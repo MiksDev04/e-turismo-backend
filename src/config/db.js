@@ -1,6 +1,6 @@
 import mysql from 'mysql2/promise';
 
-const pool = mysql.createPool({
+export const pool = mysql.createPool({
   host:               process.env.DB_HOST     || 'localhost',
   port:               parseInt(process.env.DB_PORT) || 3306,
   user:               process.env.DB_USER     || 'root',
@@ -9,14 +9,14 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit:    10,
   queueLimit:         0,
-  // Return proper JS Date objects and BigInt as strings
-  dateStrings:        false,
+  // Return dates as strings to avoid timezone shifting
+  dateStrings:        true,
   supportBigNumbers:  true,
   bigNumberStrings:   false,
 });
 
 
-async function testConnection() {
+export async function testConnection() {
   try {
     const conn = await pool.getConnection();
     console.log('✅ MySQL connected successfully');

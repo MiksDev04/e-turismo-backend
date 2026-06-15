@@ -48,6 +48,8 @@ CREATE TABLE users (
   password    TEXT         NOT NULL,   -- bcrypt / argon2 hash only
   role        ENUM('business', 'admin')
                            NOT NULL DEFAULT 'business',
+  reset_otp   VARCHAR(6),
+  reset_otp_expiry DATETIME,
   created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
                                     ON UPDATE CURRENT_TIMESTAMP,
@@ -130,7 +132,7 @@ CREATE TABLE guest_breakdowns (
   country             VARCHAR(255),
   philippines_region  VARCHAR(255),
   sex                 ENUM('male', 'female')    NOT NULL,
-  age_group           ENUM('1-9', '10-17', '18-25', '26-35',
+  age_group           ENUM('0-9', '10-17', '18-25', '26-35',
                            '36-45', '46-55', '56+',
                            'prefer_not_to_say') NOT NULL,
   count               INT       NOT NULL,
