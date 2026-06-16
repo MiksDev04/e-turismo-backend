@@ -114,4 +114,69 @@ async function sendOtp(toEmail, otp) {
   });
 }
 
-export default { sendOtp };
+async function sendSystemMessage(toEmail, subject, content, messageType = 'general') {
+  const typeLabel = messageType.charAt(0).toUpperCase() + messageType.slice(1);
+  
+  await transporter.sendMail({
+    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_USER}>`,
+    to:      toEmail,
+    subject: `${subject} – San Pablo City Tourism Office`,
+    html: `
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+        <title>New Message</title>
+      </head>
+      <body style="margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,sans-serif;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f6f9;padding:32px 0;">
+          <tr>
+            <td align="center">
+              <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+                <tr>
+                  <td style="background-color:#0077b6;padding:28px 40px;text-align:center;">
+                    <p style="margin:0;font-size:12px;color:#cce7f5;letter-spacing:1.5px;text-transform:uppercase;">
+                      ${typeLabel} Notice
+                    </p>
+                    <h1 style="margin:6px 0 0;color:#ffffff;font-size:20px;font-weight:700;letter-spacing:0.5px;">
+                      San Pablo City Tourism Office
+                    </h1>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:36px 20px 28px;">
+                    <h2 style="margin:0 0 12px;font-size:18px;color:#1a1a2e;">
+                      ${subject}
+                    </h2>
+                    <div style="margin:0 0 20px;font-size:14px;color:#555;line-height:1.6;white-space: pre-wrap;">
+                      ${content}
+                    </div>
+                
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:0 40px;">
+                    <hr style="border:none;border-top:1px solid #eee;margin:0;"/>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:20px 40px 28px;text-align:center;">
+                    <p style="margin:0;font-size:12px;color:#aaa;line-height:1.8;">
+                      This is an automated notification from the<br/>
+                      <strong style="color:#555;">San Pablo City Tourism Office</strong><br/>
+                      San Pablo City, Laguna, Philippines
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
+    `,
+  });
+}
+
+export default { sendOtp, sendSystemMessage };

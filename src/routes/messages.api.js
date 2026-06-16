@@ -1,6 +1,8 @@
 import express from 'express';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
+import mailer from '../utils/mailer.js';
+import crypto from 'crypto';
 
 const router = express.Router();
 
@@ -68,7 +70,19 @@ router.post('/send-selected', auth.authenticate, auth.requireRole('admin'), asyn
       );
     }
 
+    // Fetch emails to send notifications
+    const [recipients] = await connection.execute(
+      'SELECT u.email FROM businesses b JOIN users u ON b.user_id = u.id WHERE b.id IN (' + businessIds.map(() => '?').join(',') + ') AND u.email IS NOT NULL',
+      businessIds
+    );
+
     await connection.commit();
+
+    // Send emails asynchronously after commit
+    recipients.forEach(r => {
+      mailer.sendSystemMessage(r.email, subject.trim(), content.trim(), messageType).catch(console.error);
+    });
+
     res.status(201).json({ messageId });
   } catch (err) {
     await connection.rollback();
@@ -112,7 +126,21 @@ router.post('/send-all', auth.authenticate, auth.requireRole('admin'), async (re
       );
     }
 
+    // Fetch emails to send notifications
+    const [recipients] = await connection.execute(
+      `SELECT u.email 
+       FROM businesses b 
+       JOIN users u ON b.user_id = u.id 
+       WHERE b.status IN ("approved", "warning") AND b.deleted_at IS NULL AND u.email IS NOT NULL`
+    );
+
     await connection.commit();
+
+    // Send emails asynchronously after commit
+    recipients.forEach(r => {
+      mailer.sendSystemMessage(r.email, subject.trim(), content.trim(), messageType).catch(console.error);
+    });
+
     res.status(201).json({ messageId, recipientCount: businesses.length });
   } catch (err) {
     await connection.rollback();
