@@ -142,100 +142,7 @@ router.post('/change-password', auth.authenticate, async (req, res, next) => {
 });
 
 /**
- * POST /api/auth/forgot-password
- * Sends reset OTP to user email
- */
-router.post('/forgot-password', async (req, res, next) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ message: 'Email is required.' });
-
-    const [users] = await db.pool.execute('SELECT id, full_name FROM users WHERE email = ? AND deleted_at IS NULL', [email.trim().toLowerCase()]);
-    if (users.length === 0) {
-      return res.status(404).json({ message: 'No account found with that email address.' });
-    }
-
-    const user = users[0];
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiry = new Date(Date.now() + 15 * 60 * 1000);
-
-    await db.pool.execute('UPDATE users SET reset_otp = ?, reset_otp_expiry = ? WHERE id = ?', [otp, expiry, user.id]);
-
-    try {
-      await mailer.sendOtp(email.trim().toLowerCase(), otp);
-      console.log(`[MAIL] Reset code sent to ${email}`);
-    } catch (mailErr) {
-      console.error('[MAIL ERROR]', mailErr);
-    }
-
-    res.json({ message: 'Reset code sent to your email.' });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * POST /api/auth/verify-otp
- * Validates reset OTP without changing password
- */
-router.post('/verify-otp', async (req, res, next) => {
-  try {
-    const { email, otp } = req.body;
-    if (!email || !otp) return res.status(400).json({ message: 'Email and code are required.' });
-
-    const [users] = await db.pool.execute(
-      'SELECT id FROM users WHERE email = ? AND reset_otp = ? AND reset_otp_expiry > NOW() AND deleted_at IS NULL',
-      [email.trim().toLowerCase(), otp.trim()]
-    );
-
-    if (users.length === 0) {
-      return res.status(400).json({ message: 'Invalid or expired reset code.' });
-    }
-
-    res.json({ message: 'Code verified.' });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * POST /api/auth/reset-password
- * Verifies OTP and sets new password
- */
-router.post('/reset-password', async (req, res, next) => {
-  try {
-    const { email, otp, new_password } = req.body;
-
-    if (!email || !otp || !new_password) {
-      return res.status(400).json({ message: 'Missing required fields.' });
-    }
-
-    const [users] = await db.pool.execute(
-      'SELECT id FROM users WHERE email = ? AND reset_otp = ? AND reset_otp_expiry > NOW() AND deleted_at IS NULL',
-      [email.trim().toLowerCase(), otp.trim()]
-    );
-
-    if (users.length === 0) {
-      return res.status(400).json({ message: 'Invalid or expired reset code.' });
-    }
-
-    const user = users[0];
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(new_password, salt);
-
-    await db.pool.execute(
-      'UPDATE users SET password = ?, reset_otp = NULL, reset_otp_expiry = NULL WHERE id = ?',
-      [hashedPassword, user.id]
-    );
-
-    res.json({ message: 'Password has been reset successfully.' });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * POST /api/profile/send-email-otp
+ * POST /api/send-email-otp
  * Sends OTP to CURRENT email to verify identity for email/password change
  */
 router.post('/send-email-otp', auth.authenticate, async (req, res, next) => {
@@ -244,6 +151,8 @@ router.post('/send-email-otp', auth.authenticate, async (req, res, next) => {
     if (users.length === 0) return res.status(404).json({ message: 'User not found.' });
     
     const user = users[0];
+    if (!user.email) return res.status(400).json({ message: 'No email associated with this account.' });
+
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiry = new Date(Date.now() + 15 * 60 * 1000);
 
@@ -263,7 +172,7 @@ router.post('/send-email-otp', auth.authenticate, async (req, res, next) => {
 });
 
 /**
- * POST /api/profile/update-email
+ * PUT /api/update-email
  * Updates email after verification
  */
 router.put('/update-email', auth.authenticate, async (req, res, next) => {

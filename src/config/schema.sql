@@ -48,8 +48,6 @@ CREATE TABLE users (
   password    TEXT         NOT NULL,   -- bcrypt / argon2 hash only
   role        ENUM('business', 'admin')
                            NOT NULL DEFAULT 'business',
-  reset_otp   VARCHAR(6),
-  reset_otp_expiry DATETIME,
   created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
                                     ON UPDATE CURRENT_TIMESTAMP,
@@ -298,3 +296,11 @@ SELECT
   gr.business_id
 FROM  guest_breakdowns gb
 JOIN  guest_records    gr ON gb.guest_record_id = gr.id;
+
+-- ------------------------------------------------------------
+-- MIGRATIONS / UPDATES
+-- ------------------------------------------------------------
+
+-- Update users table to add OTP columns for forgot password functionality
+ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_otp VARCHAR(6) AFTER role;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_otp_expiry DATETIME AFTER reset_otp;

@@ -9,7 +9,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "db:sync": "node src/config/sync.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
