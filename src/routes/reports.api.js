@@ -690,7 +690,7 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   // Days beyond the month end (e.g. day 31 in a 30-day month) are left null.
   const setDayValues = (rowNum, fn) => {
     for (let d = 1; d <= 31; d++) {
-      sheet.getCell(rowNum, d + 1).value = d > daysInMonth ? null : (fn(d) ?? 0);
+      sheet.getCell(rowNum, d + 1).value = d > daysInMonth ? null : (fn(d) ?? 0);j
     }
   };
 
