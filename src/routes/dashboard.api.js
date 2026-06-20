@@ -163,4 +163,84 @@ router.get('/business-lines', auth.authenticate, auth.requireRole('admin'), asyn
   }
 });
 
+/**
+ * GET /api/dashboard/summary
+ * Admin only: consolidated endpoint returning all dashboard data in one call
+ * Replaces 4–6 individual API calls with a single request.
+ */
+router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req, res, next) => {
+  const { startDate, endDate, yearStart, yearEnd } = req.query;
+  if (!startDate || !endDate || !yearStart || !yearEnd) {
+    return res.status(400).json({ message: 'Missing date parameters' });
+  }
+
+  const connection = await db.pool.getConnection();
+  try {
+    const [active] = await connection.execute(
+      'SELECT COUNT(*) as count FROM businesses WHERE status = "approved" AND deleted_at IS NULL'
+    );
+    const [pending] = await connection.execute(
+      'SELECT COUNT(*) as count FROM businesses WHERE status = "pending" AND deleted_at IS NULL'
+    );
+
+    const [periodRecords] = await connection.execute(
+      `SELECT id, business_id, check_in, check_out, total_guests, rooms_occupied, purpose_of_visit
+       FROM guest_records WHERE is_deleted = FALSE AND check_in >= ? AND check_in <= ?`,
+      [startDate, endDate]
+    );
+
+    let yearRecords;
+    if (startDate === yearStart && endDate === yearEnd) {
+      yearRecords = periodRecords;
+    } else {
+      const [rows] = await connection.execute(
+        `SELECT id, business_id, check_in, check_out, total_guests, rooms_occupied, purpose_of_visit
+         FROM guest_records WHERE is_deleted = FALSE AND check_in >= ? AND check_in <= ?`,
+        [yearStart, yearEnd]
+      );
+      yearRecords = rows;
+    }
+
+    const recordIds = periodRecords.map((r) => r.id);
+    let breakdowns = [];
+    if (recordIds.length > 0) {
+      const placeholders = recordIds.map(() => '?').join(',');
+      const [rows] = await connection.execute(
+        `SELECT guest_record_id, country, philippines_region, sex, age_group, count
+         FROM guest_breakdowns
+         WHERE guest_record_id IN (${placeholders})`,
+        recordIds
+      );
+      breakdowns = rows;
+    }
+
+    const businessIds = [...new Set(periodRecords.map((r) => r.business_id))];
+    let businessLines = [];
+    if (businessIds.length > 0) {
+      const placeholders = businessIds.map(() => '?').join(',');
+      const [rows] = await connection.execute(
+        `SELECT id, business_line FROM businesses
+         WHERE id IN (${placeholders}) AND status = "approved" AND deleted_at IS NULL`,
+        businessIds
+      );
+      businessLines = rows;
+    }
+
+    res.json({
+      stats: {
+        activeAccommodations: active[0].count,
+        pendingRegistrations: pending[0].count,
+      },
+      periodRecords,
+      yearRecords,
+      breakdowns,
+      businessLines,
+    });
+  } catch (err) {
+    next(err);
+  } finally {
+    connection.release();
+  }
+});
+
 export default router;
