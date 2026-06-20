@@ -215,8 +215,9 @@ router.put('/update-email', auth.authenticate, async (req, res, next) => {
       [normalisedEmail, token, expiry, req.user.id]
     );
 
-    // Build confirmation URL dynamically from the request
-    const confirmationUrl = `${req.protocol}://${req.get('host')}/api/confirm-email?token=${token}`;
+    // Build confirmation URL from BACKEND_URL env or fall back to request host
+    const baseUrl = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
+    const confirmationUrl = `${baseUrl}/api/confirm-email?token=${token}`;
 
     // Send confirmation email to the NEW email
     try {
