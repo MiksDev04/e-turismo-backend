@@ -12,10 +12,10 @@ router.get('/stats', auth.authenticate, auth.requireRole('admin'), async (req, r
   const connection = await db.pool.getConnection();
   try {
     const [active] = await connection.execute(
-      'SELECT COUNT(*) as count FROM businesses WHERE status = 'approved' AND deleted_at IS NULL'
+      `SELECT COUNT(*) as count FROM businesses WHERE status = 'approved' AND deleted_at IS NULL`
     );
     const [pending] = await connection.execute(
-      'SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL'
+      `SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL`
     );
     res.json({
       activeAccommodations: active[0].count,
@@ -177,10 +177,10 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
   const connection = await db.pool.getConnection();
   try {
     const [active] = await connection.execute(
-      'SELECT COUNT(*) as count FROM businesses WHERE status = 'approved' AND deleted_at IS NULL'
+      `SELECT COUNT(*) as count FROM businesses WHERE status = 'approved' AND deleted_at IS NULL`
     );
     const [pending] = await connection.execute(
-      'SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL'
+      `SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL`
     );
 
     const [periodRecords] = await connection.execute(
