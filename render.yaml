@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: tourism-app-backend
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: apt-get install -y libreoffice && npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
