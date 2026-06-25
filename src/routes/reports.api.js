@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
+import cloudinary from '../config/cloudinary.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +16,7 @@ const router = express.Router();
 const adminGuard = [auth.authenticate, auth.requireRole('admin')];
 
 const UPLOADS_DIR = path.join(__dirname, '../../uploads/reports');
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 const TEMPLATE_PATH = path.join(__dirname, '../../sample/ON Blank Form.xlsx');
 
 // ─── Country / Region Definitions ────────────────────────────────────────────
@@ -237,7 +239,15 @@ router.get('/reports', adminGuard, async (req, res, next) => {
        LEFT JOIN users     u  ON rb.generated_by = u.id
        ORDER BY rb.generated_at DESC`
     );
-    res.json(rows);
+    const data = rows.map(row => ({
+      ...row,
+      pdf_url: row.file_url
+        ? row.file_url.includes('/excel.xlsx')
+          ? row.file_url.replace('/excel.xlsx', '/pdf.pdf')
+          : row.file_url.replace('.xlsx', '.pdf')
+        : null,
+    }));
+    res.json(data);
   } catch (err) {
     next(err);
   }
@@ -365,7 +375,7 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
           }
         });
 
-        // Write Excel file
+        // Write Excel file (temp)
         const bizSlug = biz.business_name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').substring(0, 30);
         const monthLabel = scope === 'annual' ? 'ANNUAL' : String(month).padStart(2, '0');
         const excelFileName = `DAE1B_${bizSlug}_${year}_${monthLabel}_${timestamp}.xlsx`;
@@ -373,21 +383,41 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
         await wb.xlsx.writeFile(excelPath);
         writtenFiles.push(excelPath);
 
-        // Generate PDF
+        // Generate PDF (temp)
         const pdfFileName = excelFileName.replace('.xlsx', '.pdf');
         const pdfPath = path.join(UPLOADS_DIR, pdfFileName);
         await _generatePdfFromWorkbook(wb, pdfPath, month, year);
         writtenFiles.push(pdfPath);
 
-        // Insert report row
+        // Upload Excel to Cloudinary
         const reportId = uuidv4();
-        const fileUrl = `/uploads/reports/${excelFileName}`;
+        const excelUpload = await cloudinary.uploader.upload(excelPath, {
+          resource_type: 'raw',
+          folder: 'tourism/reports',
+          public_id: `${reportId}/excel`,
+          overwrite: true,
+        });
+        const excelUrl = excelUpload.secure_url;
+
+        // Upload PDF to Cloudinary
+        await cloudinary.uploader.upload(pdfPath, {
+          resource_type: 'raw',
+          folder: 'tourism/reports',
+          public_id: `${reportId}/pdf`,
+          overwrite: true,
+        });
+
+        // Remove local temp files
+        try { fs.unlinkSync(excelPath); } catch (e) { /* best effort */ }
+        try { fs.unlinkSync(pdfPath); } catch (e) { /* best effort */ }
+
+        // Insert report row
         await db.pool.execute(
           `INSERT INTO reports (id, batch_id, business_id, file_url) VALUES (?, ?, ?, ?)`,
-          [reportId, batchId, biz.id, fileUrl]
+          [reportId, batchId, biz.id, excelUrl]
         );
 
-        reportResults.push({ reportId, businessId: biz.id, businessName: biz.business_name, fileUrl });
+        reportResults.push({ reportId, businessId: biz.id, businessName: biz.business_name, fileUrl: excelUrl });
       }
 
       // ── Commit transaction ───────────────────────────────────────────────

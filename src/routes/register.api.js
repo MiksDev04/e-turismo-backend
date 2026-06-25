@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import upload from '../middleware/upload.js';
+import cloudinary from '../config/cloudinary.js';
 
 const router = express.Router();
 
@@ -81,8 +82,29 @@ router.post('/register', upload.fields([
 
     // 5. Insert into businesses table
     const businessId = uuidv4();
-    const permitUrl = `/uploads/permits/${files.permit_file[0].filename}`;
-    const validIdUrl = `/uploads/valid_ids/${files.valid_id[0].filename}`;
+
+    // Upload files to Cloudinary
+    const permitFile = files.permit_file[0];
+    const validIdFile = files.valid_id[0];
+
+    const permitUpload = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { resource_type: 'raw', folder: 'tourism/permits', public_id: businessId, overwrite: true },
+        (err, result) => { if (err) reject(err); else resolve(result); }
+      );
+      stream.end(permitFile.buffer);
+    });
+
+    const validIdUpload = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { resource_type: 'raw', folder: 'tourism/valid_ids', public_id: businessId, overwrite: true },
+        (err, result) => { if (err) reject(err); else resolve(result); }
+      );
+      stream.end(validIdFile.buffer);
+    });
+
+    const permitUrl = permitUpload.secure_url;
+    const validIdUrl = validIdUpload.secure_url;
 
     // businessLine might be a string from multipart/form-data
     let parsedBusinessLine = businessLine;
