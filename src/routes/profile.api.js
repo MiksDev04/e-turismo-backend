@@ -4,6 +4,8 @@ import crypto from 'crypto';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
+import cloudinary from '../config/cloudinary.js';
+import upload from '../middleware/upload.js';
 
 const router = express.Router();
 
@@ -107,6 +109,71 @@ router.put('/business', auth.authenticate, auth.requireRole('business'), async (
     next(err);
   }
 });
+
+/**
+ * POST /api/business/upload
+ * Updates permit file and/or valid ID for the authenticated business
+ */
+router.post('/business/upload',
+  auth.authenticate,
+  auth.requireRole('business'),
+  upload.fields([
+    { name: 'permit_file', maxCount: 1 },
+    { name: 'valid_id',    maxCount: 1 }
+  ]),
+  async (req, res, next) => {
+    try {
+      const [businesses] = await db.pool.execute(
+        'SELECT id FROM businesses WHERE user_id = ? AND deleted_at IS NULL',
+        [req.user.id]
+      );
+      if (businesses.length === 0) {
+        return res.status(404).json({ message: 'Business not found.' });
+      }
+      const businessId = businesses[0].id;
+      const files = req.files;
+      const updates = {};
+
+      if (files?.permit_file?.[0]) {
+        const uploadResult = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { resource_type: 'raw', folder: 'tourism/permits', public_id: businessId, overwrite: true },
+            (err, result) => { if (err) reject(err); else resolve(result); }
+          );
+          stream.end(files.permit_file[0].buffer);
+        });
+        updates.permit_file_url = uploadResult.secure_url;
+      }
+
+      if (files?.valid_id?.[0]) {
+        const uploadResult = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { resource_type: 'raw', folder: 'tourism/valid_ids', public_id: businessId, overwrite: true },
+            (err, result) => { if (err) reject(err); else resolve(result); }
+          );
+          stream.end(files.valid_id[0].buffer);
+        });
+        updates.valid_id_url = uploadResult.secure_url;
+      }
+
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ message: 'No files provided.' });
+      }
+
+      const setClauses = Object.keys(updates).map(key => `${key} = ?`).join(', ');
+      const values = [...Object.values(updates), req.user.id];
+
+      await db.pool.execute(
+        `UPDATE businesses SET ${setClauses} WHERE user_id = ?`,
+        values
+      );
+
+      res.json({ message: 'Documents updated successfully.', ...updates });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 /**
  * POST /api/profile/change-password
