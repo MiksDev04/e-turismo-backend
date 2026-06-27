@@ -280,7 +280,7 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
     const [businesses] = await db.pool.execute(
       `SELECT id, business_name, business_line, region, city_municipality, province, total_rooms,
               owner_first_name, owner_last_name, owner_middle_name
-       FROM businesses WHERE status = 'approved' AND deleted_at IS NULL ORDER BY business_name`
+       FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY business_name`
     );
 
     if (businesses.length === 0) {
@@ -344,6 +344,10 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
           const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
           const sheet = wb.addWorksheet(sheetName);
           _copySheetProperties(dailyTpl, sheet);
+          for (let c = 1; c <= 33; c++) {
+            const col = sheet.getColumn(c);
+            if (col.width) col.width = Math.round(col.width * 1.0 * 10) / 10;
+          }
           _buildDailySheet(sheet, biz, bizData, month, year, daysInMonth, adminName);
         }
 
@@ -351,14 +355,14 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
         if (includeCountrySum && bizData) {
           const sheet = wb.addWorksheet('AE DAE-1B by Country (Sum)');
           _copySheetProperties(sumTpl, sheet);
-          _buildCountrySummarySheet(sheet, bizData, biz.total_rooms, month, year, daysInMonth, adminName, biz.city_municipality || '', biz.province || '', biz.business_name);
+          _buildCountrySummarySheet(sheet, bizData, biz.total_rooms, month, year, daysInMonth, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
         }
 
         // Build annual monthly-summary sheet (annual scope only)
         if (includeMonthlySum && bizAllMonths) {
           const sheet = wb.addWorksheet('AE DAE-1B (Monthly) Summary');
           _copySheetProperties(monthTpl, sheet);
-          _buildMonthlySummarySheet(sheet, bizAllMonths, biz.total_rooms, year, adminName, biz.city_municipality || '', biz.province || '', biz.business_name);
+          _buildMonthlySummarySheet(sheet, bizAllMonths, biz.total_rooms, year, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
         }
 
         // Remove template sheets
@@ -938,7 +942,7 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
 // ==============================================================================================
 
 
-function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysInMonth, adminName, city, province, businessName) {
+function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysInMonth, adminName, city, province, businessName, biz) {
   const r = kRows.sum;
 
   sheet.getCell('B3').value = 'Region: __4-A';
@@ -947,6 +951,16 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
 
   sheet.getCell('A22').value = `City/Municipality: ${city || ''}`;
   sheet.getCell('A23').value = `Province: ${province || ''}`;
+
+  const bizLines = typeof biz?.business_line === 'string'
+    ? JSON.parse(biz.business_line || '[]')
+    : (biz?.business_line || []);
+  kAccTypes.forEach(t => {
+    if (bizLines.includes(t.key)) {
+      sheet.getCell(`B${t.row}`).value     = '✔';
+      sheet.getCell(`B${t.row}`).alignment = { horizontal: 'center' };
+    }
+  });
 
   const res = cat     => md.residentsByDay[0]?.[cat] || 0;
   const cnt = country => md.countryByDay[country.toUpperCase()]?.[0] || 0;
@@ -1036,7 +1050,7 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
 // ==============================================================================================
 
 
-function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminName, city, province, businessName) {
+function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminName, city, province, businessName, biz) {
   const r = kRows.sum;
 
   sheet.getCell('B3').value = 'Region: __4-A';
@@ -1045,6 +1059,16 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
 
   sheet.getCell('A22').value = `City/Municipality: ${city || ''}`;
   sheet.getCell('A23').value = `Province: ${province || ''}`;
+
+  const bizLines = typeof biz?.business_line === 'string'
+    ? JSON.parse(biz.business_line || '[]')
+    : (biz?.business_line || []);
+  kAccTypes.forEach(t => {
+    if (bizLines.includes(t.key)) {
+      sheet.getCell(`B${t.row}`).value     = '✔';
+      sheet.getCell(`B${t.row}`).alignment = { horizontal: 'center' };
+    }
+  });
 
   // Sets values for months 1-12 into columns B-M (col index 2-13).
   // Also calculates the total for the year and writes to Column N (14).
@@ -1206,9 +1230,9 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
 //   page 3 : rows 128+   (NEW ZEALAND onward)
 //
 const SHEET_PDF_CONFIG = {
-  daily:   { layout: 'landscape', size: 'A3', margin: 20, breakRows: [64, 124]  },
-  monthly: { layout: 'landscape', size: 'A3', margin: 20, breakRows: [64, 124]  },
-  sum:     { layout: 'portrait',  size: 'A3', margin: 20, breakRows: [66, 128] },
+  daily:   { layout: 'landscape', size: 'A3', margin: 45, breakRows: [64, 124] },
+  monthly: { layout: 'landscape', size: 'A3', margin: 45, breakRows: [64, 124] },
+  sum:     { layout: 'portrait',  size: 'A3', margin: 45, breakRows: [66, 128] },
 };
 
 function _getSheetPdfConfig(sheetName) {
@@ -1220,8 +1244,6 @@ function _getSheetPdfConfig(sheetName) {
 // ─── PDF Generation ──────────────────────────────────────────────────────────
 
 async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
-  // Collect sheets first so we can inspect the first one before
-  // creating the PDFDocument (which needs the initial page layout).
   const sheets = [];
   workbook.eachSheet(sheet => sheets.push(sheet));
 
@@ -1229,7 +1251,7 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
     ? _getSheetPdfConfig(sheets[0].name)
     : SHEET_PDF_CONFIG.daily;
 
-  const doc    = new PDFDocument({
+  const doc = new PDFDocument({
     layout: firstConfig.layout,
     size:   firstConfig.size,
     margin: firstConfig.margin,
@@ -1237,128 +1259,192 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
   const stream = fs.createWriteStream(pdfPath);
   doc.pipe(stream);
 
-  const pointsPerExcelHeight = 0.75;
-  const pointsPerExcelWidth  = 5.25;
+  const BASE_HEIGHT_FACTOR = 0.75;
+  const BASE_WIDTH_FACTOR  = 5.25;
+
+  const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 } };
+
+  const _pageSize = name => PAGE_DIMS[name] || PAGE_DIMS.A3;
 
   let isFirstSheet = true;
 
   for (const sheet of sheets) {
-    const cfg = _getSheetPdfConfig(sheet.name);
+    const cfg  = _getSheetPdfConfig(sheet.name);
+    const ps   = _pageSize(cfg.size);
+    const pgW  = cfg.layout === 'landscape' ? ps.h : ps.w;
+    const pgH  = cfg.layout === 'landscape' ? ps.w : ps.h;
+    const aw   = pgW - 2 * cfg.margin;
+    const ah   = pgH - 2 * cfg.margin;
 
-    // Each spreadsheet starts on its own page.
-    // The very first page is already created by the PDFDocument constructor.
     if (!isFirstSheet) {
       doc.addPage({ layout: cfg.layout, size: cfg.size, margin: cfg.margin });
     }
     isFirstSheet = false;
 
-    let currentY    = cfg.margin;
-    let breakRowIdx = 0;           // tracks which breakRow we're waiting for next
+    // Collect all rows (capped at 197)
+    const rows = [];
+    sheet.eachRow({ includeEmpty: true }, (row, rn) => {
+      if (rn > 197) return;
+      rows.push({ row, rn });
+    });
 
-    sheet.eachRow({ includeEmpty: true }, (row, rowNumber) => {
-      if (rowNumber > 197) return;
+    // Build sections from break-row boundaries
+    const breaks = [1, ...cfg.breakRows, Infinity];
 
-      // ── Insert a page break BEFORE rendering the configured row ────────────
-      if (
-        breakRowIdx < cfg.breakRows.length &&
-        rowNumber === cfg.breakRows[breakRowIdx]
-      ) {
+    // Pre-compute all sections and find the tallest one
+    const sheetSections = [];
+    for (let s = 0; s < breaks.length - 1; s++) {
+      const lo = breaks[s];
+      const hi = breaks[s + 1];
+      const section = rows.filter(r => r.rn >= lo && r.rn < hi);
+      if (section.length > 0) sheetSections.push(section);
+    }
+
+    // Measure total width (identical for all sections)
+    let totalW = 0;
+    for (let c = 1; c <= 33; c++) {
+      const w = sheet.getColumn(c).width;
+      if (w != null && w > 0) totalW += w;
+    }
+    if (totalW === 0) totalW = 40;
+
+    // Find tallest section height for vertical constraint
+    let maxSectionH = 0;
+    for (const sec of sheetSections) {
+      let h = 0;
+      for (const { row } of sec) h += row.height || 15;
+      if (h > maxSectionH) maxSectionH = h;
+    }
+    if (maxSectionH === 0) maxSectionH = 300;
+    const contentH = maxSectionH * (cfg.heightFactor ?? BASE_HEIGHT_FACTOR);
+
+    // Balance width and height: compute a widthFactor that equalises both constraints
+    const balancedWF = aw * contentH / (totalW * ah);
+    const wf = Math.min(balancedWF, BASE_WIDTH_FACTOR);
+    const contentW = totalW * wf;
+
+    // Single uniform scale — fits both dimensions (constraints are now balanced)
+    const scale = Math.min(aw / contentW, ah / contentH);
+    const ox = (aw - contentW * scale) / 2;
+    const oy = (ah - contentH * scale) / 2;
+    const originX = cfg.margin + ox;
+    const originY = cfg.margin + oy;
+
+    for (let s = 0; s < sheetSections.length; s++) {
+      const section = sheetSections[s];
+      if (s > 0) {
         doc.addPage({ layout: cfg.layout, size: cfg.size, margin: cfg.margin });
-        currentY = cfg.margin;
-        breakRowIdx++;
       }
 
-      const rowHeight = (row.height || 15) * pointsPerExcelHeight;
-      let currentX = cfg.margin;
+      // ── Render ─────────────────────────────────────────────────────────────
+      let curY = originY;
 
-      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-        if (colNumber > 33) return;
+      for (const { row, rn } of section) {
+        const rh = (row.height || 15) * (cfg.heightFactor ?? BASE_HEIGHT_FACTOR) * scale;
+        let curX = originX;
 
-        const colWidth = (sheet.getColumn(colNumber).width || 10) * pointsPerExcelWidth;
+        row.eachCell({ includeEmpty: true }, (cell, cn) => {
+          if (cn > 33) return;
 
-        if (cell.isMerged && cell.address !== cell.master.address) {
-          currentX += colWidth;
-          return;
-        }
+          const cw = (sheet.getColumn(cn).width || 10) * wf * scale;
 
-        let boxWidth  = colWidth;
-        let boxHeight = rowHeight;
-        if (cell.isMerged) {
-          const mergeRange = _findMergeRange(sheet, cell.address);
-          if (mergeRange) {
-            boxWidth  = 0;
-            for (let c = mergeRange.left; c <= mergeRange.right; c++) {
-              boxWidth += (sheet.getColumn(c).width || 10) * pointsPerExcelWidth;
-            }
-            boxHeight = 0;
-            for (let r = mergeRange.top; r <= mergeRange.bottom; r++) {
-              boxHeight += (sheet.getRow(r).height || 15) * pointsPerExcelHeight;
+          if (cell.isMerged && cell.address !== cell.master.address) {
+            curX += cw;
+            return;
+          }
+
+          let bw = cw;
+          let bh = rh;
+          if (cell.isMerged) {
+            const mr = _findMergeRange(sheet, cell.address);
+            if (mr) {
+              bw = 0;
+              for (let c = mr.left; c <= mr.right; c++) bw += (sheet.getColumn(c).width || 10) * wf * scale;
+              bh = 0;
+              for (let r = mr.top; r <= mr.bottom; r++) bh += (sheet.getRow(r).height || 15) * BASE_HEIGHT_FACTOR * scale;
             }
           }
-        }
 
-        if (cell.fill?.fgColor?.argb) {
-          doc.rect(currentX, currentY, boxWidth, boxHeight)
-             .fill('#' + cell.fill.fgColor.argb.substring(2));
-        }
+          // Fill
+          if (cell.fill?.fgColor?.argb) {
+            doc.rect(curX, curY, bw, bh)
+               .fill('#' + cell.fill.fgColor.argb.substring(2));
+          }
 
-        if (cell.border) {
-          doc.lineWidth(0.5).strokeColor('#000000');
-          if (cell.border.top)    doc.moveTo(currentX, currentY).lineTo(currentX + boxWidth, currentY).stroke();
-          if (cell.border.bottom) doc.moveTo(currentX, currentY + boxHeight).lineTo(currentX + boxWidth, currentY + boxHeight).stroke();
-          if (cell.border.left)   doc.moveTo(currentX, currentY).lineTo(currentX, currentY + boxHeight).stroke();
-          if (cell.border.right)  doc.moveTo(currentX + boxWidth, currentY).lineTo(currentX + boxWidth, currentY + boxHeight).stroke();
-        }
+          // Borders
+          if (cell.border) {
+            doc.lineWidth(0.5).strokeColor('#000000');
+            if (cell.border.top)    doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke();
+            if (cell.border.bottom) doc.moveTo(curX, curY + bh).lineTo(curX + bw, curY + bh).stroke();
+            if (cell.border.left)   doc.moveTo(curX, curY).lineTo(curX, curY + bh).stroke();
+            if (cell.border.right)  doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke();
+          }
 
-        let text = '';
-        if (cell.value?.richText) {
-          text = cell.value.richText.map(rt => rt.text).join('');
-        } else if (cell.value !== null && cell.value !== undefined) {
-          if (typeof cell.value === 'object') {
-            // Handle formula objects { formula, result }
-            if (cell.value.result !== undefined && cell.value.result !== null) {
-              text = cell.value.result.toString();
-            } else if (cell.value.formula) {
-              text = ''; // No result yet, don't show [object]
-            } else if (cell.value instanceof Date) {
-              text = cell.value.toLocaleDateString();
+          // Text
+          let text = '';
+          if (cell.value?.richText) {
+            text = cell.value.richText.map(rt => rt.text).join('');
+          } else if (cell.value !== null && cell.value !== undefined) {
+            if (typeof cell.value === 'object') {
+              if (cell.value.result !== undefined && cell.value.result !== null) {
+                text = cell.value.result.toString();
+              } else if (cell.value.formula) {
+                text = '';
+              } else if (cell.value instanceof Date) {
+                text = cell.value.toLocaleDateString();
+              } else {
+                text = cell.value.toString();
+              }
             } else {
               text = cell.value.toString();
             }
-          } else {
-            text = cell.value.toString();
           }
-        }
 
-        if (text) {
-          const fontSize = (cell.font?.size ?? 0) * 0.8 || 7;
-          const isBold   = !!cell.font?.bold;
-          const isItalic = !!cell.font?.italic;
-          const color    = cell.font?.color?.argb
-            ? '#' + cell.font.color.argb.substring(2)
-            : '#000000';
+          if (text === '✔') {
+            const cx = curX + bw / 2;
+            const cy = curY + bh / 2;
+            const s  = Math.min(bw, bh) * 0.35;
+            const color = cell.font?.color?.argb
+              ? '#' + cell.font.color.argb.substring(2)
+              : '#000000';
+            doc.fillColor(color)
+               .lineWidth(Math.max(1, 1.5 * scale))
+               .moveTo(cx - s * 0.5, cy - s * 0.05)
+               .lineTo(cx - s * 0.1, cy + s * 0.4)
+               .lineTo(cx + s * 0.6, cy - s * 0.3)
+               .stroke();
+          } else if (text) {
+            const fontSize = ((cell.font?.size ?? 0) * 0.8 || 7) * scale;
+            const isBold   = !!cell.font?.bold;
+            const isItalic = !!cell.font?.italic;
+            const color    = cell.font?.color?.argb
+              ? '#' + cell.font.color.argb.substring(2)
+              : '#000000';
 
-          doc.fillColor(color)
-             .font(isBold
-               ? (isItalic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold')
-               : (isItalic ? 'Helvetica-Oblique'     : 'Helvetica'))
-             .fontSize(fontSize);
+            doc.fillColor(color)
+               .font(isBold
+                 ? (isItalic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold')
+                 : (isItalic ? 'Helvetica-Oblique'     : 'Helvetica'))
+               .fontSize(fontSize);
 
-          const align = cell.alignment?.horizontal || 'left';
-          const pdfAlign = (align === 'center') ? 'center' : ((colNumber > 1 || align === 'right') ? 'right' : 'left');
+            const align    = cell.alignment?.horizontal || 'left';
+            const pdfAlign = align === 'center'
+              ? 'center'
+              : (cn > 1 || align === 'right' ? 'right' : 'left');
 
-          doc.text(text, currentX + 2, currentY + 2, {
-            width:    boxWidth  - 4,
-            height:   boxHeight - 4,
-            align:    pdfAlign,
-            ellipsis: true,
-          });
-        }
+            doc.text(text, curX + 2, curY + 2, {
+              width:    bw - 4,
+              height:   bh - 4,
+              align:    pdfAlign,
+              ellipsis: true,
+            });
+          }
 
-        currentX += colWidth;
-      });
-      currentY += rowHeight;
-    });
+          curX += cw;
+        });
+        curY += rh;
+      }
+    }
   }
 
   doc.end();
