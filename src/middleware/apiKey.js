@@ -1,7 +1,7 @@
 /**
  * Public paths that do not require an API key.
  */
-const PUBLIC_PATHS = ['/api/confirm-email'];
+const PUBLIC_PATHS = ['/api/confirm-email', '/health'];
 
 /**
  * Middleware to verify the X-API-Key header.
