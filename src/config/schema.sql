@@ -97,7 +97,7 @@ CREATE TABLE `guest_breakdowns` (
   `country` varchar(255) DEFAULT NULL,
   `philippines_region` varchar(255) DEFAULT NULL,
   `sex` enum('male','female') NOT NULL,
-  `age_group` enum('1-9','10-17','18-25','26-35','36-45','46-55','56+','prefer_not_to_say') NOT NULL,
+  `age_group` enum('0-9','10-17','18-25','26-35','36-45','46-55','56+','prefer_not_to_say') NOT NULL,
   `count` int NOT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `is_overseas` tinyint(1) NOT NULL DEFAULT '0',
