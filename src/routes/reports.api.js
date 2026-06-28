@@ -228,16 +228,16 @@ function _purgeOrphanedDefinedNames(workbook) {
 router.get('/reports', adminGuard, async (req, res, next) => {
   try {
     const [rows] = await db.pool.execute(
-      `SELECT r.id, r.batch_id, r.business_id, r.file_url,
+      `SELECT r.id, r.batch_id, r.business_id, r.report_type, r.file_url,
                rb.report_scope, rb.period_month, rb.period_year,
                rb.generated_at, rb.generated_by,
                u.full_name AS generated_by_name,
                b.business_name
-       FROM reports r
-       JOIN report_batches rb ON rb.id = r.batch_id
-       JOIN businesses     b  ON b.id  = r.business_id
-       LEFT JOIN users     u  ON rb.generated_by = u.id
-       ORDER BY rb.generated_at DESC`
+        FROM reports r
+        JOIN report_batches rb ON rb.id = r.batch_id
+        LEFT JOIN businesses b  ON b.id  = r.business_id
+        LEFT JOIN users     u  ON rb.generated_by = u.id
+        ORDER BY rb.generated_at DESC`
     );
     const data = rows.map(row => ({
       ...row,
@@ -246,6 +246,7 @@ router.get('/reports', adminGuard, async (req, res, next) => {
           ? row.file_url.replace('/excel.xlsx', '/pdf.pdf')
           : row.file_url.replace('.xlsx', '.pdf')
         : null,
+      report_type: row.report_type || 'business',
     }));
     res.json(data);
   } catch (err) {
@@ -308,6 +309,13 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
     const includeDaily       = scope === 'monthly';
     const includeCountrySum  = scope === 'monthly';
     const includeMonthlySum  = scope === 'annual';
+    const monthLabel = scope === 'annual' ? 'ANNUAL' : String(month).padStart(2, '0');
+
+    // ── Aggregation collectors for totals report ───────────────────────────────
+    const allBizMonthData = [];
+    const allBizAnnualData = [];
+    let totalRoomsSum = 0;
+    const unionLines = new Set();
 
     try {
       // ── Process each business sequentially ─────────────────────────────────
@@ -326,6 +334,12 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
         const bizData = includeDaily || includeCountrySum
           ? await _fetchMonthData(biz.id, month, year)
           : null;
+
+        // Collect for totals aggregation
+        if (includeDaily || includeCountrySum) allBizMonthData.push(bizData);
+        if (includeMonthlySum)                allBizAnnualData.push(bizAllMonths);
+        totalRoomsSum += biz.total_rooms || 0;
+        if (Array.isArray(biz.business_line)) biz.business_line.forEach(l => unionLines.add(l));
 
         // ── Create workbook for this business ────────────────────────────────
         const wb = new ExcelJS.Workbook();
@@ -381,7 +395,6 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
 
         // Write Excel file (temp)
         const bizSlug = biz.business_name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').substring(0, 30);
-        const monthLabel = scope === 'annual' ? 'ANNUAL' : String(month).padStart(2, '0');
         const excelFileName = `DAE1B_${bizSlug}_${year}_${monthLabel}_${timestamp}.xlsx`;
         const excelPath = path.join(UPLOADS_DIR, excelFileName);
         await wb.xlsx.writeFile(excelPath);
@@ -417,12 +430,103 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
 
         // Insert report row
         await db.pool.execute(
-          `INSERT INTO reports (id, batch_id, business_id, file_url) VALUES (?, ?, ?, ?)`,
+          `INSERT INTO reports (id, batch_id, business_id, report_type, file_url) VALUES (?, ?, ?, 'business', ?)`,
           [reportId, batchId, biz.id, excelUrl]
         );
 
         reportResults.push({ reportId, businessId: biz.id, businessName: biz.business_name, fileUrl: excelUrl });
       }
+
+      // ── Build totals workbook across all businesses ─────────────────────────
+      const totalBiz = {
+        business_name:  'TOTAL \u2013 ALL ACCOMMODATION',
+        total_rooms:    totalRoomsSum,
+        business_line:  [...unionLines],
+        region:         '', city_municipality: 'ALL', province: 'ALL',
+      };
+
+      const wbTotal = new ExcelJS.Workbook();
+      await wbTotal.xlsx.readFile(TEMPLATE_PATH);
+      const totalDailyTpl = wbTotal.getWorksheet('Name of Establishment');
+      const totalSumTpl   = wbTotal.getWorksheet('AE DAE-1B by Country (Sum) ');
+      const totalMonthTpl = wbTotal.getWorksheet('AE DAE-1B (Monthly)');
+
+      // Rename template sheets so addWorksheet with the same name doesn't clash
+      totalDailyTpl.name = '_TEMPLATE_Daily';
+      totalSumTpl.name   = '_TEMPLATE_Sum';
+      totalMonthTpl.name = '_TEMPLATE_Monthly';
+
+      if (scope === 'monthly' && allBizMonthData.length > 0) {
+        const mergedMd = _mergeMonthData(month, allBizMonthData);
+
+        const dailySheet = wbTotal.addWorksheet('Name of Establishment');
+        _copySheetProperties(totalDailyTpl, dailySheet);
+        _buildDailySheet(dailySheet, totalBiz, mergedMd, month, year, daysInMonth, adminName);
+
+        const sumSheet = wbTotal.addWorksheet('AE DAE-1B by Country (Sum)');
+        _copySheetProperties(totalSumTpl, sumSheet);
+        _buildCountrySummarySheet(sumSheet, mergedMd, totalRoomsSum, month, year, daysInMonth, adminName, 'ALL', 'ALL', totalBiz.business_name, totalBiz);
+      }
+
+      if (scope === 'annual' && allBizAnnualData.length > 0) {
+        const mergedMonths = [];
+        for (let m = 1; m <= 12; m++) {
+          const monthDataList = allBizAnnualData.map(b => b[m - 1]);
+          mergedMonths.push(_mergeMonthData(m, monthDataList));
+        }
+
+        const mSheet = wbTotal.addWorksheet('AE DAE-1B (Monthly) Summary');
+        _copySheetProperties(totalMonthTpl, mSheet);
+        _buildMonthlySummarySheet(mSheet, mergedMonths, totalRoomsSum, year, adminName, 'ALL', 'ALL', totalBiz.business_name, totalBiz);
+      }
+
+      // Remove template sheets from totals workbook
+      wbTotal.removeWorksheet(totalDailyTpl.id);
+      wbTotal.removeWorksheet(totalSumTpl.id);
+      wbTotal.removeWorksheet(totalMonthTpl.id);
+      _purgeOrphanedDefinedNames(wbTotal);
+      wbTotal.eachSheet(ws => {
+        if (ws.pageSetup) {
+          ws.pageSetup.printArea = null;
+          delete ws.pageSetup.printTitlesRow;
+          delete ws.pageSetup.printTitlesColumn;
+        }
+      });
+
+      // Write totals Excel + PDF
+      const totalId = uuidv4();
+      const totalExcelName = `DAE1B_TOTAL_ALL_${year}_${monthLabel}_${timestamp}.xlsx`;
+      const totalExcelPath = path.join(UPLOADS_DIR, totalExcelName);
+      await wbTotal.xlsx.writeFile(totalExcelPath);
+      writtenFiles.push(totalExcelPath);
+
+      const totalPdfPath = totalExcelPath.replace('.xlsx', '.pdf');
+      await _generatePdfFromWorkbook(wbTotal, totalPdfPath, month, year);
+      writtenFiles.push(totalPdfPath);
+
+      const totalExcelUpload = await cloudinary.uploader.upload(totalExcelPath, {
+        resource_type: 'raw',
+        folder: 'tourism/reports',
+        public_id: `${totalId}/excel`,
+        overwrite: true,
+      });
+
+      await cloudinary.uploader.upload(totalPdfPath, {
+        resource_type: 'raw',
+        folder: 'tourism/reports',
+        public_id: `${totalId}/pdf`,
+        overwrite: true,
+      });
+
+      try { fs.unlinkSync(totalExcelPath); } catch (e) { /* best effort */ }
+      try { fs.unlinkSync(totalPdfPath); } catch (e) { /* best effort */ }
+
+      await db.pool.execute(
+        `INSERT INTO reports (id, batch_id, business_id, report_type, file_url) VALUES (?, ?, NULL, 'total', ?)`,
+        [totalId, batchId, totalExcelUpload.secure_url]
+      );
+
+      reportResults.push({ reportId: totalId, businessId: null, businessName: totalBiz.business_name, fileUrl: totalExcelUpload.secure_url });
 
       // ── Commit transaction ───────────────────────────────────────────────
       await db.pool.query('COMMIT');

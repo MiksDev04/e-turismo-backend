@@ -290,10 +290,11 @@ DROP TABLE IF EXISTS `reports`;
 CREATE TABLE `reports` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
   `batch_id` char(36) NOT NULL,
-  `business_id` char(36) NOT NULL,
+  `business_id` char(36) DEFAULT NULL,
+  `report_type` enum('business','total') NOT NULL DEFAULT 'business',
   `file_url` varchar(1000) DEFAULT NULL,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uq_reports_batch_business` (`batch_id`,`business_id`),
+  UNIQUE KEY `uq_reports_batch_business_type` (`batch_id`,`business_id`,`report_type`),
   KEY `idx_reports_batch_id` (`batch_id`),
   KEY `idx_reports_business_id` (`business_id`),
   CONSTRAINT `reports_batch_id_fkey` FOREIGN KEY (`batch_id`) REFERENCES `report_batches` (`id`) ON DELETE CASCADE,
