@@ -442,7 +442,7 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
         business_name:  'TOTAL \u2013 ALL ACCOMMODATION',
         total_rooms:    totalRoomsSum,
         business_line:  [...unionLines],
-        region:         '', city_municipality: 'ALL', province: 'ALL',
+        region:         '', city_municipality: 'San Pablo City', province: 'Laguna',
       };
 
       const wbTotal = new ExcelJS.Workbook();
@@ -465,7 +465,7 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
 
         const sumSheet = wbTotal.addWorksheet('AE DAE-1B by Country (Sum)');
         _copySheetProperties(totalSumTpl, sumSheet);
-        _buildCountrySummarySheet(sumSheet, mergedMd, totalRoomsSum, month, year, daysInMonth, adminName, 'ALL', 'ALL', totalBiz.business_name, totalBiz);
+        _buildCountrySummarySheet(sumSheet, mergedMd, totalRoomsSum, month, year, daysInMonth, adminName, 'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
       }
 
       if (scope === 'annual' && allBizAnnualData.length > 0) {
@@ -477,7 +477,7 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
 
         const mSheet = wbTotal.addWorksheet('AE DAE-1B (Monthly) Summary');
         _copySheetProperties(totalMonthTpl, mSheet);
-        _buildMonthlySummarySheet(mSheet, mergedMonths, totalRoomsSum, year, adminName, 'ALL', 'ALL', totalBiz.business_name, totalBiz);
+        _buildMonthlySummarySheet(mSheet, mergedMonths, totalRoomsSum, year, adminName, 'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
       }
 
       // Remove template sheets from totals workbook
