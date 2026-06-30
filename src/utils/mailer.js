@@ -27,7 +27,7 @@ async function sendOtp(toEmail, otp) {
     return;
   }
   await transporter.sendMail({
-    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_USER}>`,
+    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_FROM || process.env.MAIL_USER}>`,
     to:      toEmail,
     subject: 'Your Verification Code – San Pablo City Tourism Office',
     html: `
@@ -137,7 +137,7 @@ async function sendSystemMessage(toEmail, subject, content, messageType = 'gener
   const typeLabel = messageType.charAt(0).toUpperCase() + messageType.slice(1);
   
   await transporter.sendMail({
-    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_USER}>`,
+    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_FROM || process.env.MAIL_USER}>`,
     to:      toEmail,
     subject: `${subject} – San Pablo City Tourism Office`,
     html: `
@@ -204,7 +204,7 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
     return;
   }
   await transporter.sendMail({
-    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_USER}>`,
+    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_FROM || process.env.MAIL_USER}>`,
     to:      toEmail,
     subject: 'Confirm Your New Email – San Pablo City Tourism Office',
     html: `
