@@ -1,36 +1,27 @@
-import nodemailer from 'nodemailer';
+import { BrevoClient } from '@getbrevo/brevo';
 
-const hasMailConfig = !!(process.env.MAIL_USER && process.env.MAIL_PASS);
+const hasBrevoConfig = !!process.env.BREVO_API_KEY;
 
-const transporter = hasMailConfig
-  ? nodemailer.createTransport({
-      host:   process.env.MAIL_HOST || 'smtp.gmail.com',
-      port:   parseInt(process.env.MAIL_PORT) || 587,
-      secure: false,
-      auth: {
-        user: process.env.MAIL_USER,
-        pass: process.env.MAIL_PASS,
-      },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 15000,
-    })
-  : null;
+const brevoClient = hasBrevoConfig ? new BrevoClient({ apiKey: process.env.BREVO_API_KEY }) : null;
 
-if (!hasMailConfig) {
-  console.warn('⚠️  Mail credentials (MAIL_USER/MAIL_PASS) not set. Emails will be skipped.');
+if (!hasBrevoConfig) {
+  console.warn('BREVO_API_KEY not set. Emails will be skipped.');
+} else {
+  console.log('Brevo mailer configured.');
 }
 
+const defaultSender = {
+  email: process.env.BREVO_FROM_EMAIL || process.env.MAIL_USER || 'noreply@example.com',
+  name:  process.env.BREVO_FROM_NAME || 'San Pablo City Tourism Office',
+};
+
 async function sendOtp(toEmail, otp) {
-  if (!transporter) {
-    console.warn(`Skipping OTP email to ${toEmail}: mailer not configured`);
-    return;
+  if (!brevoClient) {
+    throw new Error('Email service not configured (BREVO_API_KEY missing)');
   }
-  await transporter.sendMail({
-    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_FROM || process.env.MAIL_USER}>`,
-    to:      toEmail,
-    subject: 'Your Verification Code – San Pablo City Tourism Office',
-    html: `
+  try {
+    await brevoClient.transactionalEmails.sendTransacEmail({
+      htmlContent: `
       <!DOCTYPE html>
       <html lang="en">
       <head>
@@ -40,13 +31,11 @@ async function sendOtp(toEmail, otp) {
       </head>
       <body style="margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,sans-serif;">
 
-        <!-- Wrapper -->
         <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f6f9;padding:32px 0;">
           <tr>
             <td align="center">
               <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
 
-                <!-- Header / Branding -->
                 <tr>
                   <td style="background-color:#0077b6;padding:28px 40px;text-align:center;">
                     <p style="margin:0;font-size:12px;color:#cce7f5;letter-spacing:1.5px;text-transform:uppercase;">
@@ -61,7 +50,6 @@ async function sendOtp(toEmail, otp) {
                   </td>
                 </tr>
 
-                <!-- Body -->
                 <tr>
                   <td style="padding:36px 40px 28px;">
                     <h2 style="margin:0 0 12px;font-size:18px;color:#1a1a2e;">
@@ -73,7 +61,6 @@ async function sendOtp(toEmail, otp) {
                       Use the one-time password below to proceed.
                     </p>
 
-                    <!-- OTP Box -->
                     <table width="100%" cellpadding="0" cellspacing="0">
                       <tr>
                         <td align="center" style="padding:20px 0;">
@@ -90,7 +77,7 @@ async function sendOtp(toEmail, otp) {
                     </table>
 
                     <p style="margin:0 0 8px;font-size:13px;color:#e05c00;font-weight:600;text-align:center;">
-                      ⏱ This code expires in <strong>10 minutes</strong>.
+                      This code expires in <strong>10 minutes</strong>.
                     </p>
                     <p style="margin:16px 0 0;font-size:13px;color:#888;line-height:1.6;text-align:center;">
                       If you did not request this code, you can safely ignore this email.<br/>
@@ -99,14 +86,12 @@ async function sendOtp(toEmail, otp) {
                   </td>
                 </tr>
 
-                <!-- Divider -->
                 <tr>
                   <td style="padding:0 40px;">
                     <hr style="border:none;border-top:1px solid #eee;margin:0;"/>
                   </td>
                 </tr>
 
-                <!-- Footer -->
                 <tr>
                   <td style="padding:20px 40px 28px;text-align:center;">
                     <p style="margin:0;font-size:12px;color:#aaa;line-height:1.8;">
@@ -126,21 +111,26 @@ async function sendOtp(toEmail, otp) {
       </body>
       </html>
     `,
-  });
+      sender:  defaultSender,
+      subject: 'Your Verification Code – San Pablo City Tourism Office',
+      to:      [{ email: toEmail }],
+    });
+    console.log(`[MAIL] OTP sent successfully to ${toEmail}`);
+  } catch (err) {
+    console.error(`[MAIL ERROR] Failed to send OTP to ${toEmail}:`, err.response?.body || err.message);
+    throw err;
+  }
 }
 
 async function sendSystemMessage(toEmail, subject, content, messageType = 'general') {
-  if (!transporter) {
-    console.warn(`Skipping system message email to ${toEmail}: mailer not configured`);
-    return;
+  if (!brevoClient) {
+    throw new Error('Email service not configured (BREVO_API_KEY missing)');
   }
   const typeLabel = messageType.charAt(0).toUpperCase() + messageType.slice(1);
-  
-  await transporter.sendMail({
-    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_FROM || process.env.MAIL_USER}>`,
-    to:      toEmail,
-    subject: `${subject} – San Pablo City Tourism Office`,
-    html: `
+
+  try {
+    await brevoClient.transactionalEmails.sendTransacEmail({
+      htmlContent: `
       <!DOCTYPE html>
       <html lang="en">
       <head>
@@ -171,7 +161,7 @@ async function sendSystemMessage(toEmail, subject, content, messageType = 'gener
                     <div style="margin:0 0 20px;font-size:14px;color:#555;line-height:1.6;white-space: pre-wrap;">
                       ${content}
                     </div>
-                
+
                   </td>
                 </tr>
                 <tr>
@@ -195,19 +185,25 @@ async function sendSystemMessage(toEmail, subject, content, messageType = 'gener
       </body>
       </html>
     `,
-  });
+      sender:  defaultSender,
+      subject: `${subject} – San Pablo City Tourism Office`,
+      to:      [{ email: toEmail }],
+    });
+    console.log(`[MAIL] System message sent to ${toEmail}`);
+  } catch (err) {
+    console.error(`[MAIL ERROR] Failed to send system message to ${toEmail}:`, err.response?.body || err.message);
+    throw err;
+  }
 }
 
 async function sendEmailConfirmation(toEmail, confirmationUrl) {
-  if (!transporter) {
-    console.warn(`Skipping confirmation email to ${toEmail}: mailer not configured`);
-    return;
+  if (!brevoClient) {
+    throw new Error('Email service not configured (BREVO_API_KEY missing)');
   }
-  await transporter.sendMail({
-    from:    `"San Pablo City Tourism Office" <${process.env.MAIL_FROM || process.env.MAIL_USER}>`,
-    to:      toEmail,
-    subject: 'Confirm Your New Email – San Pablo City Tourism Office',
-    html: `
+
+  try {
+    await brevoClient.transactionalEmails.sendTransacEmail({
+      htmlContent: `
       <!DOCTYPE html>
       <html lang="en">
       <head>
@@ -266,7 +262,7 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
                     </p>
 
                     <p style="margin:16px 0 0;font-size:13px;color:#e05c00;font-weight:600;text-align:center;">
-                      ⏱ This link expires in <strong>24 hours</strong>.
+                      This link expires in <strong>24 hours</strong>.
                     </p>
                     <p style="margin:16px 0 0;font-size:13px;color:#888;line-height:1.6;text-align:center;">
                       If you did not request this change, you can safely ignore this email.
@@ -299,7 +295,15 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
       </body>
       </html>
     `,
-  });
+      sender:  defaultSender,
+      subject: 'Confirm Your New Email – San Pablo City Tourism Office',
+      to:      [{ email: toEmail }],
+    });
+    console.log(`[MAIL] Confirmation email sent to ${toEmail}`);
+  } catch (err) {
+    console.error(`[MAIL ERROR] Failed to send confirmation email to ${toEmail}:`, err.response?.body || err.message);
+    throw err;
+  }
 }
 
 export default { sendOtp, sendSystemMessage, sendEmailConfirmation };
