@@ -32,6 +32,39 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
 
     await connection.beginTransaction();
 
+    // Idempotency check — the mobile app supplies a client-generated UUID so
+    // that the offline SQLite row and the MySQL row share the same primary
+    // key. Under flaky connectivity, the request can succeed on the server
+    // (commit goes through) while the response never reaches the phone —
+    // e.g. connectivity drops right after commit. The client then retries
+    // with the *same* id, which previously caused a raw ER_DUP_ENTRY -> 409
+    // and left the local record permanently stuck, since it never learned
+    // the first attempt actually succeeded. Detecting the duplicate here and
+    // returning success instead lets a retried create resolve cleanly.
+    if (id) {
+      const [existingRows] = await connection.execute(
+        `SELECT id, business_id FROM guest_records WHERE id = ? LIMIT 1`,
+        [id]
+      );
+
+      if (existingRows.length > 0) {
+        const existing = existingRows[0];
+        await connection.commit(); // nothing was changed, just release the tx
+
+        if (existing.business_id !== businessId) {
+          // Same UUID somehow associated with a different business — this is
+          // a genuine conflict, not a retried create.
+          return res.status(409).json({ message: 'A record with that value already exists.' });
+        }
+
+        return res.status(200).json({
+          message: 'Guest entry already synced',
+          guestRecordId: existing.id,
+          alreadyExisted: true,
+        });
+      }
+    }
+
     await connection.execute(
       `INSERT INTO guest_records (
         id, business_id, check_in, check_out, total_guests, 

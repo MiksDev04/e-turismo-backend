@@ -81,7 +81,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
                         purpose_of_visit, transportation_mode, status, created_at
                  FROM guest_records 
                  WHERE ${whereClause}
-                 ORDER BY check_in DESC`;
+                 ORDER BY created_at DESC`;
     const queryParams = [...params];
     if (fetchAll !== 'true') {
       query += ' LIMIT ? OFFSET ?';
