@@ -115,7 +115,7 @@ router.post('/admin-setup/request', async (req, res, next) => {
     );
 
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
-    const confirmationUrl = `${backendUrl}/api/admin-setup/confirm?token=${token}`;
+    const confirmationUrl = `${backendUrl}/api/auth/admin-setup/confirm?token=${token}`;
 
     await mailer.sendEmailConfirmation(email, confirmationUrl, {
       subject: 'Confirm Your Admin Account – San Pablo City Tourism Office',

@@ -92,7 +92,7 @@ router.post('/register/send-confirmation', async (req, res, next) => {
     );
 
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
-    const confirmationUrl = `${backendUrl}/api/register/confirm?token=${token}`;
+    const confirmationUrl = `${backendUrl}/api/auth/register/confirm?token=${token}`;
 
     await mailer.sendEmailConfirmation(email, confirmationUrl, {
       subject: 'Confirm Your Email – San Pablo City Tourism Office',
