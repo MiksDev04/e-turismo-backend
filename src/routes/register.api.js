@@ -1,16 +1,181 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import upload from '../middleware/upload.js';
 import cloudinary from '../config/cloudinary.js';
+import mailer from '../utils/mailer.js';
 
 const router = express.Router();
 
-/**
- * POST /api/auth/register
- * Handles business user registration with file uploads.
- */
+const usernameRe = /^[a-zA-Z0-9_]{3,20}$/;
+const emailRe = /^[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}$/;
+const phoneRe = /^(09|\+639)\d{9}$/;
+const specialCharacterRe = /[!@#$%^&*()\-_=+\[\]{};:',.<>?\/\\|`~@]/;
+
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function normalizePhone(phoneNumber) {
+  return String(phoneNumber || '').replace(/[-\s]/g, '');
+}
+
+function validateBusinessAccount(body) {
+  const fullName = String(body.fullName || '').trim();
+  const username = String(body.username || '').trim().toLowerCase();
+  const email = normalizeEmail(body.email);
+  const phoneNumber = normalizePhone(body.phoneNumber);
+  const password = String(body.password || '');
+
+  if (!fullName) return 'Full name is required.';
+  if (!usernameRe.test(username)) {
+    return 'Username must be 3-20 characters using letters, numbers, or underscores.';
+  }
+  if (!emailRe.test(email)) return 'Enter a valid email address.';
+  if (!phoneRe.test(phoneNumber)) return 'Invalid phone number format.';
+  if (password.length < 8) return 'Password must be at least 8 characters long.';
+  if (!/[A-Z]/.test(password)) return 'Password must contain at least one uppercase letter.';
+  if (!/[0-9]/.test(password)) return 'Password must contain at least one number.';
+  if (!specialCharacterRe.test(password)) {
+    return 'Password must contain at least one special character.';
+  }
+
+  return null;
+}
+
+async function hasUserConflict({ username, email, connection = db.pool }) {
+  const [existingUsers] = await connection.execute(
+    `SELECT id FROM users
+     WHERE deleted_at IS NULL
+       AND (username = ? OR LOWER(email) = ?)
+     LIMIT 1`,
+    [username.trim().toLowerCase(), normalizeEmail(email)]
+  );
+  return existingUsers.length > 0;
+}
+
+router.post('/register/send-confirmation', async (req, res, next) => {
+  try {
+    const validationError = validateBusinessAccount(req.body);
+    if (validationError) {
+      return res.status(400).json({ message: validationError });
+    }
+
+    const fullName = req.body.fullName.trim();
+    const username = req.body.username.trim().toLowerCase();
+    const email = normalizeEmail(req.body.email);
+    const phoneNumber = normalizePhone(req.body.phoneNumber);
+    const password = String(req.body.password);
+
+    if (await hasUserConflict({ username, email })) {
+      return res.status(409).json({
+        message: 'Username or email is already taken.',
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const token = crypto.randomBytes(32).toString('hex');
+    const id = uuidv4();
+
+    await db.pool.execute(
+      `DELETE FROM pending_email_confirmations WHERE purpose = 'business_registration' AND email = ?`,
+      [email]
+    );
+
+    await db.pool.execute(
+      `INSERT INTO pending_email_confirmations
+         (id, purpose, full_name, username, email, phone, password_hash, confirmation_token, expires_at)
+       VALUES (?, 'business_registration', ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
+      [id, fullName, username, email, phoneNumber, hashedPassword, token]
+    );
+
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
+    const confirmationUrl = `${backendUrl}/api/register/confirm?token=${token}`;
+
+    await mailer.sendEmailConfirmation(email, confirmationUrl, {
+      subject: 'Confirm Your Email – San Pablo City Tourism Office',
+      label: 'Registration',
+      heading: 'Confirm Your Email Address',
+      body: `Thank you for registering with the <strong>San Pablo City Tourism Record Management System</strong>. Click the button below to confirm your email address and complete your registration.`,
+      buttonLabel: 'Confirm Email Address',
+    });
+
+    res.json({ message: 'Confirmation email sent. Please check your inbox.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/register/confirm', async (req, res, next) => {
+  try {
+    const { token } = req.query;
+
+    if (!token) {
+      return res.status(400).send(simpleHtmlPage('Invalid Link', 'Missing confirmation token.'));
+    }
+
+    const [rows] = await db.pool.execute(
+      `SELECT id, email, expires_at, confirmed_at
+       FROM pending_email_confirmations
+       WHERE purpose = 'business_registration' AND confirmation_token = ?
+       LIMIT 1`,
+      [token]
+    );
+
+    if (rows.length === 0) {
+      return res.status(400).send(simpleHtmlPage('Invalid Link', 'This confirmation link is not valid.'));
+    }
+
+    const pending = rows[0];
+
+    if (pending.confirmed_at) {
+      return res.send(simpleHtmlPage('Already Confirmed', 'Your email has already been confirmed. You can close this tab and continue your registration.'));
+    }
+
+    if (new Date(pending.expires_at) < new Date()) {
+      await db.pool.execute('DELETE FROM pending_email_confirmations WHERE id = ?', [pending.id]);
+      return res.status(400).send(simpleHtmlPage('Link Expired', 'This confirmation link has expired. Please start your registration again.'));
+    }
+
+    await db.pool.execute(
+      'UPDATE pending_email_confirmations SET confirmed_at = NOW() WHERE id = ?',
+      [pending.id]
+    );
+
+    res.send(simpleHtmlPage(
+      'Email Confirmed',
+      'Your email has been confirmed successfully. You can close this tab and continue your registration.'
+    ));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/register/confirmation-status', async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.query.email);
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required.' });
+    }
+
+    const [rows] = await db.pool.execute(
+      `SELECT confirmed_at
+       FROM pending_email_confirmations
+       WHERE purpose = 'business_registration' AND email = ?
+       LIMIT 1`,
+      [email]
+    );
+
+    const confirmed = rows.length > 0 && rows[0].confirmed_at !== null;
+    res.json({ confirmed });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/register', upload.fields([
   { name: 'permit_file', maxCount: 1 },
   { name: 'valid_id',    maxCount: 1 }
@@ -26,7 +191,7 @@ router.post('/register', upload.fields([
       businessName,
       tradeName,
       businessType,
-      businessLine, // Expecting JSON string if from multipart, or array if already parsed
+      businessLine,
       ownerFirstName,
       ownerMiddleName,
       ownerLastName,
@@ -40,9 +205,13 @@ router.post('/register', upload.fields([
       region
     } = req.body;
 
-    // 1. Basic Validation
-    if (!username || !password || !email || !businessName) {
-      return res.status(400).json({ message: 'Missing required fields' });
+    const accountValidationError = validateBusinessAccount(req.body);
+    if (accountValidationError) {
+      return res.status(400).json({ message: accountValidationError });
+    }
+
+    if (!businessName) {
+      return res.status(400).json({ message: 'Business name is required.' });
     }
 
     const files = req.files;
@@ -50,40 +219,53 @@ router.post('/register', upload.fields([
       return res.status(400).json({ message: 'Missing required files (permit or valid ID)' });
     }
 
-    // 2. Check if username exists
-    const [existingUsers] = await connection.execute(
-      'SELECT id FROM users WHERE username = ?',
-      [username.trim().toLowerCase()]
-    );
+    const normalizedUsername = username.trim().toLowerCase();
+    const normalizedEmail = normalizeEmail(email);
 
-    if (existingUsers.length > 0) {
-      return res.status(409).json({ message: 'Username is already taken.' });
+    if (await hasUserConflict({
+      username: normalizedUsername,
+      email: normalizedEmail,
+      connection,
+    })) {
+      return res.status(409).json({ message: 'Username or email is already taken.' });
     }
 
-    // 3. Start Transaction
+    const [pendingRows] = await connection.execute(
+      `SELECT id, password_hash
+       FROM pending_email_confirmations
+       WHERE purpose = 'business_registration'
+         AND email = ?
+         AND confirmed_at IS NOT NULL
+         AND expires_at > NOW()
+       LIMIT 1`,
+      [normalizedEmail]
+    );
+
+    if (pendingRows.length === 0) {
+      return res.status(400).json({ message: 'Please confirm your email before submitting.' });
+    }
+
+    const pending = pendingRows[0];
+
     await connection.beginTransaction();
 
     const userId = uuidv4();
-    const hashedPassword = await bcrypt.hash(password, 10);
 
-    // 4. Insert into users table
     await connection.execute(
       `INSERT INTO users (id, full_name, phone, email, username, password, role) 
        VALUES (?, ?, ?, ?, ?, ?, 'business')`,
       [
         userId,
         fullName,
-        phoneNumber,
-        email,
-        username.trim().toLowerCase(),
-        hashedPassword
+        normalizePhone(phoneNumber),
+        normalizedEmail,
+        normalizedUsername,
+        pending.password_hash
       ]
     );
 
-    // 5. Insert into businesses table
     const businessId = uuidv4();
 
-    // Upload files to Cloudinary
     const permitFile = files.permit_file[0];
     const validIdFile = files.valid_id[0];
 
@@ -106,7 +288,6 @@ router.post('/register', upload.fields([
     const permitUrl = permitUpload.secure_url;
     const validIdUrl = validIdUpload.secure_url;
 
-    // businessLine might be a string from multipart/form-data
     let parsedBusinessLine = businessLine;
     if (typeof businessLine === 'string') {
       try {
@@ -147,7 +328,8 @@ router.post('/register', upload.fields([
       ]
     );
 
-    // 6. Commit Transaction
+    await connection.execute('DELETE FROM pending_email_confirmations WHERE id = ?', [pending.id]);
+
     await connection.commit();
 
     res.status(201).json({
@@ -163,5 +345,36 @@ router.post('/register', upload.fields([
     connection.release();
   }
 });
+
+function simpleHtmlPage(title, message) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>${title} – San Pablo City Tourism Office</title>
+  <style>
+    body{margin:0;padding:0;background:#f4f6f9;font-family:Arial,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;}
+    .card{background:#fff;border-radius:12px;padding:48px 40px;max-width:480px;width:90%;box-shadow:0 4px 20px rgba(0,0,0,0.1);text-align:center;}
+    .icon{width:64px;height:64px;border-radius:50%;background:#e8f5e9;display:inline-flex;align-items:center;justify-content:center;margin-bottom:20px;}
+    .icon svg{width:32px;height:32px;fill:#2e7d32;}
+    h1{font-size:22px;color:#1a1a2e;margin:0 0 12px;}
+    p{font-size:15px;color:#555;line-height:1.6;margin:0 0 24px;}
+    .footer{font-size:12px;color:#aaa;line-height:1.8;margin-top:20px;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon"><svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></div>
+    <h1>${title}</h1>
+    <p>${message}</p>
+    <div class="footer">
+      <strong>San Pablo City Tourism Office</strong><br/>
+      San Pablo City, Laguna, Philippines
+    </div>
+  </div>
+</body>
+</html>`;
+}
 
 export default router;

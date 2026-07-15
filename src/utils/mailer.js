@@ -196,10 +196,16 @@ async function sendSystemMessage(toEmail, subject, content, messageType = 'gener
   }
 }
 
-async function sendEmailConfirmation(toEmail, confirmationUrl) {
+async function sendEmailConfirmation(toEmail, confirmationUrl, options = {}) {
   if (!brevoClient) {
     throw new Error('Email service not configured (BREVO_API_KEY missing)');
   }
+
+  const subject = options.subject || 'Confirm Your Email – San Pablo City Tourism Office';
+  const label = options.label || 'Email Change Request';
+  const heading = options.heading || 'Confirm Your New Email Address';
+  const body = options.body || 'You recently requested to change the email address associated with your <strong>San Pablo City Tourism Record Management System</strong> account. Click the button below to confirm this email address.';
+  const buttonLabel = options.buttonLabel || 'Confirm Email Address';
 
   try {
     await brevoClient.transactionalEmails.sendTransacEmail({
@@ -209,7 +215,7 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
       <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-        <title>Confirm Email Change</title>
+        <title>${heading}</title>
       </head>
       <body style="margin:0;padding:0;background-color:#f4f6f9;font-family:Arial,sans-serif;">
 
@@ -221,7 +227,7 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
                 <tr>
                   <td style="background-color:#0077b6;padding:28px 40px;text-align:center;">
                     <p style="margin:0;font-size:12px;color:#cce7f5;letter-spacing:1.5px;text-transform:uppercase;">
-                      Email Change Request
+                      ${label}
                     </p>
                     <h1 style="margin:6px 0 0;color:#ffffff;font-size:20px;font-weight:700;letter-spacing:0.5px;">
                       San Pablo City Tourism Office
@@ -235,12 +241,10 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
                 <tr>
                   <td style="padding:36px 40px 28px;">
                     <h2 style="margin:0 0 12px;font-size:18px;color:#1a1a2e;">
-                      Confirm Your New Email Address
+                      ${heading}
                     </h2>
                     <p style="margin:0 0 20px;font-size:14px;color:#555;line-height:1.6;">
-                      You recently requested to change the email address associated with your
-                      <strong>San Pablo City Tourism Record Management System</strong> account.
-                      Click the button below to confirm this email address.
+                      ${body}
                     </p>
 
                     <table width="100%" cellpadding="0" cellspacing="0">
@@ -250,7 +254,7 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
                              style="display:inline-block;background-color:#0077b6;color:#ffffff;
                                     text-decoration:none;padding:14px 36px;border-radius:6px;
                                     font-size:16px;font-weight:700;letter-spacing:0.5px;">
-                            Confirm Email Address
+                            ${buttonLabel}
                           </a>
                         </td>
                       </tr>
@@ -265,7 +269,7 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
                       This link expires in <strong>24 hours</strong>.
                     </p>
                     <p style="margin:16px 0 0;font-size:13px;color:#888;line-height:1.6;text-align:center;">
-                      If you did not request this change, you can safely ignore this email.
+                      If you did not request this, you can safely ignore this email.
                     </p>
                   </td>
                 </tr>
@@ -296,7 +300,7 @@ async function sendEmailConfirmation(toEmail, confirmationUrl) {
       </html>
     `,
       sender:  defaultSender,
-      subject: 'Confirm Your New Email – San Pablo City Tourism Office',
+      subject,
       to:      [{ email: toEmail }],
     });
     console.log(`[MAIL] Confirmation email sent to ${toEmail}`);
