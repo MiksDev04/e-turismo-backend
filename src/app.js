@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import errorHandler from './middleware/errorHandler.js';
 import verifyApiKey from './middleware/apiKey.js';
 import registerRoutes from './routes/register.api.js';
+import adminSetupRoutes from './routes/admin_setup.api.js';
 import loginRoutes from './routes/login.api.js';
 import profileRoutes from './routes/profile.api.js';
 import accommodationRoutes from './routes/accommodation.api.js';
@@ -54,6 +55,7 @@ app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 // ── Routes ────────────────────────────────────────────────────
 app.use('/api/auth', registerRoutes);
+app.use('/api/auth', adminSetupRoutes);
 app.use('/api/auth', loginRoutes);
 app.use('/api', profileRoutes);
 app.use('/api/admin/accommodations', accommodationRoutes);
