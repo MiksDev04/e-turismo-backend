@@ -214,6 +214,25 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
 });
 
 /**
+ * GET /api/admin/accommodations/:id/rooms
+ * Fetch individual rooms for a business
+ */
+router.get('/:id/rooms', adminGuard, async (req, res, next) => {
+  try {
+    const [rows] = await db.pool.execute(
+      `SELECT room_number, occupancy, room_status
+       FROM rooms
+       WHERE business_id = ?
+       ORDER BY room_number`,
+      [req.params.id]
+    );
+    res.json({ data: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * PUT /api/admin/accommodations/:id/approve
  * Approve a business
  */

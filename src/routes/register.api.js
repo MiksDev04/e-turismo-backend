@@ -328,6 +328,30 @@ router.post('/register', upload.fields([
       ]
     );
 
+    // Insert rooms
+    let parsedRooms = [];
+    if (req.body.rooms) {
+      try {
+        parsedRooms = typeof req.body.rooms === 'string'
+          ? JSON.parse(req.body.rooms)
+          : req.body.rooms;
+      } catch (e) {
+        parsedRooms = [];
+      }
+    }
+
+    for (const room of parsedRooms) {
+      const roomNumber = String(room.name || '').trim();
+      const occupancy = parseInt(room.capacity) || 1;
+      if (roomNumber) {
+        const roomId = uuidv4();
+        await connection.execute(
+          `INSERT INTO rooms (id, business_id, room_number, occupancy) VALUES (?, ?, ?, ?)`,
+          [roomId, businessId, roomNumber, occupancy]
+        );
+      }
+    }
+
     await connection.execute('DELETE FROM pending_email_confirmations WHERE id = ?', [pending.id]);
 
     await connection.commit();

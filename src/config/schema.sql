@@ -128,13 +128,13 @@ CREATE TABLE `rooms` (
   `business_id` char(36) NOT NULL,
   `room_number` varchar(50) NOT NULL,
   `occupancy` int NOT NULL DEFAULT '1' COMMENT 'Max guests the room can hold',
-  `is_occupied` tinyint(1) NOT NULL DEFAULT '0',
+  `room_status` enum('vacant','reserved','occupied','unavailable') NOT NULL DEFAULT 'vacant',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_rooms_business_room_number` (`business_id`,`room_number`),
   KEY `idx_rooms_business_id` (`business_id`),
-  KEY `idx_rooms_is_occupied` (`is_occupied`),
+  KEY `idx_rooms_room_status` (`room_status`),
   CONSTRAINT `rooms_business_id_fkey` FOREIGN KEY (`business_id`) REFERENCES `businesses` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
@@ -155,6 +155,8 @@ CREATE TABLE `guest_records` (
 
   -- Lead guest: the one whose valid ID was checked
   `lead_country` varchar(255) NOT NULL,
+  `lead_city_municipality` varchar(255) DEFAULT NULL,
+  `lead_province` varchar(255) DEFAULT NULL,
   `lead_nationality` enum('Filipino','Foreign') NOT NULL,
   `lead_philippines_region` varchar(255) DEFAULT NULL COMMENT 'Only set when lead_nationality = Filipino',
   `lead_is_overseas` tinyint(1) NOT NULL DEFAULT '0' COMMENT 'True if a Filipino lead guest resides abroad (balikbayan/OFW)',
@@ -164,6 +166,7 @@ CREATE TABLE `guest_records` (
   `status` enum('active','archived') NOT NULL DEFAULT 'active',
   `is_deleted` tinyint(1) NOT NULL DEFAULT '0',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
   PRIMARY KEY (`id`),
   KEY `idx_gr_business_id` (`business_id`),
