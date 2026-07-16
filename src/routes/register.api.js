@@ -45,6 +45,12 @@ function validateBusinessAccount(body) {
   return null;
 }
 
+function validateBusinessDetails(body) {
+  const aeId = String(body.aeId || '').trim();
+  if (!aeId) return 'AE ID is required.';
+  return null;
+}
+
 async function hasUserConflict({ username, email, connection = db.pool }) {
   const [existingUsers] = await connection.execute(
     `SELECT id FROM users
@@ -198,6 +204,7 @@ router.post('/register', upload.fields([
       totalRooms,
       permitNumber,
       registrationNumber,
+      aeId,
       street,
       barangay,
       cityMunicipality,
@@ -214,6 +221,11 @@ router.post('/register', upload.fields([
       return res.status(400).json({ message: 'Business name is required.' });
     }
 
+    const businessDetailError = validateBusinessDetails(req.body);
+    if (businessDetailError) {
+      return res.status(400).json({ message: businessDetailError });
+    }
+
     const files = req.files;
     if (!files || !files.permit_file || !files.valid_id) {
       return res.status(400).json({ message: 'Missing required files (permit or valid ID)' });
@@ -221,6 +233,7 @@ router.post('/register', upload.fields([
 
     const normalizedUsername = username.trim().toLowerCase();
     const normalizedEmail = normalizeEmail(email);
+    const normalizedAeId = String(aeId || '').trim();
 
     if (await hasUserConflict({
       username: normalizedUsername,
@@ -301,10 +314,10 @@ router.post('/register', upload.fields([
       `INSERT INTO businesses (
         id, user_id, business_name, tradename, business_type, 
         owner_first_name, owner_middle_name, owner_last_name, 
-        business_line, total_rooms, permit_number, registration_number, 
+        business_line, total_rooms, permit_number, registration_number, ae_id,
         street, barangay, city_municipality, province, region, 
         permit_file_url, valid_id_url, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
       [
         businessId,
         userId,
@@ -318,6 +331,7 @@ router.post('/register', upload.fields([
         parseInt(totalRooms) || 0,
         permitNumber,
         registrationNumber,
+        normalizedAeId,
         street,
         barangay,
         cityMunicipality,
