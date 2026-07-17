@@ -35,29 +35,29 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     const offset  = (pageNum - 1) * limit;
 
     // ── Build WHERE clause ────────────────────────────────────────────────
-    const conditions = ['business_id = ?', 'is_deleted = FALSE'];
+    const conditions = ['gr.business_id = ?', 'gr.is_deleted = FALSE'];
     const params     = [businessId];
 
     if (status === 'archived') {
-      conditions.push("status = 'archived'");
+      conditions.push("gr.status = 'archived'");
     } else {
-      conditions.push("status = 'active'");
+      conditions.push("gr.status = 'active'");
     }
 
     if (checkInFrom) {
-      conditions.push('check_in >= ?');
+      conditions.push('gr.check_in >= ?');
       params.push(checkInFrom);
     }
     if (checkOutTo) {
-      conditions.push('check_out <= ?');
+      conditions.push('gr.check_out <= ?');
       params.push(checkOutTo);
     }
     if (purpose && purpose !== 'All') {
-      conditions.push('purpose_of_visit = ?');
+      conditions.push('gr.purpose_of_visit = ?');
       params.push(purpose);
     }
     if (transport && transport !== 'All') {
-      conditions.push('transportation_mode = ?');
+      conditions.push('gr.transportation_mode = ?');
       params.push(transport);
     }
     const whereClause = conditions.join(' AND ');
@@ -66,7 +66,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     let totalCount = 0;
     if (fetchAll !== 'true') {
       const [countRows] = await connection.query(
-        `SELECT COUNT(*) as total FROM guest_records WHERE ${whereClause}`,
+        `SELECT COUNT(*) as total FROM guest_records gr WHERE ${whereClause}`,
         params
       );
       totalCount = countRows[0].total;
@@ -76,12 +76,17 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
       }
     }
 
-    // ── Fetch guest records ──────────────────────────────────────────────
-    let query = `SELECT id, business_id, check_in, check_out, total_guests, rooms_occupied, 
-                        purpose_of_visit, transportation_mode, status
-                 FROM guest_records 
+    // ── Fetch guest records with lead guest fields ───────────────────────
+    let query = `SELECT gr.id, gr.business_id, gr.check_in, gr.check_out,
+                        gr.length_of_stay, gr.total_guests,
+                        gr.purpose_of_visit, gr.transportation_mode,
+                        gr.lead_country, gr.lead_city_municipality, gr.lead_province,
+                        gr.lead_nationality, gr.lead_philippines_region, gr.lead_is_overseas,
+                        gr.lead_birthdate, gr.lead_sex,
+                        gr.status
+                 FROM guest_records gr
                  WHERE ${whereClause}
-                 ORDER BY check_in DESC`;
+                 ORDER BY gr.check_in DESC`;
     const queryParams = [...params];
     if (fetchAll !== 'true') {
       query += ' LIMIT ? OFFSET ?';
@@ -89,38 +94,36 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     }
     const [records] = await connection.query(query, queryParams);
 
-    // ── Fetch breakdowns for these records ────────────────────────────────
+    // ── Fetch rooms for these records via junction table ─────────────────
     const recordIds = records.map(r => r.id);
-    const placeholders = recordIds.map(() => '?').join(',');
-    const [breakdowns] = await connection.execute(
-      `SELECT id, guest_record_id, is_overseas, country, nationality, 
-              philippines_region, sex, age_group, count
-       FROM guest_breakdowns
-       WHERE guest_record_id IN (${placeholders})`,
-      recordIds
-    );
+    let roomsByRecord = {};
 
-    const breakdownsByRecord = {};
-    for (const b of breakdowns) {
-      if (!breakdownsByRecord[b.guest_record_id]) {
-        breakdownsByRecord[b.guest_record_id] = [];
+    if (recordIds.length > 0) {
+      const placeholders = recordIds.map(() => '?').join(',');
+      const [roomLinks] = await connection.execute(
+        `SELECT grr.guest_record_id, r.id AS room_id, r.room_number, r.capacity
+         FROM guest_record_rooms grr
+         JOIN rooms r ON r.id = grr.room_id
+         WHERE grr.guest_record_id IN (${placeholders})`,
+        recordIds
+      );
+
+      for (const rl of roomLinks) {
+        if (!roomsByRecord[rl.guest_record_id]) {
+          roomsByRecord[rl.guest_record_id] = [];
+        }
+        roomsByRecord[rl.guest_record_id].push({
+          id: rl.room_id,
+          roomNumber: rl.room_number,
+          capacity: rl.capacity,
+        });
       }
-      breakdownsByRecord[b.guest_record_id].push({
-        id: b.id,
-        guest_record_id: b.guest_record_id,
-        is_overseas: b.is_overseas === 1,
-        country: b.country,
-        nationality: b.nationality,
-        philippines_region: b.philippines_region,
-        sex: b.sex,
-        age_group: b.age_group,
-        count: b.count
-      });
     }
 
     const data = records.map(r => ({
       ...r,
-      guest_breakdowns: breakdownsByRecord[r.id] || []
+      leadIsOverseas: r.lead_is_overseas === 1,
+      rooms: roomsByRecord[r.id] || [],
     }));
 
     if (fetchAll === 'true') {
@@ -136,7 +139,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
 
 /**
  * PUT /api/business/guest-records/:id
- * Updates a guest record and its breakdowns
+ * Updates a guest record, room assignments, and room statuses
  */
 router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business'), async (req, res, next) => {
   const connection = await db.pool.getConnection();
@@ -146,15 +149,24 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       checkIn,
       checkOut,
       totalGuests,
-      roomsOccupied,
+      roomIds,
       purposeOfVisit,
       transportationMode,
-      breakdowns,
-      status, // Optional, could be used for archiving
-      businessId, // required for sync creates
+      status,
+      businessId,
+      leadCountry,
+      leadMunicipality,
+      leadProvince,
+      leadNationality,
+      leadPhilippinesRegion,
+      leadIsOverseas,
+      leadBirthdate,
+      leadSex,
     } = req.body;
 
     await connection.beginTransaction();
+
+    const lengthOfStay = Math.max(1, Math.round((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24)));
 
     // Check if record exists
     const [existing] = await connection.execute(
@@ -171,18 +183,30 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       }
       await connection.execute(
         `INSERT INTO guest_records (
-          id, business_id, check_in, check_out, total_guests, 
-          rooms_occupied, purpose_of_visit, transportation_mode, status, is_deleted, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
+          id, business_id, check_in, check_out, length_of_stay, total_guests,
+          purpose_of_visit, transportation_mode,
+          lead_country, lead_city_municipality, lead_province,
+          lead_nationality, lead_philippines_region, lead_is_overseas,
+          lead_birthdate, lead_sex,
+          status, is_deleted, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
         [
           recordId,
           businessId,
           checkIn,
           checkOut,
+          lengthOfStay,
           totalGuests,
-          roomsOccupied,
           purposeOfVisit,
           transportationMode,
+          leadCountry || null,
+          leadMunicipality || null,
+          leadProvince || null,
+          leadNationality || null,
+          leadPhilippinesRegion || null,
+          leadIsOverseas ? 1 : 0,
+          leadBirthdate || null,
+          leadSex || null,
           status || 'active',
           now
         ]
@@ -190,52 +214,73 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
     } else {
       // Update existing
       await connection.execute(
-        `UPDATE guest_records SET 
-          check_in = ?, check_out = ?, total_guests = ?, 
-          rooms_occupied = ?, purpose_of_visit = ?, transportation_mode = ?, 
+        `UPDATE guest_records SET
+          check_in = ?, check_out = ?, length_of_stay = ?, total_guests = ?,
+          purpose_of_visit = ?, transportation_mode = ?,
+          lead_country = ?, lead_city_municipality = ?, lead_province = ?,
+          lead_nationality = ?, lead_philippines_region = ?, lead_is_overseas = ?,
+          lead_birthdate = ?, lead_sex = ?,
           status = COALESCE(?, status)
          WHERE id = ?`,
         [
           checkIn,
           checkOut,
+          lengthOfStay,
           totalGuests,
-          roomsOccupied,
           purposeOfVisit,
           transportationMode,
+          leadCountry || null,
+          leadMunicipality || null,
+          leadProvince || null,
+          leadNationality || null,
+          leadPhilippinesRegion || null,
+          leadIsOverseas ? 1 : 0,
+          leadBirthdate || null,
+          leadSex || null,
           status || null,
           recordId
         ]
       );
     }
 
-    // Replace all breakdowns
-    if (breakdowns !== undefined) {
-      await connection.execute(
-        `DELETE FROM guest_breakdowns WHERE guest_record_id = ?`,
+    // Replace room assignments
+    if (roomIds !== undefined) {
+      // Release old rooms back to vacant
+      const [oldLinks] = await connection.execute(
+        `SELECT room_id FROM guest_record_rooms WHERE guest_record_id = ?`,
         [recordId]
       );
 
-      if (breakdowns.length > 0) {
-        for (const b of breakdowns) {
-          const breakdownId = uuidv4();
+      if (oldLinks.length > 0) {
+        const oldRoomIds = oldLinks.map(l => l.room_id);
+        const placeholders = oldRoomIds.map(() => '?').join(',');
+        await connection.execute(
+          `UPDATE rooms SET room_status = 'vacant' WHERE id IN (${placeholders}) AND room_status = 'occupied'`,
+          oldRoomIds
+        );
+      }
+
+      // Delete old junction entries
+      await connection.execute(
+        `DELETE FROM guest_record_rooms WHERE guest_record_id = ?`,
+        [recordId]
+      );
+
+      // Insert new junction entries and mark rooms occupied
+      if (roomIds.length > 0) {
+        for (const roomId of roomIds) {
+          const junctionId = uuidv4();
           await connection.execute(
-            `INSERT INTO guest_breakdowns (
-              id, guest_record_id, is_overseas, country, nationality, 
-              philippines_region, sex, age_group, count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              breakdownId,
-              recordId,
-              b.isOverseas ? 1 : 0,
-              b.country || null,
-              b.nationality || null,
-              b.philippinesRegion || null,
-              b.sex,
-              b.ageGroup,
-              b.count
-            ]
+            `INSERT INTO guest_record_rooms (id, guest_record_id, room_id) VALUES (?, ?, ?)`,
+            [junctionId, recordId, roomId]
           );
         }
+
+        const placeholders = roomIds.map(() => '?').join(',');
+        await connection.execute(
+          `UPDATE rooms SET room_status = 'occupied' WHERE id IN (${placeholders})`,
+          roomIds
+        );
       }
     }
 
@@ -248,6 +293,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
     connection.release();
   }
 });
+
 /**
  * GET /api/business/guest-records/:id/updated-at
  * Fetch the last updated timestamp of a guest record
@@ -263,7 +309,6 @@ router.get('/guest-records/:id/updated-at', auth.authenticate, auth.requireRole(
     if (existing.length === 0) {
       return res.status(404).json({ message: 'Record not found' });
     }
-    // Note: if there is no updated_at, fallback to created_at if needed, but assuming table has it or we can return null
     res.json({ updated_at: existing[0].updated_at || null });
   } catch (err) {
     next(err);

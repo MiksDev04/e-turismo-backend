@@ -220,7 +220,7 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
 router.get('/:id/rooms', adminGuard, async (req, res, next) => {
   try {
     const [rows] = await db.pool.execute(
-      `SELECT room_number, occupancy, room_status
+      `SELECT room_number, capacity, room_status
        FROM rooms
        WHERE business_id = ?
        ORDER BY room_number`,

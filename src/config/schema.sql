@@ -128,7 +128,7 @@ CREATE TABLE `rooms` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
   `business_id` char(36) NOT NULL,
   `room_number` varchar(50) NOT NULL,
-  `occupancy` int NOT NULL DEFAULT '1' COMMENT 'Max guests the room can hold',
+  `capacity` int NOT NULL DEFAULT '1' COMMENT 'Max guests the room can hold',
   `room_status` enum('vacant','reserved','occupied','unavailable') NOT NULL DEFAULT 'vacant',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

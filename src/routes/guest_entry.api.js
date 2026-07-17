@@ -6,8 +6,40 @@ import auth from '../middleware/auth.js';
 const router = express.Router();
 
 /**
+ * GET /api/business/vacant-rooms
+ * Fetch all vacant rooms for a business
+ */
+router.get('/vacant-rooms', auth.authenticate, auth.requireRole('business'), async (req, res, next) => {
+  try {
+    const { businessId } = req.query;
+    if (!businessId) {
+      return res.status(400).json({ message: 'Missing businessId parameter' });
+    }
+
+    const [rows] = await db.pool.execute(
+      `SELECT id, room_number, capacity, room_status
+       FROM rooms
+       WHERE business_id = ? AND room_status = 'vacant'
+       ORDER BY room_number`,
+      [businessId]
+    );
+
+    const data = rows.map(r => ({
+      id: r.id,
+      roomNumber: r.room_number,
+      capacity: r.capacity,
+      roomStatus: r.room_status,
+    }));
+
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * POST /api/business/guest-entries
- * Submits a new guest entry with demographics
+ * Submits a new guest entry with lead guest demographics and room assignments
  */
 router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), async (req, res, next) => {
   const connection = await db.pool.getConnection();
@@ -18,29 +50,29 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       checkIn,
       checkOut,
       totalGuests,
-      roomsOccupied,
+      roomIds,
       purposeOfVisit,
       transportationMode,
-      breakdowns
+      leadCountry,
+      leadMunicipality,
+      leadProvince,
+      leadNationality,
+      leadPhilippinesRegion,
+      leadIsOverseas,
+      leadBirthdate,
+      leadSex,
     } = req.body;
 
-    if (!businessId || !checkIn || !checkOut || !totalGuests || roomsOccupied === undefined) {
+    if (!businessId || !checkIn || !checkOut || !totalGuests || !roomIds || roomIds.length === 0) {
       return res.status(400).json({ message: 'Missing required fields' });
     }
 
     const guestRecordId = id || uuidv4();
+    const lengthOfStay = Math.max(1, Math.round((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24)));
 
     await connection.beginTransaction();
 
-    // Idempotency check — the mobile app supplies a client-generated UUID so
-    // that the offline SQLite row and the MySQL row share the same primary
-    // key. Under flaky connectivity, the request can succeed on the server
-    // (commit goes through) while the response never reaches the phone —
-    // e.g. connectivity drops right after commit. The client then retries
-    // with the *same* id, which previously caused a raw ER_DUP_ENTRY -> 409
-    // and left the local record permanently stuck, since it never learned
-    // the first attempt actually succeeded. Detecting the duplicate here and
-    // returning success instead lets a retried create resolve cleanly.
+    // Idempotency check
     if (id) {
       const [existingRows] = await connection.execute(
         `SELECT id, business_id FROM guest_records WHERE id = ? LIMIT 1`,
@@ -49,11 +81,9 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
 
       if (existingRows.length > 0) {
         const existing = existingRows[0];
-        await connection.commit(); // nothing was changed, just release the tx
+        await connection.commit();
 
         if (existing.business_id !== businessId) {
-          // Same UUID somehow associated with a different business — this is
-          // a genuine conflict, not a retried create.
           return res.status(409).json({ message: 'A record with that value already exists.' });
         }
 
@@ -65,44 +95,52 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       }
     }
 
+    // Compute length_of_stay from dates
     await connection.execute(
       `INSERT INTO guest_records (
-        id, business_id, check_in, check_out, total_guests, 
-        rooms_occupied, purpose_of_visit, transportation_mode, status, is_deleted
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', FALSE)`,
+        id, business_id, check_in, check_out, length_of_stay, total_guests,
+        purpose_of_visit, transportation_mode,
+        lead_country, lead_city_municipality, lead_province,
+        lead_nationality, lead_philippines_region, lead_is_overseas,
+        lead_birthdate, lead_sex,
+        status, is_deleted
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', FALSE)`,
       [
         guestRecordId,
         businessId,
         checkIn,
         checkOut,
+        lengthOfStay,
         totalGuests,
-        roomsOccupied,
         purposeOfVisit,
-        transportationMode
+        transportationMode,
+        leadCountry || null,
+        leadMunicipality || null,
+        leadProvince || null,
+        leadNationality || null,
+        leadPhilippinesRegion || null,
+        leadIsOverseas ? 1 : 0,
+        leadBirthdate || null,
+        leadSex || null,
       ]
     );
 
-    if (breakdowns && breakdowns.length > 0) {
-      for (const b of breakdowns) {
-        const breakdownId = uuidv4();
+    // Insert room associations into junction table
+    if (roomIds && roomIds.length > 0) {
+      for (const roomId of roomIds) {
+        const junctionId = uuidv4();
         await connection.execute(
-          `INSERT INTO guest_breakdowns (
-            id, guest_record_id, is_overseas, country, nationality, 
-            philippines_region, sex, age_group, count
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            breakdownId,
-            guestRecordId,
-            b.isOverseas ? 1 : 0,
-            b.country || null,
-            b.nationality || null,
-            b.philippinesRegion || null,
-            b.sex,
-            b.ageGroup,
-            b.count
-          ]
+          `INSERT INTO guest_record_rooms (id, guest_record_id, room_id) VALUES (?, ?, ?)`,
+          [junctionId, guestRecordId, roomId]
         );
       }
+
+      // Mark selected rooms as occupied
+      const placeholders = roomIds.map(() => '?').join(',');
+      await connection.execute(
+        `UPDATE rooms SET room_status = 'occupied' WHERE id IN (${placeholders})`,
+        roomIds
+      );
     }
 
     await connection.commit();

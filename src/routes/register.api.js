@@ -356,12 +356,12 @@ router.post('/register', upload.fields([
 
     for (const room of parsedRooms) {
       const roomNumber = String(room.name || '').trim();
-      const occupancy = parseInt(room.capacity) || 1;
+      const capacity = parseInt(room.capacity) || 1;
       if (roomNumber) {
         const roomId = uuidv4();
         await connection.execute(
-          `INSERT INTO rooms (id, business_id, room_number, occupancy) VALUES (?, ?, ?, ?)`,
-          [roomId, businessId, roomNumber, occupancy]
+          `INSERT INTO rooms (id, business_id, room_number, capacity) VALUES (?, ?, ?, ?)`,
+          [roomId, businessId, roomNumber, capacity]
         );
       }
     }
