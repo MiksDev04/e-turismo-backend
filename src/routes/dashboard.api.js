@@ -69,7 +69,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('admin', 'busin
       return res.status(400).json({ message: 'Missing date parameters' });
     }
 
-    let query = `SELECT id, business_id, check_in, check_out, total_guests, rooms_occupied, purpose_of_visit
+    let query = `SELECT id, business_id, check_in, check_out, total_guests, purpose_of_visit
                  FROM guest_records 
                  WHERE is_deleted = FALSE 
                    AND check_in >= ? AND check_in <= ?`;
@@ -121,9 +121,21 @@ router.get('/breakdowns', auth.authenticate, auth.requireRole('admin', 'business
 
     const placeholders = idsArray.map(() => '?').join(',');
     const [rows] = await connection.execute(
-      `SELECT guest_record_id, country, philippines_region, sex, age_group, count
-       FROM guest_breakdowns
-       WHERE guest_record_id IN (${placeholders})`,
+      `SELECT id AS guest_record_id, lead_country AS country,
+              lead_philippines_region AS philippines_region,
+              lead_sex AS sex,
+              CASE
+                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
+                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 17 THEN '10-17'
+                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 25 THEN '18-25'
+                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 35 THEN '26-35'
+                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 45 THEN '36-45'
+                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 55 THEN '46-55'
+                ELSE '56+'
+              END AS age_group,
+              1 AS count
+       FROM guest_records
+       WHERE id IN (${placeholders}) AND is_deleted = FALSE`,
       idsArray
     );
 
@@ -184,7 +196,7 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     );
 
     const [periodRecords] = await connection.execute(
-      `SELECT id, business_id, check_in, check_out, total_guests, rooms_occupied, purpose_of_visit
+      `SELECT id, business_id, check_in, check_out, total_guests, purpose_of_visit
        FROM guest_records WHERE is_deleted = FALSE AND check_in >= ? AND check_in <= ?`,
       [startDate, endDate]
     );
@@ -194,7 +206,7 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
       yearRecords = periodRecords;
     } else {
       const [rows] = await connection.execute(
-        `SELECT id, business_id, check_in, check_out, total_guests, rooms_occupied, purpose_of_visit
+        `SELECT id, business_id, check_in, check_out, total_guests, purpose_of_visit
          FROM guest_records WHERE is_deleted = FALSE AND check_in >= ? AND check_in <= ?`,
         [yearStart, yearEnd]
       );
@@ -206,9 +218,21 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     if (recordIds.length > 0) {
       const placeholders = recordIds.map(() => '?').join(',');
       const [rows] = await connection.execute(
-        `SELECT guest_record_id, country, philippines_region, sex, age_group, count
-         FROM guest_breakdowns
-         WHERE guest_record_id IN (${placeholders})`,
+        `SELECT id AS guest_record_id, lead_country AS country,
+                lead_philippines_region AS philippines_region,
+                lead_sex AS sex,
+                CASE
+                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
+                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 17 THEN '10-17'
+                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 25 THEN '18-25'
+                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 35 THEN '26-35'
+                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 45 THEN '36-45'
+                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 55 THEN '46-55'
+                  ELSE '56+'
+                END AS age_group,
+                1 AS count
+         FROM guest_records
+         WHERE id IN (${placeholders}) AND is_deleted = FALSE`,
         recordIds
       );
       breakdowns = rows;
