@@ -63,7 +63,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       leadSex,
     } = req.body;
 
-    if (!businessId || !checkIn || !checkOut || !totalGuests || !roomIds || roomIds.length === 0) {
+    if (!businessId || !checkIn || !checkOut || !totalGuests) {
       return res.status(400).json({ message: 'Missing required fields' });
     }
 
@@ -117,7 +117,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
         leadCountry || null,
         leadMunicipality || null,
         leadProvince || null,
-        leadNationality || null,
+        leadIsOverseas ? null : (leadNationality || 'Foreign'),
         leadPhilippinesRegion || null,
         leadIsOverseas ? 1 : 0,
         leadBirthdate || null,

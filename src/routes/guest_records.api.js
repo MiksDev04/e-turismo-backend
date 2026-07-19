@@ -86,7 +86,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
                         gr.status, gr.created_at, gr.updated_at
                  FROM guest_records gr
                  WHERE ${whereClause}
-                 ORDER BY gr.check_in DESC`;
+                 ORDER BY gr.created_at DESC`;
     const queryParams = [...params];
     if (fetchAll !== 'true') {
       query += ' LIMIT ? OFFSET ?';
@@ -202,7 +202,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
           leadCountry || null,
           leadMunicipality || null,
           leadProvince || null,
-          leadNationality || null,
+          leadIsOverseas ? null : (leadNationality || 'Foreign'),
           leadPhilippinesRegion || null,
           leadIsOverseas ? 1 : 0,
           leadBirthdate || null,
@@ -232,7 +232,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
           leadCountry || null,
           leadMunicipality || null,
           leadProvince || null,
-          leadNationality || null,
+          leadIsOverseas ? null : (leadNationality || 'Foreign'),
           leadPhilippinesRegion || null,
           leadIsOverseas ? 1 : 0,
           leadBirthdate || null,

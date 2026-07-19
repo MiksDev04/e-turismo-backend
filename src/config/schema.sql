@@ -158,7 +158,7 @@ CREATE TABLE `guest_records` (
   `lead_country` varchar(255) NOT NULL,
   `lead_city_municipality` varchar(255) DEFAULT NULL,
   `lead_province` varchar(255) DEFAULT NULL,
-  `lead_nationality` enum('Filipino','Foreign') NOT NULL,
+  `lead_nationality` enum('Filipino','Foreign') DEFAULT NULL,
   `lead_philippines_region` varchar(255) DEFAULT NULL COMMENT 'Only set when lead_nationality = Filipino',
   `lead_is_overseas` tinyint(1) NOT NULL DEFAULT '0' COMMENT 'True if a Filipino lead guest resides abroad (balikbayan/OFW)',
   `lead_birthdate` date NOT NULL COMMENT 'Age at time of stay is derived from this + check_in, not stored',
