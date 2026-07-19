@@ -130,7 +130,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       for (const roomId of roomIds) {
         const junctionId = uuidv4();
         await connection.execute(
-          `INSERT INTO guest_record_rooms (id, guest_record_id, room_id) VALUES (?, ?, ?)`,
+          `INSERT INTO guest_record_rooms (id, guest_record_id, room_id, status) VALUES (?, ?, ?, 'active')`,
           [junctionId, guestRecordId, roomId]
         );
       }

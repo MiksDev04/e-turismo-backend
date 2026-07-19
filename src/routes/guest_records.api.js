@@ -78,6 +78,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
 
     // ── Fetch guest records with lead guest fields ───────────────────────
     let query = `SELECT gr.id, gr.business_id, gr.check_in, gr.check_out,
+                        gr.actual_check_out,
                         gr.length_of_stay, gr.total_guests,
                         gr.purpose_of_visit, gr.transportation_mode,
                         gr.lead_country, gr.lead_city_municipality, gr.lead_province,
@@ -101,7 +102,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     if (recordIds.length > 0) {
       const placeholders = recordIds.map(() => '?').join(',');
       const [roomLinks] = await connection.execute(
-        `SELECT grr.guest_record_id, r.id AS room_id, r.room_number, r.capacity
+        `SELECT grr.guest_record_id, r.id AS room_id, r.room_number, r.capacity, grr.status AS link_status
          FROM guest_record_rooms grr
          JOIN rooms r ON r.id = grr.room_id
          WHERE grr.guest_record_id IN (${placeholders})`,
@@ -116,6 +117,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
           id: rl.room_id,
           roomNumber: rl.room_number,
           capacity: rl.capacity,
+          status: rl.link_status,
         });
       }
     }
@@ -148,6 +150,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
     const {
       checkIn,
       checkOut,
+      actualCheckOut,
       totalGuests,
       roomIds,
       purposeOfVisit,
@@ -183,18 +186,19 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       }
       await connection.execute(
         `INSERT INTO guest_records (
-          id, business_id, check_in, check_out, length_of_stay, total_guests,
+          id, business_id, check_in, check_out, actual_check_out, length_of_stay, total_guests,
           purpose_of_visit, transportation_mode,
           lead_country, lead_city_municipality, lead_province,
           lead_nationality, lead_philippines_region, lead_is_overseas,
           lead_birthdate, lead_sex,
           status, is_deleted, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
         [
           recordId,
           businessId,
           checkIn,
           checkOut,
+          actualCheckOut || null,
           lengthOfStay,
           totalGuests,
           purposeOfVisit,
@@ -213,67 +217,122 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       );
     } else {
       // Update existing
+      const updateFields = [
+        `check_in = ?`, `check_out = ?`, `length_of_stay = ?`, `total_guests = ?`,
+        `purpose_of_visit = ?`, `transportation_mode = ?`,
+        `lead_country = ?`, `lead_city_municipality = ?`, `lead_province = ?`,
+        `lead_nationality = ?`, `lead_philippines_region = ?`, `lead_is_overseas = ?`,
+        `lead_birthdate = ?`, `lead_sex = ?`,
+        `status = COALESCE(?, status)`,
+      ];
+      const updateParams = [
+        checkIn,
+        checkOut,
+        lengthOfStay,
+        totalGuests,
+        purposeOfVisit,
+        transportationMode,
+        leadCountry || null,
+        leadMunicipality || null,
+        leadProvince || null,
+        leadIsOverseas ? null : (leadNationality || 'Foreign'),
+        leadPhilippinesRegion || null,
+        leadIsOverseas ? 1 : 0,
+        leadBirthdate || null,
+        leadSex || null,
+        status || null,
+      ];
+
+      if (actualCheckOut !== undefined) {
+        updateFields.push(`actual_check_out = ?`);
+        updateParams.push(actualCheckOut || null);
+      }
+
+      updateParams.push(recordId);
       await connection.execute(
-        `UPDATE guest_records SET
-          check_in = ?, check_out = ?, length_of_stay = ?, total_guests = ?,
-          purpose_of_visit = ?, transportation_mode = ?,
-          lead_country = ?, lead_city_municipality = ?, lead_province = ?,
-          lead_nationality = ?, lead_philippines_region = ?, lead_is_overseas = ?,
-          lead_birthdate = ?, lead_sex = ?,
-          status = COALESCE(?, status)
-         WHERE id = ?`,
-        [
-          checkIn,
-          checkOut,
-          lengthOfStay,
-          totalGuests,
-          purposeOfVisit,
-          transportationMode,
-          leadCountry || null,
-          leadMunicipality || null,
-          leadProvince || null,
-          leadIsOverseas ? null : (leadNationality || 'Foreign'),
-          leadPhilippinesRegion || null,
-          leadIsOverseas ? 1 : 0,
-          leadBirthdate || null,
-          leadSex || null,
-          status || null,
-          recordId
-        ]
+        `UPDATE guest_records SET ${updateFields.join(', ')} WHERE id = ?`,
+        updateParams
       );
     }
 
-    // Replace room assignments
-    if (roomIds !== undefined) {
-      // Release old rooms back to vacant
+    // ── Handle room assignment changes ──────────────────────────────────
+    const isCheckout = actualCheckOut !== undefined && actualCheckOut !== null;
+
+    if (isCheckout && roomIds === undefined) {
+      // Checkout only (no room reassignment) — mark all active links as completed
+      const [activeLinks] = await connection.execute(
+        `SELECT room_id FROM guest_record_rooms WHERE guest_record_id = ? AND status = 'active'`,
+        [recordId]
+      );
+
+      if (activeLinks.length > 0) {
+        const activeRoomIds = activeLinks.map(l => l.room_id);
+        const placeholders = activeRoomIds.map(() => '?').join(',');
+
+        // Set rooms back to vacant
+        await connection.execute(
+          `UPDATE rooms SET room_status = 'vacant' WHERE id IN (${placeholders}) AND room_status = 'occupied'`,
+          activeRoomIds
+        );
+
+        // Mark junction rows as completed (preserved as history)
+        await connection.execute(
+          `UPDATE guest_record_rooms SET status = 'completed' WHERE guest_record_id = ? AND status = 'active'`,
+          [recordId]
+        );
+      }
+    } else if (roomIds !== undefined) {
+      // Normal edit or checkout with room reassignment
       const [oldLinks] = await connection.execute(
-        `SELECT room_id FROM guest_record_rooms WHERE guest_record_id = ?`,
+        `SELECT room_id FROM guest_record_rooms WHERE guest_record_id = ? AND status = 'active'`,
         [recordId]
       );
 
       if (oldLinks.length > 0) {
         const oldRoomIds = oldLinks.map(l => l.room_id);
         const placeholders = oldRoomIds.map(() => '?').join(',');
+
+        // Set old rooms back to vacant
         await connection.execute(
           `UPDATE rooms SET room_status = 'vacant' WHERE id IN (${placeholders}) AND room_status = 'occupied'`,
           oldRoomIds
         );
+
+        // Mark removed rooms as completed (preserve history)
+        const removedIds = oldRoomIds.filter(id => !roomIds.includes(id));
+        if (removedIds.length > 0) {
+          const removedPlaceholders = removedIds.map(() => '?').join(',');
+          await connection.execute(
+            `UPDATE guest_record_rooms SET status = 'completed' WHERE guest_record_id = ? AND room_id IN (${removedPlaceholders}) AND status = 'active'`,
+            [recordId, ...removedIds]
+          );
+        }
       }
 
-      // Delete old junction entries
-      await connection.execute(
-        `DELETE FROM guest_record_rooms WHERE guest_record_id = ?`,
-        [recordId]
-      );
-
-      // Insert new junction entries and mark rooms occupied
+      // Insert new room assignments as active
       if (roomIds.length > 0) {
         for (const roomId of roomIds) {
-          const junctionId = uuidv4();
-          await connection.execute(
-            `INSERT INTO guest_record_rooms (id, guest_record_id, room_id) VALUES (?, ?, ?)`,
-            [junctionId, recordId, roomId]
+          // Check if a completed link already exists for this room
+          const [existingLink] = await connection.execute(
+            `SELECT id, status FROM guest_record_rooms WHERE guest_record_id = ? AND room_id = ?`,
+            [recordId, roomId]
           );
+
+          if (existingLink.length > 0) {
+            // Reactivate if it was completed
+            if (existingLink[0].status === 'completed') {
+              await connection.execute(
+                `UPDATE guest_record_rooms SET status = 'active' WHERE guest_record_id = ? AND room_id = ?`,
+                [recordId, roomId]
+              );
+            }
+          } else {
+            const junctionId = uuidv4();
+            await connection.execute(
+              `INSERT INTO guest_record_rooms (id, guest_record_id, room_id, status) VALUES (?, ?, ?, 'active')`,
+              [junctionId, recordId, roomId]
+            );
+          }
         }
 
         const placeholders = roomIds.map(() => '?').join(',');

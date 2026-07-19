@@ -149,6 +149,7 @@ CREATE TABLE `guest_records` (
   -- Stay details
   `check_in` date NOT NULL,
   `check_out` date NOT NULL,
+  `actual_check_out` datetime DEFAULT NULL COMMENT 'Actual datetime when guest checked out',
   `length_of_stay` int NOT NULL COMMENT 'Nights; app computes as DATEDIFF(check_out, check_in), min 1',
   `total_guests` int NOT NULL,
   `purpose_of_visit` varchar(255) NOT NULL,
@@ -189,12 +190,14 @@ CREATE TABLE `guest_record_rooms` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
   `guest_record_id` char(36) NOT NULL,
   `room_id` char(36) NOT NULL,
+  `status` enum('active','completed') NOT NULL DEFAULT 'active',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_grr_record_room` (`guest_record_id`,`room_id`),
   KEY `idx_grr_guest_record_id` (`guest_record_id`),
   KEY `idx_grr_room_id` (`room_id`),
+  KEY `idx_grr_status` (`status`),
   CONSTRAINT `guest_record_rooms_guest_record_id_fkey` FOREIGN KEY (`guest_record_id`) REFERENCES `guest_records` (`id`) ON DELETE CASCADE,
   CONSTRAINT `guest_record_rooms_room_id_fkey` FOREIGN KEY (`room_id`) REFERENCES `rooms` (`id`) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
