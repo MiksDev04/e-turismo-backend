@@ -11,6 +11,7 @@ import profileRoutes from './routes/profile.api.js';
 import accommodationRoutes from './routes/accommodation.api.js';
 import guestEntryRoutes from './routes/guest_entry.api.js';
 import guestRecordsRoutes from './routes/guest_records.api.js';
+import roomRoutes from './routes/rooms.api.js';
 import dashboardRoutes from './routes/dashboard.api.js';
 import messageRoutes from './routes/messages.api.js';
 import complianceRoutes from './routes/compliance.api.js';
@@ -63,6 +64,7 @@ app.use('/api/admin/compliance', complianceRoutes);
 app.use('/api/admin', reportRoutes);
 app.use('/api/business', guestEntryRoutes);
 app.use('/api/business', guestRecordsRoutes);
+app.use('/api/business', roomRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/messages', messageRoutes);
 

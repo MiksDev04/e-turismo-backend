@@ -190,6 +190,7 @@ CREATE TABLE `guest_record_rooms` (
   `guest_record_id` char(36) NOT NULL,
   `room_id` char(36) NOT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_grr_record_room` (`guest_record_id`,`room_id`),
   KEY `idx_grr_guest_record_id` (`guest_record_id`),

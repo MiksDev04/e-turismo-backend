@@ -83,7 +83,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
                         gr.lead_country, gr.lead_city_municipality, gr.lead_province,
                         gr.lead_nationality, gr.lead_philippines_region, gr.lead_is_overseas,
                         gr.lead_birthdate, gr.lead_sex,
-                        gr.status
+                        gr.status, gr.created_at, gr.updated_at
                  FROM guest_records gr
                  WHERE ${whereClause}
                  ORDER BY gr.check_in DESC`;
