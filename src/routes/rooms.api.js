@@ -109,11 +109,28 @@ router.post('/rooms', auth.authenticate, auth.requireRole('business'), async (re
     const roomId = id || uuidv4();
     const roomCapacity = Math.max(1, parseInt(capacity, 10) || 1);
 
-    await db.pool.execute(
-      `INSERT INTO rooms (id, business_id, room_number, capacity, room_status)
-       VALUES (?, ?, ?, ?, 'vacant')`,
-      [roomId, businessId, roomNumber.trim(), roomCapacity]
-    );
+    const connection = await db.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+
+      await connection.execute(
+        `INSERT INTO rooms (id, business_id, room_number, capacity, room_status)
+         VALUES (?, ?, ?, ?, 'vacant')`,
+        [roomId, businessId, roomNumber.trim(), roomCapacity]
+      );
+
+      await connection.execute(
+        `UPDATE businesses SET total_rooms = total_rooms + 1 WHERE id = ?`,
+        [businessId]
+      );
+
+      await connection.commit();
+    } catch (err) {
+      await connection.rollback();
+      throw err;
+    } finally {
+      connection.release();
+    }
 
     const [created] = await db.pool.execute(
       `SELECT id, room_number, capacity, room_status, created_at FROM rooms WHERE id = ?`,
