@@ -62,6 +62,12 @@ router.post('/login', async (req, res, next) => {
 
       const business = businesses[0];
 
+      const [roomCountRows] = await db.pool.execute(
+        'SELECT COUNT(*) AS count FROM rooms WHERE business_id = ?',
+        [business.id]
+      );
+      const totalRooms = roomCountRows[0]?.count || 0;
+
       // Check status
       if (business.status === 'pending') {
         return res.status(403).json({ message: 'Your account is still pending approval.' });
@@ -79,7 +85,7 @@ router.post('/login', async (req, res, next) => {
         permit_number: business.permit_number,
         registration_number: business.registration_number,
         street: business.street,
-        total_rooms: business.total_rooms,
+        total_rooms: totalRooms,
         permit_file_url: business.permit_file_url,
         valid_id_url: business.valid_id_url,
         status: business.status,

@@ -58,7 +58,7 @@ router.get('/', adminGuard, async (req, res, next) => {
 
     // ── Fetch paginated rows ──────────────────────────────────────────────
     const [rows] = await db.pool.query(
-      `SELECT b.*, u.full_name, u.email, u.phone
+      `SELECT b.*, (SELECT COUNT(*) FROM rooms WHERE business_id = b.id) AS total_rooms, u.full_name, u.email, u.phone
        FROM businesses b
        JOIN users u ON b.user_id = u.id
        WHERE ${whereClause}

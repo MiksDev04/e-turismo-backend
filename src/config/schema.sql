@@ -96,7 +96,7 @@ CREATE TABLE `businesses` (
   `registration_number` varchar(255) DEFAULT NULL,
   `ae_id` varchar(20) NOT NULL,
   `street` text,
-  `total_rooms` int NOT NULL DEFAULT '0',
+
   `permit_file_url` varchar(1000) DEFAULT NULL,
   `valid_id_url` varchar(1000) DEFAULT NULL,
   `status` enum('pending','approved','rejected','warning','suspended') NOT NULL DEFAULT 'pending',

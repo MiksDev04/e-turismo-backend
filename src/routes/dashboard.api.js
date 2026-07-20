@@ -41,7 +41,7 @@ router.get('/details', auth.authenticate, auth.requireRole('business'), async (r
     }
 
     const [rows] = await connection.execute(
-      `SELECT street, barangay, total_rooms, business_line FROM businesses WHERE id = ?`,
+      `SELECT street, barangay, (SELECT COUNT(*) FROM rooms WHERE business_id = businesses.id) AS total_rooms, business_line FROM businesses WHERE id = ?`,
       [businessId]
     );
 

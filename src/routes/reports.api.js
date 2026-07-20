@@ -346,7 +346,8 @@ router.post('/reports/generate', adminGuard, async (req, res, next) => {
 
     // ── Fetch approved businesses ────────────────────────────────────────────
     const [businesses] = await db.pool.execute(
-      `SELECT id, business_name, business_line, region, city_municipality, province, total_rooms,
+      `SELECT id, business_name, business_line, region, city_municipality, province,
+              (SELECT COUNT(*) FROM rooms WHERE business_id = businesses.id) AS total_rooms,
               owner_first_name, owner_last_name, owner_middle_name
        FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY business_name`
     );

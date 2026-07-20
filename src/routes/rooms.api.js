@@ -1,6 +1,6 @@
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import db from '../config/db.js';
+import db, { queryWithRetry } from '../config/db.js';
 import auth from '../middleware/auth.js';
 
 const router = express.Router();
@@ -119,11 +119,6 @@ router.post('/rooms', auth.authenticate, auth.requireRole('business'), async (re
         [roomId, businessId, roomNumber.trim(), roomCapacity]
       );
 
-      await connection.execute(
-        `UPDATE businesses SET total_rooms = total_rooms + 1 WHERE id = ?`,
-        [businessId]
-      );
-
       await connection.commit();
     } catch (err) {
       await connection.rollback();
@@ -165,9 +160,8 @@ router.put('/rooms/:id', auth.authenticate, auth.requireRole('business'), async 
       return res.status(400).json({ message: 'Nothing to update — provide roomNumber or capacity' });
     }
 
-    const [existing] = await db.pool.execute(
-      `SELECT id FROM rooms WHERE id = ?`,
-      [roomId]
+    const [existing] = await queryWithRetry(() =>
+      db.pool.execute(`SELECT id FROM rooms WHERE id = ?`, [roomId])
     );
 
     if (existing.length === 0) {
@@ -187,14 +181,15 @@ router.put('/rooms/:id', auth.authenticate, auth.requireRole('business'), async 
     }
 
     params.push(roomId);
-    await db.pool.execute(
-      `UPDATE rooms SET ${updates.join(', ')} WHERE id = ?`,
-      params
+    await queryWithRetry(() =>
+      db.pool.execute(`UPDATE rooms SET ${updates.join(', ')} WHERE id = ?`, params)
     );
 
-    const [updated] = await db.pool.execute(
-      `SELECT id, room_number, capacity, room_status, created_at, updated_at FROM rooms WHERE id = ?`,
-      [roomId]
+    const [updated] = await queryWithRetry(() =>
+      db.pool.execute(
+        `SELECT id, room_number, capacity, room_status, created_at, updated_at FROM rooms WHERE id = ?`,
+        [roomId]
+      )
     );
 
     res.json({
@@ -226,18 +221,19 @@ router.put('/rooms/:id/status', auth.authenticate, auth.requireRole('business'),
       return res.status(400).json({ message: 'roomStatus must be "vacant", "occupied", "unavailable", or "reserved"' });
     }
 
-    const [existing] = await db.pool.execute(
-      `SELECT id FROM rooms WHERE id = ?`,
-      [roomId]
+    const [existing] = await queryWithRetry(() =>
+      db.pool.execute(`SELECT id FROM rooms WHERE id = ?`, [roomId])
     );
 
     if (existing.length === 0) {
       return res.status(404).json({ message: 'Room not found' });
     }
 
-    await db.pool.execute(
-      `UPDATE rooms SET room_status = ? WHERE id = ?`,
-      [roomStatus, roomId]
+    await queryWithRetry(() =>
+      db.pool.execute(
+        `UPDATE rooms SET room_status = ? WHERE id = ?`,
+        [roomStatus, roomId]
+      )
     );
 
     res.json({ message: 'Room status updated', roomStatus });

@@ -215,6 +215,29 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
           now
         ]
       );
+
+      // Create junction rows when roomIds are provided (mirrors POST handler logic).
+      // This handles the case where a record was created offline (syncPendingCreate)
+      // and the PUT arrives before the POST — the upsert creates the record and
+      // its room associations so the checkout handler can process them.
+      if (roomIds && roomIds.length > 0) {
+        const junctionStatus = actualCheckOut ? 'completed' : 'active';
+        for (const roomId of roomIds) {
+          const junctionId = uuidv4();
+          await connection.execute(
+            `INSERT INTO guest_record_rooms (id, guest_record_id, room_id, status) VALUES (?, ?, ?, ?)`,
+            [junctionId, recordId, roomId, junctionStatus]
+          );
+        }
+        // Only mark rooms occupied if NOT already checked out
+        if (!actualCheckOut) {
+          const placeholders = roomIds.map(() => '?').join(',');
+          await connection.execute(
+            `UPDATE rooms SET room_status = 'occupied' WHERE id IN (${placeholders})`,
+            roomIds
+          );
+        }
+      }
     } else {
       // Update existing
       const updateFields = [

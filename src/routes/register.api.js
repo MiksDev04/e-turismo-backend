@@ -201,7 +201,6 @@ router.post('/register', upload.fields([
       ownerFirstName,
       ownerMiddleName,
       ownerLastName,
-      totalRooms,
       permitNumber,
       registrationNumber,
       aeId,
@@ -314,7 +313,7 @@ router.post('/register', upload.fields([
       `INSERT INTO businesses (
         id, user_id, business_name, tradename, business_type, 
         owner_first_name, owner_middle_name, owner_last_name, 
-        business_line, total_rooms, permit_number, registration_number, ae_id,
+        business_line, permit_number, registration_number, ae_id,
         street, barangay, city_municipality, province, region, 
         permit_file_url, valid_id_url, status
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
@@ -328,7 +327,6 @@ router.post('/register', upload.fields([
         ownerMiddleName || null,
         ownerLastName,
         JSON.stringify(parsedBusinessLine || []),
-        parseInt(totalRooms) || 0,
         permitNumber,
         registrationNumber,
         normalizedAeId,

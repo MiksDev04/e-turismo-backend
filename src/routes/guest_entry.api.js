@@ -49,6 +49,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       businessId,
       checkIn,
       checkOut,
+      actualCheckOut,
       totalGuests,
       roomIds,
       purposeOfVisit,
@@ -98,18 +99,19 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
     // Compute length_of_stay from dates
     await connection.execute(
       `INSERT INTO guest_records (
-        id, business_id, check_in, check_out, length_of_stay, total_guests,
+        id, business_id, check_in, check_out, actual_check_out, length_of_stay, total_guests,
         purpose_of_visit, transportation_mode,
         lead_country, lead_city_municipality, lead_province,
         lead_nationality, lead_philippines_region, lead_is_overseas,
         lead_birthdate, lead_sex,
         status, is_deleted
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', FALSE)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', FALSE)`,
       [
         guestRecordId,
         businessId,
         checkIn,
         checkOut,
+        actualCheckOut || null,
         lengthOfStay,
         totalGuests,
         purposeOfVisit,
@@ -127,20 +129,23 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
 
     // Insert room associations into junction table
     if (roomIds && roomIds.length > 0) {
+      const junctionStatus = actualCheckOut ? 'completed' : 'active';
       for (const roomId of roomIds) {
         const junctionId = uuidv4();
         await connection.execute(
-          `INSERT INTO guest_record_rooms (id, guest_record_id, room_id, status) VALUES (?, ?, ?, 'active')`,
-          [junctionId, guestRecordId, roomId]
+          `INSERT INTO guest_record_rooms (id, guest_record_id, room_id, status) VALUES (?, ?, ?, ?)`,
+          [junctionId, guestRecordId, roomId, junctionStatus]
         );
       }
 
-      // Mark selected rooms as occupied
-      const placeholders = roomIds.map(() => '?').join(',');
-      await connection.execute(
-        `UPDATE rooms SET room_status = 'occupied' WHERE id IN (${placeholders})`,
-        roomIds
-      );
+      // Only mark rooms occupied if the guest is NOT already checked out
+      if (!actualCheckOut) {
+        const placeholders = roomIds.map(() => '?').join(',');
+        await connection.execute(
+          `UPDATE rooms SET room_status = 'occupied' WHERE id IN (${placeholders})`,
+          roomIds
+        );
+      }
     }
 
     await connection.commit();

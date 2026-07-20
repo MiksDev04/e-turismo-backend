@@ -32,7 +32,15 @@ router.get('/profile', auth.authenticate, async (req, res, next) => {
         'SELECT * FROM businesses WHERE user_id = ? AND deleted_at IS NULL',
         [user.id]
       );
-      responseData.business = businesses[0] || null;
+      const business = businesses[0] || null;
+      if (business) {
+        const [roomCountRows] = await db.pool.execute(
+          'SELECT COUNT(*) AS count FROM rooms WHERE business_id = ?',
+          [business.id]
+        );
+        business.total_rooms = roomCountRows[0]?.count || 0;
+      }
+      responseData.business = business;
     }
 
     res.json(responseData);
@@ -82,7 +90,7 @@ router.put('/business', auth.authenticate, auth.requireRole('business'), async (
   try {
     const {
       business_name, tradename, owner_first_name, owner_middle_name, owner_last_name,
-      business_type, business_line, total_rooms, street, barangay,
+      business_type, business_line, street, barangay,
       city_municipality, province, region, permit_number, registration_number
     } = req.body;
 
@@ -93,12 +101,12 @@ router.put('/business', auth.authenticate, auth.requireRole('business'), async (
     await db.pool.execute(
       `UPDATE businesses SET 
         business_name = ?, tradename = ?, owner_first_name = ?, owner_middle_name = ?, owner_last_name = ?,
-        business_type = ?, business_line = ?, total_rooms = ?, street = ?, barangay = ?,
+        business_type = ?, business_line = ?, street = ?, barangay = ?,
         city_municipality = ?, province = ?, region = ?, permit_number = ?, registration_number = ?
       WHERE user_id = ?`,
       [
         business_name.trim(), tradename?.trim(), owner_first_name?.trim(), owner_middle_name?.trim(), owner_last_name?.trim(),
-        business_type, JSON.stringify(business_line), total_rooms || 0, street?.trim(), barangay?.trim(),
+        business_type, JSON.stringify(business_line), street?.trim(), barangay?.trim(),
         city_municipality?.trim(), province?.trim(), region?.trim(), permit_number?.trim(), registration_number?.trim(),
         req.user.id
       ]

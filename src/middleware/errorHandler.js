@@ -19,6 +19,11 @@ function errorHandler(err, req, res, next) {
     return res.status(409).json({ message: 'A record with that value already exists.' });
   }
 
+  // Database timeout
+  if (err.code === 'ETIMEDOUT') {
+    return res.status(503).json({ message: 'Database temporarily unreachable' });
+  }
+
   const status  = err.status || err.statusCode || 500;
   const message = err.message || 'Internal server error';
 

@@ -34,4 +34,16 @@ export async function testConnection() {
   }
 }
 
-export default { pool, testConnection };
+export async function queryWithRetry(fn, retries = 1) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (retries > 0 && err.code === 'ETIMEDOUT') {
+      await new Promise(r => setTimeout(r, 500));
+      return queryWithRetry(fn, retries - 1);
+    }
+    throw err;
+  }
+}
+
+export default { pool, testConnection, queryWithRetry };
