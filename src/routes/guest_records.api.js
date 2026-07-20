@@ -258,8 +258,8 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
     // ── Handle room assignment changes ──────────────────────────────────
     const isCheckout = actualCheckOut !== undefined && actualCheckOut !== null;
 
-    if (isCheckout && roomIds === undefined) {
-      // Checkout only (no room reassignment) — mark all active links as completed
+    if (isCheckout) {
+      // Checkout — always free rooms and mark active junctions as completed.
       const [activeLinks] = await connection.execute(
         `SELECT room_id FROM guest_record_rooms WHERE guest_record_id = ? AND status = 'active'`,
         [recordId]
@@ -282,7 +282,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
         );
       }
     } else if (roomIds !== undefined) {
-      // Normal edit or checkout with room reassignment
+      // Normal edit (no checkout) — reassign rooms
       const [oldLinks] = await connection.execute(
         `SELECT room_id FROM guest_record_rooms WHERE guest_record_id = ? AND status = 'active'`,
         [recordId]
