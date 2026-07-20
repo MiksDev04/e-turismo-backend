@@ -316,7 +316,7 @@ router.post('/register', upload.fields([
         business_line, permit_number, registration_number, ae_id,
         street, barangay, city_municipality, province, region, 
         permit_file_url, valid_id_url, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
       [
         businessId,
         userId,
