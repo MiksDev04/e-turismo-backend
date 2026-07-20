@@ -7,23 +7,72 @@ const router = express.Router();
 
 /**
  * GET /api/business/rooms
- * Fetch ALL rooms for a business (sync pull endpoint).
- * Returns both vacant and occupied rooms with their status.
+ * Fetch rooms for a business with optional pagination, filters.
+ * Query: businessId, page, pageSize, fetchAll, status, search
+ * Without fetchAll — returns { data, totalCount, pageCount }.
+ * With fetchAll=true — returns { data } (backward compat for guest-entry).
  */
 router.get('/rooms', auth.authenticate, auth.requireRole('business'), async (req, res, next) => {
+  const connection = await db.pool.getConnection();
   try {
-    const { businessId } = req.query;
+    const {
+      businessId,
+      page = '1',
+      pageSize = '10',
+      fetchAll,
+      status,
+      search,
+    } = req.query;
+
     if (!businessId) {
       return res.status(400).json({ message: 'Missing businessId parameter' });
     }
 
-    const [rows] = await db.pool.execute(
-      `SELECT id, room_number, capacity, room_status, created_at, updated_at
-       FROM rooms
-       WHERE business_id = ?
-       ORDER BY room_number`,
-      [businessId]
-    );
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limit   = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 10));
+    const offset  = (pageNum - 1) * limit;
+
+    // ── Build WHERE clause ────────────────────────────────────────────────
+    const conditions = ['business_id = ?'];
+    const params     = [businessId];
+
+    if (status && status !== 'All') {
+      conditions.push('room_status = ?');
+      params.push(status);
+    }
+
+    if (search && search.trim()) {
+      conditions.push('room_number LIKE ?');
+      params.push(`%${search.trim()}%`);
+    }
+
+    const whereClause = conditions.join(' AND ');
+
+    // ── Count total matching rows ─────────────────────────────────────────
+    let totalCount = 0;
+    if (fetchAll !== 'true') {
+      const [countRows] = await connection.query(
+        `SELECT COUNT(*) as total FROM rooms WHERE ${whereClause}`,
+        params
+      );
+      totalCount = countRows[0].total;
+
+      if (totalCount === 0) {
+        return res.json({ data: [], totalCount: 0, pageCount: 0 });
+      }
+    }
+
+    // ── Fetch rooms ──────────────────────────────────────────────────────
+    let query = `SELECT id, room_number, capacity, room_status, created_at, updated_at
+                 FROM rooms
+                 WHERE ${whereClause}
+                 ORDER BY room_number`;
+    const queryParams = [...params];
+    if (fetchAll !== 'true') {
+      query += ' LIMIT ? OFFSET ?';
+      queryParams.push(limit, offset);
+    }
+    const [rows] = await connection.query(query, queryParams);
 
     const data = rows.map(r => ({
       id: r.id,
@@ -34,9 +83,14 @@ router.get('/rooms', auth.authenticate, auth.requireRole('business'), async (req
       updatedAt: r.updated_at,
     }));
 
-    res.json({ data });
+    if (fetchAll === 'true') {
+      return res.json({ data });
+    }
+    res.json({ data, totalCount, pageCount: Math.ceil(totalCount / limit) });
   } catch (err) {
     next(err);
+  } finally {
+    connection.release();
   }
 });
 
@@ -151,8 +205,8 @@ router.put('/rooms/:id/status', auth.authenticate, auth.requireRole('business'),
     const roomId = req.params.id;
     const { roomStatus } = req.body;
 
-    if (!roomStatus || !['vacant', 'occupied'].includes(roomStatus)) {
-      return res.status(400).json({ message: 'roomStatus must be "vacant" or "occupied"' });
+    if (!roomStatus || !['vacant', 'occupied', 'unavailable', 'reserved'].includes(roomStatus)) {
+      return res.status(400).json({ message: 'roomStatus must be "vacant", "occupied", "unavailable", or "reserved"' });
     }
 
     const [existing] = await db.pool.execute(

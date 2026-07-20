@@ -7,7 +7,7 @@ const router = express.Router();
 
 /**
  * GET /api/business/vacant-rooms
- * Fetch all vacant rooms for a business
+ * Fetch all available rooms for a business (vacant + reserved)
  */
 router.get('/vacant-rooms', auth.authenticate, auth.requireRole('business'), async (req, res, next) => {
   try {
@@ -19,7 +19,7 @@ router.get('/vacant-rooms', auth.authenticate, auth.requireRole('business'), asy
     const [rows] = await db.pool.execute(
       `SELECT id, room_number, capacity, room_status
        FROM rooms
-       WHERE business_id = ? AND room_status = 'vacant'
+       WHERE business_id = ? AND room_status IN ('vacant', 'reserved')
        ORDER BY room_number`,
       [businessId]
     );
@@ -28,7 +28,7 @@ router.get('/vacant-rooms', auth.authenticate, auth.requireRole('business'), asy
       id: r.id,
       roomNumber: r.room_number,
       capacity: r.capacity,
-      roomStatus: r.room_status,
+      status: r.room_status,
     }));
 
     res.json({ data });
