@@ -16,7 +16,7 @@
 -- Table creation order respects foreign key dependencies:
 --   users -> businesses -> rooms -> guest_records -> guest_record_rooms
 --         -> messages -> message_recipients
---         -> report_batches -> reports
+--         -> report_batches
 -- =====================================================================
 DROP DATABASE tourism_db;
 CREATE DATABASE IF NOT EXISTS `tourism_db`
@@ -27,7 +27,7 @@ USE `tourism_db`;
 SET FOREIGN_KEY_CHECKS = 0;
 
 DROP VIEW  IF EXISTS `guest_breakdowns_synced`;
-DROP TABLE IF EXISTS `reports`;
+DROP TABLE IF EXISTS `report_downloads`;
 DROP TABLE IF EXISTS `report_batches`;
 DROP TABLE IF EXISTS `message_recipients`;
 DROP TABLE IF EXISTS `messages`;
@@ -244,36 +244,35 @@ CREATE TABLE `message_recipients` (
 -- ---------------------------------------------------------------
 CREATE TABLE `report_batches` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
-  `report_scope` enum('monthly','annual') NOT NULL DEFAULT 'monthly',
-  `period_month` smallint NOT NULL,
+  `report_type` enum('dae','var') NOT NULL,
+  `report_variant` enum('daily','summary','series','total') NOT NULL
+    COMMENT 'DAE: daily/summary/series. VAR always uses total (single sheet).',
   `period_year` smallint NOT NULL,
-  `generated_by` char(36) DEFAULT NULL,
-  `generated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uq_report_batches_scope_period` (`report_scope`,`period_year`,`period_month`),
-  KEY `idx_report_batches_period` (`period_year`,`period_month`),
-  KEY `idx_report_batches_generated_by` (`generated_by`),
-  CONSTRAINT `report_batches_generated_by_fkey` FOREIGN KEY (`generated_by`) REFERENCES `users` (`id`),
-  CONSTRAINT `chk_batch_period_month` CHECK ((`period_month` between 1 and 12)),
-  CONSTRAINT `chk_batch_period_year` CHECK ((`period_year` >= 2000))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-
--- ---------------------------------------------------------------
--- Table: reports
--- ---------------------------------------------------------------
-CREATE TABLE `reports` (
-  `id` char(36) NOT NULL DEFAULT (uuid()),
-  `batch_id` char(36) NOT NULL,
-  `business_id` char(36) DEFAULT NULL,
-  `report_type` enum('business','total') NOT NULL DEFAULT 'business',
-  `file_url` varchar(1000) DEFAULT NULL,
+  `period_months` JSON NOT NULL
+    COMMENT 'Sorted array of ints 1-12, e.g. [1,2,3]. App must sort before insert.',
+  `period_months_hash` char(64)
+    GENERATED ALWAYS AS (SHA2(CAST(`period_months` AS CHAR), 256)) STORED,
+  `requested_by` char(36) DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `last_viewed_at` datetime DEFAULT NULL
+    COMMENT 'Bumped on every view; viewing is a live query, no file involved',
+  `last_xlsx_url` varchar(1000) DEFAULT NULL,
+  `last_pdf_url` varchar(1000) DEFAULT NULL,
+  `last_generated_at` datetime DEFAULT NULL
+    COMMENT 'Bumped whenever Download regenerates the file',
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uq_reports_batch_business_type` (`batch_id`,`business_id`,`report_type`),
-  KEY `idx_reports_batch_id` (`batch_id`),
-  KEY `idx_reports_business_id` (`business_id`),
-  CONSTRAINT `reports_batch_id_fkey` FOREIGN KEY (`batch_id`) REFERENCES `report_batches` (`id`) ON DELETE CASCADE,
-  CONSTRAINT `reports_business_id_fkey` FOREIGN KEY (`business_id`) REFERENCES `businesses` (`id`)
+  UNIQUE KEY `uq_batch_combo` (`report_type`, `report_variant`, `period_year`, `period_months_hash`),
+  KEY `idx_batches_type_period` (`report_type`, `period_year`),
+  CONSTRAINT `report_batches_requested_by_fkey` FOREIGN KEY (`requested_by`) REFERENCES `users` (`id`),
+  CONSTRAINT `chk_batch_period_year` CHECK (`period_year` >= 2000),
+  CONSTRAINT `chk_batch_period_months_array` CHECK (JSON_TYPE(`period_months`) = 'ARRAY'),
+  CONSTRAINT `chk_batch_variant_matches_type` CHECK (
+    (`report_type` = 'dae' AND `report_variant` IN ('daily','summary','series')) OR
+    (`report_type` = 'var' AND `report_variant` = 'total')
+  ),
+  CONSTRAINT `chk_batch_single_month_variants` CHECK (
+    `report_variant` NOT IN ('daily','summary') OR JSON_LENGTH(`period_months`) = 1
+  )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 SET FOREIGN_KEY_CHECKS = 1;
