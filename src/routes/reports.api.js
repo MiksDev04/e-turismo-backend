@@ -332,28 +332,19 @@ router.post('/reports', adminGuard, async (req, res, next) => {
       return res.status(400).json({ message: `"${reportVariant}" variant requires exactly one month` });
     }
 
-    const crypto = await import('crypto');
-    const monthsHash = crypto.createHash('sha256').update(JSON.stringify(months)).digest('hex');
-
-    // Find-or-create (dedupe on type+variant+year+monthsHash)
-    const [existing] = await db.pool.execute(
-      `SELECT id FROM report_batches
-       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months_hash = ?`,
-      [reportType, reportVariant, parseInt(periodYear, 10), monthsHash]
-    );
-
-    if (existing.length > 0) {
-      return res.status(200).json({ batchId: existing[0].id, existing: true });
-    }
-
-    const batchId = uuidv4();
+    // Find-or-create (atomic: INSERT IGNORE + SELECT)
+    const newBatchId = uuidv4();
     await db.pool.execute(
-      `INSERT INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
+      `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [batchId, reportType, reportVariant, parseInt(periodYear, 10), JSON.stringify(months), req.user.id]
+      [newBatchId, reportType, reportVariant, parseInt(periodYear, 10), JSON.stringify(months), req.user.id]
     );
-
-    res.status(201).json({ batchId, existing: false });
+    const [rows] = await db.pool.execute(
+      `SELECT id FROM report_batches
+       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
+      [reportType, reportVariant, parseInt(periodYear, 10), JSON.stringify(months)]
+    );
+    res.status(200).json({ batchId: rows[0].id, existing: true });
   } catch (err) {
     next(err);
   }
@@ -385,29 +376,22 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
       return res.status(400).json({ message: `"${reportVariant}" requires exactly one month` });
     }
 
-    const crypto = await import('crypto');
-    const monthsHash = crypto.createHash('sha256').update(JSON.stringify(sortedMonths)).digest('hex');
     const year = parseInt(periodYear, 10);
 
-    // Find-or-create batch
-    const [existing] = await db.pool.execute(
-      `SELECT id FROM report_batches
-       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months_hash = ?`,
-      [reportType, reportVariant, year, monthsHash]
+    // Find-or-create batch (atomic: INSERT IGNORE + SELECT)
+    const newBatchId = uuidv4();
+    await db.pool.execute(
+      `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by, last_viewed_at)
+       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+      [newBatchId, reportType, reportVariant, year, JSON.stringify(sortedMonths), req.user.id]
     );
-
-    let batchId;
-    if (existing.length > 0) {
-      batchId = existing[0].id;
-      await db.pool.execute('UPDATE report_batches SET last_viewed_at = NOW() WHERE id = ?', [batchId]);
-    } else {
-      batchId = uuidv4();
-      await db.pool.execute(
-        `INSERT INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by, last_viewed_at)
-         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-        [batchId, reportType, reportVariant, year, JSON.stringify(sortedMonths), req.user.id]
-      );
-    }
+    const [rows] = await db.pool.execute(
+      `SELECT id FROM report_batches
+       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
+      [reportType, reportVariant, year, JSON.stringify(sortedMonths)]
+    );
+    const batchId = rows[0].id;
+    await db.pool.execute('UPDATE report_batches SET last_viewed_at = NOW() WHERE id = ?', [batchId]);
 
     // Fetch approved businesses
     const [businesses] = await db.pool.execute(
@@ -421,12 +405,10 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
     const allMonthData = [];
 
     for (const biz of businesses) {
-      const monthDataList = [];
-      for (const m of sortedMonths) {
-        const md = await _fetchMonthData(biz.id, m, year);
-        monthDataList.push(md);
-        allMonthData.push(md);
-      }
+      const monthDataList = await Promise.all(
+        sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
+      );
+      allMonthData.push(...monthDataList);
 
       establishments.push({
         businessId: biz.id,
@@ -497,27 +479,20 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     }
 
     const year = parseInt(periodYear, 10);
-    const crypto = await import('crypto');
-    const monthsHash = crypto.createHash('sha256').update(JSON.stringify(sortedMonths)).digest('hex');
 
-    // Find-or-create batch
-    const [existing] = await db.pool.execute(
-      `SELECT id FROM report_batches
-       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months_hash = ?`,
-      [reportType, reportVariant, year, monthsHash]
+    // Find-or-create batch (atomic: INSERT IGNORE + SELECT)
+    const newBatchId = uuidv4();
+    await db.pool.execute(
+      `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [newBatchId, reportType, reportVariant, year, JSON.stringify(sortedMonths), req.user.id]
     );
-
-    let batchId;
-    if (existing.length > 0) {
-      batchId = existing[0].id;
-    } else {
-      batchId = uuidv4();
-      await db.pool.execute(
-        `INSERT INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [batchId, reportType, reportVariant, year, JSON.stringify(sortedMonths), req.user.id]
-      );
-    }
+    const [dlRows] = await db.pool.execute(
+      `SELECT id FROM report_batches
+       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
+      [reportType, reportVariant, year, JSON.stringify(sortedMonths)]
+    );
+    const batchId = dlRows[0].id;
 
     // ── Aggregate (reuse same logic as /view) ─────────────────────────────────
     const [businesses] = await db.pool.execute(
@@ -545,13 +520,11 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     for (const biz of businesses) {
       let bizAllMonths = null;
       if (reportVariant === 'series' && sortedMonths.length > 1) {
-        // Fetch all requested months for this business
-        bizAllMonths = [];
-        for (const m of sortedMonths) {
-          const md = await _fetchMonthData(biz.id, m, year);
-          bizAllMonths.push(md);
-          allBizMonthData.push(md);
-        }
+        // Fetch all requested months for this business in parallel
+        bizAllMonths = await Promise.all(
+          sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
+        );
+        allBizMonthData.push(...bizAllMonths);
       } else if (sortedMonths.length === 1) {
         const md = await _fetchMonthData(biz.id, sortedMonths[0], year);
         allBizMonthData.push(md);
