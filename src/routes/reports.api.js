@@ -4,9 +4,26 @@ import PDFDocument from 'pdfkit';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const router = express.Router();
+
 const adminGuard = [auth.authenticate, auth.requireRole('admin')];
+
+// ─── Load template workbook for styled Excel exports ─────────────────────────
+let templateWb = null;
+try {
+  templateWb = new ExcelJS.Workbook();
+  await templateWb.xlsx.readFile(path.join(__dirname, '..', '..', 'sample', 'ON Blank Form.xlsx'));
+  console.log('[report] Template loaded successfully');
+} catch (err) {
+  console.warn('[report] Template not found, exports will be unformatted:', err.message);
+  templateWb = null;
+}
 
 // ─── Country / Region Definitions ────────────────────────────────────────────
 const kCountryRows = [
@@ -465,11 +482,15 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     }
 
     let months;
-    try {
-      months = JSON.parse(periodMonths);
-      if (!Array.isArray(months)) throw new Error();
-    } catch {
-      return res.status(400).json({ message: 'periodMonths must be a JSON array of ints' });
+    if (Array.isArray(periodMonths)) {
+      months = periodMonths;
+    } else {
+      try {
+        months = JSON.parse(periodMonths);
+        if (!Array.isArray(months)) throw new Error();
+      } catch {
+        return res.status(400).json({ message: 'periodMonths must be a JSON array of ints' });
+      }
     }
 
     const sortedMonths = [...months].map(Number).sort((a, b) => a - b);
@@ -536,20 +557,23 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
       if (reportVariant === 'daily' && bizAllMonths?.[0]) {
         const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
-        const sheet = wb.addWorksheet(sheetName);
+        const tmpl = templateWb?.getWorksheet('Name of Establishment');
+        const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
         _buildDailySheet(sheet, biz, bizAllMonths[0], sortedMonths[0], year, daysInMonth, adminName);
       }
 
       if (reportVariant === 'summary' && bizAllMonths?.[0]) {
         const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
-        const sheet = wb.addWorksheet(sheetName);
+        const tmpl = templateWb?.getWorksheet('AE DAE-1B by Country (Sum)');
+        const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
         _buildCountrySummarySheet(sheet, bizAllMonths[0], biz.total_rooms, sortedMonths[0], year,
           daysInMonth, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
       }
 
       if (reportVariant === 'series' && bizAllMonths && bizAllMonths.length > 1) {
         const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
-        const sheet = wb.addWorksheet(sheetName);
+        const tmpl = templateWb?.getWorksheet('AE DAE-1B (Monthly)');
+        const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
         _buildMonthlySummarySheet(sheet, bizAllMonths, biz.total_rooms, year, adminName,
           biz.city_municipality || '', biz.province || '', biz.business_name, biz);
       }
@@ -565,13 +589,19 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
     if (reportVariant === 'daily' && allBizMonthData.length > 0) {
       const mergedMd = _mergeMonthData(sortedMonths[0], allBizMonthData);
-      const sheet = wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
+      const tmpl = templateWb?.getWorksheet('Name of Establishment');
+      const sheet = tmpl
+        ? _cloneSheetFromTemplate(tmpl, 'TOTAL \u2013 ALL ACCOMMODATION', wb)
+        : wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
       _buildDailySheet(sheet, totalBiz, mergedMd, sortedMonths[0], year, daysInMonth, adminName);
     }
 
     if (reportVariant === 'summary' && allBizMonthData.length > 0) {
       const mergedMd = _mergeMonthData(sortedMonths[0], allBizMonthData);
-      const sheet = wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
+      const tmpl = templateWb?.getWorksheet('AE DAE-1B by Country (Sum)');
+      const sheet = tmpl
+        ? _cloneSheetFromTemplate(tmpl, 'TOTAL \u2013 ALL ACCOMMODATION', wb)
+        : wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
       _buildCountrySummarySheet(sheet, mergedMd, totalRoomsSum, sortedMonths[0], year,
         daysInMonth, adminName, 'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
     }
@@ -582,7 +612,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         const monthDataList = allBizMonthData.filter(md => md.month === m);
         mergedMonths.push(_mergeMonthData(m, monthDataList));
       }
-      const sheet = wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
+      const tmpl = templateWb?.getWorksheet('AE DAE-1B (Monthly)');
+      const sheet = tmpl
+        ? _cloneSheetFromTemplate(tmpl, 'TOTAL \u2013 ALL ACCOMMODATION', wb)
+        : wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
       _buildMonthlySummarySheet(sheet, mergedMonths, totalRoomsSum, year, adminName,
         'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
     }
@@ -817,54 +850,65 @@ function _mergeMonthDataMulti(months, list) {
   return result;
 }
 
-// ─── Sheet Property Copy ─────────────────────────────────────────────────────
+// ─── Template Cloning ────────────────────────────────────────────────────────
+// Copies an entire template worksheet (styles, merges, column widths, row
+// heights, static text) into the target workbook so that data writers can
+// overlay values on top of a pre-formatted DAE-1B form.
 
-function _copySheetProperties(src, dst) {
-  if (src.properties) dst.properties = JSON.parse(JSON.stringify(src.properties));
-  if (src.pageSetup)  dst.pageSetup  = JSON.parse(JSON.stringify(src.pageSetup));
-  if (src.views)      dst.views      = JSON.parse(JSON.stringify(src.views));
+function _cloneSheetFromTemplate(templateSheet, newName, targetWb) {
+  const newSheet = targetWb.addWorksheet(newName);
 
-  if (src.columns) {
-    dst.columns = src.columns.map(c => ({
-      width:  c.width,
-      header: c.header,
-      key:    c.key,
-      style:  c.style ? JSON.parse(JSON.stringify(c.style)) : undefined,
-    }));
-  }
+  // ── Column widths ────────────────────────────────────────────────────────
+  templateSheet.columns.forEach((col, i) => {
+    if (col.width) newSheet.getColumn(i + 1).width = col.width;
+  });
 
-  src.eachRow({ includeEmpty: true }, (row, rowNumber) => {
-    const dstRow = dst.getRow(rowNumber);
-    dstRow.height = row.height;
+  // ── Row-by-row clone (values + styles) ───────────────────────────────────
+  templateSheet.eachRow({ includeEmpty: true }, (row, rowNumber) => {
+    const newRow = newSheet.getRow(rowNumber);
+    if (row.height) newRow.height = row.height;
+
     row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-      const dstCell = dstRow.getCell(colNumber);
+      const newCell = newRow.getCell(colNumber);
 
+      // Copy value (resolve formulas to cached result to avoid cross-sheet refs)
       if (cell.type === ExcelJS.ValueType.Formula) {
-        if (cell.formula && cell.formula.includes('!')) {
-          dstCell.value = cell.result ?? 0;
-        } else {
-          dstCell.value = {
-            formula: cell.formula,
-            result:  cell.result
-          };
-        }
+        newCell.value = cell.result ?? 0;
+      } else if (cell.type === ExcelJS.ValueType.Merge) {
+        // Skip merge-marker cells; the merge range is restored below
+        newCell.value = null;
       } else {
-        dstCell.value = cell.value;
+        newCell.value = cell.value;
       }
 
-      if (cell.style) dstCell.style = JSON.parse(JSON.stringify(cell.style));
+      // Deep-copy style (font, fill, border, alignment, numberFormat …)
+      if (cell.style && Object.keys(cell.style).length > 0) {
+        newCell.style = JSON.parse(JSON.stringify(cell.style));
+      }
     });
   });
 
-  if (src._merges) {
-    Object.values(src._merges).forEach(m => {
+  // ── Merged cell ranges ───────────────────────────────────────────────────
+  if (templateSheet._merges) {
+    for (const merge of Object.values(templateSheet._merges)) {
       try {
-        dst.mergeCells(m.model.top, m.model.left, m.model.bottom, m.model.right);
-      } catch (e) {
-        // Ignore overlapping-merge errors from template
-      }
-    });
+        newSheet.mergeCells(
+          merge.model.top, merge.model.left,
+          merge.model.bottom, merge.model.right,
+        );
+      } catch (_) { /* ignore overlapping merges from template */ }
+    }
   }
+
+  // ── Page setup ───────────────────────────────────────────────────────────
+  if (templateSheet.pageSetup) {
+    newSheet.pageSetup = JSON.parse(JSON.stringify(templateSheet.pageSetup));
+  }
+  if (templateSheet.views && templateSheet.views.length) {
+    newSheet.views = JSON.parse(JSON.stringify(templateSheet.views));
+  }
+
+  return newSheet;
 }
 
 // ─── Excel Builders ──────────────────────────────────────────────────────────
