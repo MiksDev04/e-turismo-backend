@@ -94,7 +94,7 @@ CREATE TABLE `businesses` (
   `business_name` varchar(255) NOT NULL,
   `permit_number` varchar(255) DEFAULT NULL,
   `registration_number` varchar(255) DEFAULT NULL,
-  `ae_id` varchar(20) NOT NULL,
+  `ae_id` varchar(100) NOT NULL,
   `street` text,
 
   `permit_file_url` varchar(1000) DEFAULT NULL,

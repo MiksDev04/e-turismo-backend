@@ -1,23 +1,12 @@
 import express from 'express';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
-import cloudinary from '../config/cloudinary.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const router = express.Router();
 const adminGuard = [auth.authenticate, auth.requireRole('admin')];
-
-const UPLOADS_DIR = path.join(__dirname, '../../uploads/reports');
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-const TEMPLATE_PATH = path.join(__dirname, '../../sample/ON Blank Form.xlsx');
 
 // ─── Country / Region Definitions ────────────────────────────────────────────
 const kCountryRows = [
@@ -204,16 +193,6 @@ function _otherCountriesTotal(countryByDay, dayKey) {
 }
 
 // ─── FIX: Purge ALL named ranges from the workbook ───────────────────────────
-// The generated report needs zero named ranges. Any that survive from the
-// template reference the deleted template sheets, causing Excel's
-// "Removed Records: Named range" recovery dialog on open.
-//
-// ExcelJS stores defined names differently across major versions:
-//   v4.x  →  workbook._definedNames._defined  (plain object, keyed by name)
-//   v3.x  →  workbook._definedNames.model     (array)
-//   other →  various internal Map/object stores
-//
-// We try every known path and wipe unconditionally.
 function _purgeOrphanedDefinedNames(workbook) {
   try {
     const dn = workbook.definedNames;
@@ -225,33 +204,33 @@ function _purgeOrphanedDefinedNames(workbook) {
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
+// ── List report batches ─────────────────────────────────────────────────────
 router.get('/reports', adminGuard, async (req, res, next) => {
   try {
     const {
       page = '1',
       pageSize = '10',
-      month,
+      type,
+      variant,
       year,
-      filterBusinessName,
+      month,
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limit   = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 10));
     const offset  = (pageNum - 1) * limit;
 
-    // ── Build WHERE clause ────────────────────────────────────────────────
     const conditions = [];
     const params     = [];
 
-    if (month && month !== 'all' && month !== 'All Months') {
-      const monthIndex = [
-        '', 'January', 'February', 'March', 'April', 'May', 'June',
-        'July', 'August', 'September', 'October', 'November', 'December',
-      ].indexOf(month);
-      if (monthIndex > 0) {
-        conditions.push('rb.period_month = ?');
-        params.push(monthIndex);
-      }
+    if (type && type !== 'all') {
+      conditions.push('rb.report_type = ?');
+      params.push(type);
+    }
+
+    if (variant && variant !== 'all') {
+      conditions.push('rb.report_variant = ?');
+      params.push(variant);
     }
 
     if (year && year !== 'all' && year !== 'All Years') {
@@ -259,12 +238,14 @@ router.get('/reports', adminGuard, async (req, res, next) => {
       params.push(parseInt(year, 10));
     }
 
-    if (filterBusinessName && filterBusinessName !== 'all' && filterBusinessName !== 'All') {
-      if (filterBusinessName === 'Total') {
-        conditions.push("r.report_type = 'total'");
-      } else {
-        conditions.push('b.business_name = ?');
-        params.push(filterBusinessName);
+    if (month && month !== 'all' && month !== 'All Months') {
+      const monthIndex = [
+        '', 'January', 'February', 'March', 'April', 'May', 'June',
+        'July', 'August', 'September', 'October', 'November', 'December',
+      ].indexOf(month);
+      if (monthIndex > 0) {
+        conditions.push('JSON_CONTAINS(rb.period_months, ?)');
+        params.push(JSON.stringify(monthIndex));
       }
     }
 
@@ -272,14 +253,8 @@ router.get('/reports', adminGuard, async (req, res, next) => {
       ? 'WHERE ' + conditions.join(' AND ')
       : '';
 
-    // ── Count total ───────────────────────────────────────────────────────
     const [countRows] = await db.pool.query(
-      `SELECT COUNT(*) as total
-       FROM reports r
-       JOIN report_batches rb ON rb.id = r.batch_id
-       LEFT JOIN businesses b  ON b.id  = r.business_id
-       LEFT JOIN users     u  ON rb.generated_by = u.id
-       ${whereClause}`,
+      `SELECT COUNT(*) as total FROM report_batches rb ${whereClause}`,
       params
     );
     const totalCount = countRows[0].total;
@@ -288,32 +263,47 @@ router.get('/reports', adminGuard, async (req, res, next) => {
       return res.json({ data: [], totalCount: 0, pageCount: 0 });
     }
 
-    // ── Fetch paginated rows ──────────────────────────────────────────────
     const [rows] = await db.pool.query(
-       `SELECT r.id, r.batch_id, r.business_id, r.report_type, r.file_url, r.created_at,
-                rb.report_scope, rb.period_month, rb.period_year,
-                rb.generated_at, rb.generated_by,
-                u.full_name AS generated_by_name,
-                b.business_name
-         FROM reports r
-         JOIN report_batches rb ON rb.id = r.batch_id
-         LEFT JOIN businesses b  ON b.id  = r.business_id
-         LEFT JOIN users     u  ON rb.generated_by = u.id
-         ${whereClause}
-         ORDER BY r.created_at DESC
-         LIMIT ? OFFSET ?`,
+      `SELECT rb.id, rb.report_type, rb.report_variant, rb.period_year,
+              rb.period_months, rb.created_at, rb.last_viewed_at,
+              rb.last_generated_at, rb.requested_by,
+              u.full_name AS requested_by_name
+       FROM report_batches rb
+       LEFT JOIN users u ON rb.requested_by = u.id
+       ${whereClause}
+       ORDER BY rb.created_at DESC
+       LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
 
-    const data = rows.map(row => ({
-      ...row,
-      pdf_url: row.file_url
-        ? row.file_url.includes('/excel.xlsx')
-          ? row.file_url.replace('/excel.xlsx', '/pdf.pdf')
-          : row.file_url.replace('.xlsx', '.pdf')
-        : null,
-      report_type: row.report_type || 'business',
-    }));
+    const data = rows.map(row => {
+      const months = Array.isArray(row.period_months)
+        ? row.period_months
+        : JSON.parse(row.period_months);
+      const sortedMonths = [...months].sort((a, b) => a - b);
+      const monthLabel = sortedMonths.length === 1
+        ? kMonthNames[sortedMonths[0]]
+        : sortedMonths.length === 12
+          ? 'Full Year'
+          : sortedMonths.map(m => kMonthNames[m].substring(0, 3)).join('-');
+
+      return {
+        id: row.id,
+        report_type: row.report_type,
+        report_variant: row.report_variant,
+        period_year: row.period_year,
+        period_months: sortedMonths,
+        period_label: row.report_variant === 'series' && sortedMonths.length > 1
+          ? `${monthLabel} ${row.period_year}`
+          : sortedMonths.length === 12
+            ? String(row.period_year)
+            : `${monthLabel} ${row.period_year}`,
+        created_at: row.created_at,
+        last_viewed_at: row.last_viewed_at,
+        last_generated_at: row.last_generated_at,
+        requested_by_name: row.requested_by_name,
+      };
+    });
 
     res.json({ data, totalCount, pageCount: Math.ceil(totalCount / limit) });
   } catch (err) {
@@ -321,374 +311,345 @@ router.get('/reports', adminGuard, async (req, res, next) => {
   }
 });
 
-router.post('/reports/generate', adminGuard, async (req, res, next) => {
+// ── Create a report batch (no file generation) ─────────────────────────────
+router.post('/reports', adminGuard, async (req, res, next) => {
   try {
-    const { month, year, scope } = req.body;
+    const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.body;
 
-    if (!['monthly', 'annual'].includes(scope)) {
-      return res.status(400).json({ message: 'scope must be "monthly" or "annual"' });
+    if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
+      return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series" (DAE)' });
+    }
+    if (!periodYear || parseInt(periodYear, 10) < 2000) {
+      return res.status(400).json({ message: 'periodYear must be >= 2000' });
+    }
+    if (!Array.isArray(periodMonths) || periodMonths.length === 0) {
+      return res.status(400).json({ message: 'periodMonths must be a non-empty array of month ints (1-12)' });
     }
 
-    const effectiveMonth = scope === 'annual' ? 12 : month;
+    const months = [...new Set(periodMonths)].map(Number).filter(m => m >= 1 && m <= 12).sort((a, b) => a - b);
 
-    // ── Check for existing batch ─────────────────────────────────────────────
-    const dupQuery = scope === 'annual'
-      ? 'SELECT id FROM report_batches WHERE report_scope = ? AND period_year = ? LIMIT 1'
-      : 'SELECT id FROM report_batches WHERE report_scope = ? AND period_month = ? AND period_year = ? LIMIT 1';
-    const dupParams = scope === 'annual' ? [scope, year] : [scope, effectiveMonth, year];
-    const [existingBatch] = await db.pool.execute(dupQuery, dupParams);
-    if (existingBatch.length > 0) {
-      const label = scope === 'annual' ? String(year) : `${kMonthNames[month]} ${year}`;
-      return res.status(400).json({
-        message: `A ${scope} report batch for ${label} already exists.`
-      });
+    if (['daily', 'summary'].includes(reportVariant) && months.length !== 1) {
+      return res.status(400).json({ message: `"${reportVariant}" variant requires exactly one month` });
     }
 
-    // ── Fetch approved businesses ────────────────────────────────────────────
-    const [businesses] = await db.pool.execute(
-      `SELECT id, business_name, business_line, region, city_municipality, province,
-              (SELECT COUNT(*) FROM rooms WHERE business_id = businesses.id) AS total_rooms,
-              owner_first_name, owner_last_name, owner_middle_name
-       FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY business_name`
+    const crypto = await import('crypto');
+    const monthsHash = crypto.createHash('sha256').update(JSON.stringify(months)).digest('hex');
+
+    // Find-or-create (dedupe on type+variant+year+monthsHash)
+    const [existing] = await db.pool.execute(
+      `SELECT id FROM report_batches
+       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months_hash = ?`,
+      [reportType, reportVariant, parseInt(periodYear, 10), monthsHash]
     );
 
-    if (businesses.length === 0) {
-      return res.status(400).json({ message: 'No approved businesses found.' });
+    if (existing.length > 0) {
+      return res.status(200).json({ batchId: existing[0].id, existing: true });
     }
-
-    const [userRows] = await db.pool.execute('SELECT full_name, role FROM users WHERE id = ?', [req.user.id]);
-    const adminName = userRows[0]?.full_name || 'System Admin';
-
-    // ── Transaction: create batch + insert all reports atomically ────────────
-    await db.pool.query('START TRANSACTION');
 
     const batchId = uuidv4();
     await db.pool.execute(
-      `INSERT INTO report_batches (id, report_scope, period_month, period_year, generated_by)
-       VALUES (?, ?, ?, ?, ?)`,
-      [batchId, scope, effectiveMonth, year, req.user.id]
+      `INSERT INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [batchId, reportType, reportVariant, parseInt(periodYear, 10), JSON.stringify(months), req.user.id]
     );
 
-    const daysInMonth = new Date(year, month, 0).getDate();
-    const timestamp = Date.now();
-    const writtenFiles = [];
-    const reportResults = [];
-
-    const includeDaily       = scope === 'monthly';
-    const includeCountrySum  = scope === 'monthly';
-    const includeMonthlySum  = scope === 'annual';
-    const monthLabel = scope === 'annual' ? 'ANNUAL' : String(month).padStart(2, '0');
-
-    // ── Aggregation collectors for totals report ───────────────────────────────
-    const allBizMonthData = [];
-    const allBizAnnualData = [];
-    let totalRoomsSum = 0;
-    const unionLines = new Set();
-
-    try {
-      // ── Process each business sequentially ─────────────────────────────────
-      for (const biz of businesses) {
-        // Fetch 12 months of data if annual summary needed
-        let bizAllMonths = null;
-        if (includeMonthlySum) {
-          bizAllMonths = [];
-          for (let m = 1; m <= 12; m++) {
-            const md = await _fetchMonthData(biz.id, m, year, true);
-            bizAllMonths.push(md);
-          }
-        }
-
-        // Fetch single-month data for monthly scope (also used for daily/sum sheets)
-        const bizData = includeDaily || includeCountrySum
-          ? await _fetchMonthData(biz.id, month, year)
-          : null;
-
-        // Collect for totals aggregation
-        if (includeDaily || includeCountrySum) allBizMonthData.push(bizData);
-        if (includeMonthlySum)                allBizAnnualData.push(bizAllMonths);
-        totalRoomsSum += biz.total_rooms || 0;
-        if (Array.isArray(biz.business_line)) biz.business_line.forEach(l => unionLines.add(l));
-
-        // ── Create workbook for this business ────────────────────────────────
-        const wb = new ExcelJS.Workbook();
-        await wb.xlsx.readFile(TEMPLATE_PATH);
-
-        const dailyTpl   = wb.getWorksheet('Name of Establishment');
-        const sumTpl     = wb.getWorksheet('AE DAE-1B by Country (Sum) ');
-        const monthTpl   = wb.getWorksheet('AE DAE-1B (Monthly)');
-
-        if (!dailyTpl || !sumTpl || !monthTpl) {
-          throw new Error('Template worksheets not found. Check sheet names in template file.');
-        }
-
-        // Build daily sheet (monthly scope only)
-        if (includeDaily && bizData) {
-          const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
-          const sheet = wb.addWorksheet(sheetName);
-          _copySheetProperties(dailyTpl, sheet);
-          for (let c = 1; c <= 33; c++) {
-            const col = sheet.getColumn(c);
-            if (col.width) col.width = Math.round(col.width * 1.0 * 10) / 10;
-          }
-          _buildDailySheet(sheet, biz, bizData, month, year, daysInMonth, adminName);
-        }
-
-        // Build country summary sheet (monthly scope only)
-        if (includeCountrySum && bizData) {
-          const sheet = wb.addWorksheet('AE DAE-1B by Country (Sum)');
-          _copySheetProperties(sumTpl, sheet);
-          _buildCountrySummarySheet(sheet, bizData, biz.total_rooms, month, year, daysInMonth, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
-        }
-
-        // Build annual monthly-summary sheet (annual scope only)
-        if (includeMonthlySum && bizAllMonths) {
-          const sheet = wb.addWorksheet('AE DAE-1B (Monthly) Summary');
-          _copySheetProperties(monthTpl, sheet);
-          _buildMonthlySummarySheet(sheet, bizAllMonths, biz.total_rooms, year, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
-        }
-
-        // Remove template sheets
-        wb.removeWorksheet(dailyTpl.id);
-        wb.removeWorksheet(sumTpl.id);
-        wb.removeWorksheet(monthTpl.id);
-
-        _purgeOrphanedDefinedNames(wb);
-        wb.eachSheet(ws => {
-          if (ws.pageSetup) {
-            ws.pageSetup.printArea = null;
-            delete ws.pageSetup.printTitlesRow;
-            delete ws.pageSetup.printTitlesColumn;
-          }
-        });
-
-        // Write Excel file (temp)
-        const bizSlug = biz.business_name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').substring(0, 30);
-        const excelFileName = `DAE1B_${bizSlug}_${year}_${monthLabel}_${timestamp}.xlsx`;
-        const excelPath = path.join(UPLOADS_DIR, excelFileName);
-        await wb.xlsx.writeFile(excelPath);
-        writtenFiles.push(excelPath);
-
-        // Generate PDF (temp)
-        const pdfFileName = excelFileName.replace('.xlsx', '.pdf');
-        const pdfPath = path.join(UPLOADS_DIR, pdfFileName);
-        await _generatePdfFromWorkbook(wb, pdfPath, month, year);
-        writtenFiles.push(pdfPath);
-
-        // Upload Excel to Cloudinary
-        const reportId = uuidv4();
-        const excelUpload = await cloudinary.uploader.upload(excelPath, {
-          resource_type: 'raw',
-          folder: 'tourism/reports',
-          public_id: `${reportId}/excel`,
-          overwrite: true,
-        });
-        const excelUrl = excelUpload.secure_url;
-
-        // Upload PDF to Cloudinary
-        await cloudinary.uploader.upload(pdfPath, {
-          resource_type: 'raw',
-          folder: 'tourism/reports',
-          public_id: `${reportId}/pdf`,
-          overwrite: true,
-        });
-
-        // Remove local temp files
-        try { fs.unlinkSync(excelPath); } catch (e) { /* best effort */ }
-        try { fs.unlinkSync(pdfPath); } catch (e) { /* best effort */ }
-
-        // Insert report row
-        await db.pool.execute(
-          `INSERT INTO reports (id, batch_id, business_id, report_type, file_url) VALUES (?, ?, ?, 'business', ?)`,
-          [reportId, batchId, biz.id, excelUrl]
-        );
-
-        reportResults.push({ reportId, businessId: biz.id, businessName: biz.business_name, fileUrl: excelUrl });
-      }
-
-      // ── Build totals workbook across all businesses ─────────────────────────
-      const totalBiz = {
-        business_name:  'TOTAL \u2013 ALL ACCOMMODATION',
-        total_rooms:    totalRoomsSum,
-        business_line:  [...unionLines],
-        region:         '', city_municipality: 'San Pablo City', province: 'Laguna',
-      };
-
-      const wbTotal = new ExcelJS.Workbook();
-      await wbTotal.xlsx.readFile(TEMPLATE_PATH);
-      const totalDailyTpl = wbTotal.getWorksheet('Name of Establishment');
-      const totalSumTpl   = wbTotal.getWorksheet('AE DAE-1B by Country (Sum) ');
-      const totalMonthTpl = wbTotal.getWorksheet('AE DAE-1B (Monthly)');
-
-      // Rename template sheets so addWorksheet with the same name doesn't clash
-      totalDailyTpl.name = '_TEMPLATE_Daily';
-      totalSumTpl.name   = '_TEMPLATE_Sum';
-      totalMonthTpl.name = '_TEMPLATE_Monthly';
-
-      if (scope === 'monthly' && allBizMonthData.length > 0) {
-        const mergedMd = _mergeMonthData(month, allBizMonthData);
-
-        const dailySheet = wbTotal.addWorksheet('Name of Establishment');
-        _copySheetProperties(totalDailyTpl, dailySheet);
-        _buildDailySheet(dailySheet, totalBiz, mergedMd, month, year, daysInMonth, adminName);
-
-        const sumSheet = wbTotal.addWorksheet('AE DAE-1B by Country (Sum)');
-        _copySheetProperties(totalSumTpl, sumSheet);
-        _buildCountrySummarySheet(sumSheet, mergedMd, totalRoomsSum, month, year, daysInMonth, adminName, 'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
-      }
-
-      if (scope === 'annual' && allBizAnnualData.length > 0) {
-        const mergedMonths = [];
-        for (let m = 1; m <= 12; m++) {
-          const monthDataList = allBizAnnualData.map(b => b[m - 1]);
-          mergedMonths.push(_mergeMonthData(m, monthDataList));
-        }
-
-        const mSheet = wbTotal.addWorksheet('AE DAE-1B (Monthly) Summary');
-        _copySheetProperties(totalMonthTpl, mSheet);
-        _buildMonthlySummarySheet(mSheet, mergedMonths, totalRoomsSum, year, adminName, 'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
-      }
-
-      // Remove template sheets from totals workbook
-      wbTotal.removeWorksheet(totalDailyTpl.id);
-      wbTotal.removeWorksheet(totalSumTpl.id);
-      wbTotal.removeWorksheet(totalMonthTpl.id);
-      _purgeOrphanedDefinedNames(wbTotal);
-      wbTotal.eachSheet(ws => {
-        if (ws.pageSetup) {
-          ws.pageSetup.printArea = null;
-          delete ws.pageSetup.printTitlesRow;
-          delete ws.pageSetup.printTitlesColumn;
-        }
-      });
-
-      // Write totals Excel + PDF
-      const totalId = uuidv4();
-      const totalExcelName = `DAE1B_TOTAL_ALL_${year}_${monthLabel}_${timestamp}.xlsx`;
-      const totalExcelPath = path.join(UPLOADS_DIR, totalExcelName);
-      await wbTotal.xlsx.writeFile(totalExcelPath);
-      writtenFiles.push(totalExcelPath);
-
-      const totalPdfPath = totalExcelPath.replace('.xlsx', '.pdf');
-      await _generatePdfFromWorkbook(wbTotal, totalPdfPath, month, year);
-      writtenFiles.push(totalPdfPath);
-
-      const totalExcelUpload = await cloudinary.uploader.upload(totalExcelPath, {
-        resource_type: 'raw',
-        folder: 'tourism/reports',
-        public_id: `${totalId}/excel`,
-        overwrite: true,
-      });
-
-      await cloudinary.uploader.upload(totalPdfPath, {
-        resource_type: 'raw',
-        folder: 'tourism/reports',
-        public_id: `${totalId}/pdf`,
-        overwrite: true,
-      });
-
-      try { fs.unlinkSync(totalExcelPath); } catch (e) { /* best effort */ }
-      try { fs.unlinkSync(totalPdfPath); } catch (e) { /* best effort */ }
-
-      await db.pool.execute(
-        `INSERT INTO reports (id, batch_id, business_id, report_type, file_url) VALUES (?, ?, NULL, 'total', ?)`,
-        [totalId, batchId, totalExcelUpload.secure_url]
-      );
-
-      reportResults.push({ reportId: totalId, businessId: null, businessName: totalBiz.business_name, fileUrl: totalExcelUpload.secure_url });
-
-      // ── Commit transaction ───────────────────────────────────────────────
-      await db.pool.query('COMMIT');
-
-      // ── Archive month records (monthly scope only) ─────────────────────────
-      if (scope === 'monthly') {
-        await _archiveMonthRecords(month, year);
-      }
-
-      res.json({
-        message: 'Reports generated successfully',
-        batchId,
-        reportCount: reportResults.length,
-        reports: reportResults,
-      });
-    } catch (innerErr) {
-      // ── Rollback: roll back transaction and delete all written files ──────
-      console.error('Report generation failed — rolling back:', innerErr.message);
-      try {
-        await db.pool.query('ROLLBACK');
-      } catch (dbErr) {
-        console.error('Rollback DB error:', dbErr.message);
-      }
-      for (const f of writtenFiles) {
-        try { fs.unlinkSync(f); } catch (e) { /* best effort */ }
-      }
-      throw innerErr;
-    }
+    res.status(201).json({ batchId, existing: false });
   } catch (err) {
-    console.error('Report Generation Error:', err);
     next(err);
   }
 });
 
-// ─── Sheet Property Copy ─────────────────────────────────────────────────────
+// ── View report (live aggregation, returns JSON) ───────────────────────────
+router.get('/reports/view', adminGuard, async (req, res, next) => {
+  try {
+    const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.query;
 
-function _copySheetProperties(src, dst) {
-  if (src.properties) dst.properties = JSON.parse(JSON.stringify(src.properties));
-  if (src.pageSetup)  dst.pageSetup  = JSON.parse(JSON.stringify(src.pageSetup));
-  if (src.views)      dst.views      = JSON.parse(JSON.stringify(src.views));
+    if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
+      return res.status(400).json({ message: 'reportVariant is required (daily|summary|series)' });
+    }
+    if (!periodYear) {
+      return res.status(400).json({ message: 'periodYear is required' });
+    }
 
-  if (src.columns) {
-    dst.columns = src.columns.map(c => ({
-      width:  c.width,
-      header: c.header,
-      key:    c.key,
-      style:  c.style ? JSON.parse(JSON.stringify(c.style)) : undefined,
-    }));
+    let months;
+    try {
+      months = JSON.parse(periodMonths);
+      if (!Array.isArray(months)) throw new Error();
+    } catch {
+      return res.status(400).json({ message: 'periodMonths must be a JSON array of ints' });
+    }
+
+    const sortedMonths = [...months].map(Number).sort((a, b) => a - b);
+
+    if (['daily', 'summary'].includes(reportVariant) && sortedMonths.length !== 1) {
+      return res.status(400).json({ message: `"${reportVariant}" requires exactly one month` });
+    }
+
+    const crypto = await import('crypto');
+    const monthsHash = crypto.createHash('sha256').update(JSON.stringify(sortedMonths)).digest('hex');
+    const year = parseInt(periodYear, 10);
+
+    // Find-or-create batch
+    const [existing] = await db.pool.execute(
+      `SELECT id FROM report_batches
+       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months_hash = ?`,
+      [reportType, reportVariant, year, monthsHash]
+    );
+
+    let batchId;
+    if (existing.length > 0) {
+      batchId = existing[0].id;
+      await db.pool.execute('UPDATE report_batches SET last_viewed_at = NOW() WHERE id = ?', [batchId]);
+    } else {
+      batchId = uuidv4();
+      await db.pool.execute(
+        `INSERT INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by, last_viewed_at)
+         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+        [batchId, reportType, reportVariant, year, JSON.stringify(sortedMonths), req.user.id]
+      );
+    }
+
+    // Fetch approved businesses
+    const [businesses] = await db.pool.execute(
+      `SELECT id, business_name, business_line, ae_id, region, city_municipality, province,
+              (SELECT COUNT(*) FROM rooms WHERE business_id = businesses.id) AS total_rooms
+       FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY business_name`
+    );
+
+    // Aggregate per business
+    const establishments = [];
+    const allMonthData = [];
+
+    for (const biz of businesses) {
+      const monthDataList = [];
+      for (const m of sortedMonths) {
+        const md = await _fetchMonthData(biz.id, m, year);
+        monthDataList.push(md);
+        allMonthData.push(md);
+      }
+
+      establishments.push({
+        businessId: biz.id,
+        businessName: biz.business_name,
+        totalRooms: biz.total_rooms || 0,
+        aeId: biz.ae_id,
+        region: biz.region,
+        cityMunicipality: biz.city_municipality,
+        province: biz.province,
+        businessLine: typeof biz.business_line === 'string'
+          ? JSON.parse(biz.business_line || '[]')
+          : (biz.business_line || []),
+        monthData: reportVariant === 'series' ? null : monthDataList[0],
+        seriesData: reportVariant === 'series'
+          ? monthDataList.map(md => ({ month: md.month, data: md }))
+          : null,
+      });
+    }
+
+    // Compute merged totals
+    let totals;
+    if (sortedMonths.length === 1) {
+      totals = _mergeMonthData(sortedMonths[0], allMonthData);
+    } else {
+      totals = _mergeMonthDataMulti(sortedMonths, allMonthData);
+    }
+
+    const totalRoomsAll = businesses.reduce((sum, b) => sum + (b.total_rooms || 0), 0);
+
+    res.json({
+      batch: { id: batchId, reportType, reportVariant, periodYear: year, periodMonths: sortedMonths },
+      establishments,
+      totals: { ...totals, totalRooms: totalRoomsAll },
+    });
+  } catch (err) {
+    next(err);
   }
+});
 
-  src.eachRow({ includeEmpty: true }, (row, rowNumber) => {
-    const dstRow = dst.getRow(rowNumber);
-    dstRow.height = row.height;
-    row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-      const dstCell = dstRow.getCell(colNumber);
-      
-      // ── FIX: "Unshare" shared formulas ─────────────────────────────────────
-      // If the template uses shared formulas (e.g. AG29:AG30), ExcelJS might
-      // fail with "Shared Formula master must exist..." if we later overwrite
-      // the master cell (AG29) with a hard-coded value but leave the clone 
-      // (AG30) as-is.  Converting them to regular formulas during copy avoids
-      // this dependency.
-      if (cell.type === ExcelJS.ValueType.Formula) {
-        if (cell.formula && cell.formula.includes('!')) {
-          // ── FIX: "Bake" cross-sheet formulas ───────────────────────────────
-          // Formulas like ='Sheet'!A1 will break when the source sheet is
-          // deleted. Replacing them with their cached result avoids #REF!.
-          dstCell.value = cell.result ?? 0;
-        } else {
-          dstCell.value = {
-            formula: cell.formula,
-            result:  cell.result
-          };
+// ── Download report (generates file in memory, streams bytes) ───────────────
+router.post('/reports/download', adminGuard, async (req, res, next) => {
+  // TODO: large annual series across many establishments may be slow on free tier
+  try {
+    const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx' } = req.body;
+
+    if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
+      return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series"' });
+    }
+    if (!periodYear) {
+      return res.status(400).json({ message: 'periodYear is required' });
+    }
+    if (!['xlsx', 'pdf'].includes(format)) {
+      return res.status(400).json({ message: 'format must be "xlsx" or "pdf"' });
+    }
+
+    let months;
+    try {
+      months = JSON.parse(periodMonths);
+      if (!Array.isArray(months)) throw new Error();
+    } catch {
+      return res.status(400).json({ message: 'periodMonths must be a JSON array of ints' });
+    }
+
+    const sortedMonths = [...months].map(Number).sort((a, b) => a - b);
+
+    if (['daily', 'summary'].includes(reportVariant) && sortedMonths.length !== 1) {
+      return res.status(400).json({ message: `"${reportVariant}" requires exactly one month` });
+    }
+
+    const year = parseInt(periodYear, 10);
+    const crypto = await import('crypto');
+    const monthsHash = crypto.createHash('sha256').update(JSON.stringify(sortedMonths)).digest('hex');
+
+    // Find-or-create batch
+    const [existing] = await db.pool.execute(
+      `SELECT id FROM report_batches
+       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months_hash = ?`,
+      [reportType, reportVariant, year, monthsHash]
+    );
+
+    let batchId;
+    if (existing.length > 0) {
+      batchId = existing[0].id;
+    } else {
+      batchId = uuidv4();
+      await db.pool.execute(
+        `INSERT INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [batchId, reportType, reportVariant, year, JSON.stringify(sortedMonths), req.user.id]
+      );
+    }
+
+    // ── Aggregate (reuse same logic as /view) ─────────────────────────────────
+    const [businesses] = await db.pool.execute(
+      `SELECT id, business_name, business_line, ae_id, region, city_municipality, province,
+              owner_first_name, owner_last_name, owner_middle_name,
+              (SELECT COUNT(*) FROM rooms WHERE business_id = businesses.id) AS total_rooms
+       FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY business_name`
+    );
+
+    const [userRows] = await db.pool.execute('SELECT full_name FROM users WHERE id = ?', [req.user.id]);
+    const adminName = userRows[0]?.full_name || 'System Admin';
+
+    const daysInMonth = sortedMonths.length === 1 ? new Date(year, sortedMonths[0], 0).getDate() : 0;
+    const allBizMonthData = [];
+    const allBizAnnualData = [];
+    let totalRoomsSum = 0;
+    const unionLines = new Set();
+    const monthLabel = sortedMonths.length === 1
+      ? String(sortedMonths[0]).padStart(2, '0')
+      : sortedMonths.length === 12 ? 'FULL' : sortedMonths.join('-');
+
+    // ── Build workbooks ───────────────────────────────────────────────────────
+    const wb = new ExcelJS.Workbook();
+
+    for (const biz of businesses) {
+      let bizAllMonths = null;
+      if (reportVariant === 'series' && sortedMonths.length > 1) {
+        // Fetch all requested months for this business
+        bizAllMonths = [];
+        for (const m of sortedMonths) {
+          const md = await _fetchMonthData(biz.id, m, year);
+          bizAllMonths.push(md);
+          allBizMonthData.push(md);
         }
-      } else {
-        dstCell.value = cell.value;
+      } else if (sortedMonths.length === 1) {
+        const md = await _fetchMonthData(biz.id, sortedMonths[0], year);
+        allBizMonthData.push(md);
+        bizAllMonths = [md];
       }
 
-      if (cell.style) dstCell.style = JSON.parse(JSON.stringify(cell.style));
-    });
-  });
+      totalRoomsSum += biz.total_rooms || 0;
+      if (Array.isArray(biz.business_line)) biz.business_line.forEach(l => unionLines.add(l));
 
-  if (src._merges) {
-    Object.values(src._merges).forEach(m => {
-      try {
-        dst.mergeCells(m.model.top, m.model.left, m.model.bottom, m.model.right);
-      } catch (e) {
-        // Ignore overlapping-merge errors from template
+      if (reportVariant === 'daily' && bizAllMonths?.[0]) {
+        const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
+        const sheet = wb.addWorksheet(sheetName);
+        _buildDailySheet(sheet, biz, bizAllMonths[0], sortedMonths[0], year, daysInMonth, adminName);
+      }
+
+      if (reportVariant === 'summary' && bizAllMonths?.[0]) {
+        const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
+        const sheet = wb.addWorksheet(sheetName);
+        _buildCountrySummarySheet(sheet, bizAllMonths[0], biz.total_rooms, sortedMonths[0], year,
+          daysInMonth, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
+      }
+
+      if (reportVariant === 'series' && bizAllMonths && bizAllMonths.length > 1) {
+        const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
+        const sheet = wb.addWorksheet(sheetName);
+        _buildMonthlySummarySheet(sheet, bizAllMonths, biz.total_rooms, year, adminName,
+          biz.city_municipality || '', biz.province || '', biz.business_name, biz);
+      }
+    }
+
+    // ── Totals sheet (across all businesses) ──────────────────────────────────
+    const totalBiz = {
+      business_name: 'TOTAL \u2013 ALL ACCOMMODATION',
+      total_rooms: totalRoomsSum,
+      business_line: [...unionLines],
+      region: '', city_municipality: 'San Pablo City', province: 'Laguna',
+    };
+
+    if (reportVariant === 'daily' && allBizMonthData.length > 0) {
+      const mergedMd = _mergeMonthData(sortedMonths[0], allBizMonthData);
+      const sheet = wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
+      _buildDailySheet(sheet, totalBiz, mergedMd, sortedMonths[0], year, daysInMonth, adminName);
+    }
+
+    if (reportVariant === 'summary' && allBizMonthData.length > 0) {
+      const mergedMd = _mergeMonthData(sortedMonths[0], allBizMonthData);
+      const sheet = wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
+      _buildCountrySummarySheet(sheet, mergedMd, totalRoomsSum, sortedMonths[0], year,
+        daysInMonth, adminName, 'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
+    }
+
+    if (reportVariant === 'series' && allBizMonthData.length > 0) {
+      const mergedMonths = [];
+      for (const m of sortedMonths) {
+        const monthDataList = allBizMonthData.filter(md => md.month === m);
+        mergedMonths.push(_mergeMonthData(m, monthDataList));
+      }
+      const sheet = wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
+      _buildMonthlySummarySheet(sheet, mergedMonths, totalRoomsSum, year, adminName,
+        'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
+    }
+
+    _purgeOrphanedDefinedNames(wb);
+    wb.eachSheet(ws => {
+      if (ws.pageSetup) {
+        ws.pageSetup.printArea = null;
+        delete ws.pageSetup.printTitlesRow;
+        delete ws.pageSetup.printTitlesColumn;
       }
     });
+
+    // ── Generate file ───────────────────────────────────────────────────────
+    const safeMonths = sortedMonths.join('-');
+    const baseFilename = `DAE_${reportVariant}_${year}_${safeMonths}`;
+
+    if (format === 'xlsx') {
+      const buffer = await wb.xlsx.writeBuffer();
+      await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
+      res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.set('Content-Disposition', `attachment; filename="${baseFilename}.xlsx"`);
+      res.send(Buffer.from(buffer));
+    } else {
+      const pdfBuffer = await _generatePdfBuffer(wb, sortedMonths[0], year);
+      await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
+      res.set('Content-Type', 'application/pdf');
+      res.set('Content-Disposition', `attachment; filename="${baseFilename}.pdf"`);
+      res.send(pdfBuffer);
+    }
+  } catch (err) {
+    console.error('Report download error:', err);
+    // Error must be sent BEFORE any binary headers are set
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err.message || 'Failed to generate report' });
+    }
   }
-}
+});
 
-// ─── Data Fetching ───────────────────────────────────────────────────────────
+// ─── Data Fetching (new schema: guest_records lead fields + guest_record_rooms) ─
 
 async function _fetchMonthData(businessId, month, year, includeArchived = false) {
   const firstDay    = `${year}-${String(month).padStart(2, '0')}-01`;
@@ -698,32 +659,29 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
     : "AND status = 'active'";
 
   const [records] = await db.pool.execute(
-    `SELECT id, check_in, check_out, rooms_occupied
+    `SELECT id, check_in, check_out, total_guests,
+            lead_country, lead_sex, lead_nationality, lead_is_overseas
      FROM guest_records
      WHERE business_id = ? AND is_deleted = false
        AND check_in >= ? AND check_in <= ? ${statusFilter}`,
     [businessId, firstDay, lastDay]
   );
 
+  // Fetch room assignments to compute rooms_occupied per record
   const recordIds = records.map(r => r.id);
-  let breakdowns  = [];
+  let roomCounts = {};
   if (recordIds.length > 0) {
-    const [bdRows] = await db.pool.execute(
-      `SELECT guest_record_id, country, sex, nationality, count, is_overseas
-       FROM guest_breakdowns WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')})`,
+    const [grrRows] = await db.pool.execute(
+      `SELECT guest_record_id, COUNT(DISTINCT room_id) AS room_count
+       FROM guest_record_rooms
+       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')})
+       GROUP BY guest_record_id`,
       recordIds
     );
-    breakdowns = bdRows;
+    grrRows.forEach(r => { roomCounts[r.guest_record_id] = r.room_count; });
   }
 
-  // Total guest count per record (used for guestNights calculation)
-  const recordGuestCount = {};
-  breakdowns.forEach(b => {
-    recordGuestCount[b.guest_record_id] = (recordGuestCount[b.guest_record_id] || 0) + _asInt(b.count);
-  });
-
-  // Precompute check-in day in LOCAL time so the day number is never off-by-one
-  // in Philippine timezone (UTC+8).
+  // Precompute check-in day in LOCAL time
   const recordDay = {};
   records.forEach(r => {
     const d = _parseLocalDate(r.check_in);
@@ -738,19 +696,16 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
   const guestNightsPerArrivalDay = {};
   let totalGuestNights = 0;
 
-  // ── Night / room calculations (requires both check-in AND check-out) ────────
+  // ── Night / room calculations ──────────────────────────────────────────────
   records.forEach(r => {
     const checkIn = _parseLocalDate(r.check_in);
     if (!checkIn) return;
-
-    // Guests with no check-out are still counted as arrivals (via breakdowns
-    // below) but cannot contribute to guest-nights or rooms-occupied.
     if (!r.check_out) return;
 
     const checkOut  = _parseLocalDate(r.check_out);
     const nights    = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    const rooms     = r.rooms_occupied || 0;
-    const guestCount = recordGuestCount[r.id] || 0;
+    const rooms     = roomCounts[r.id] || 0;
+    const guestCount = r.total_guests || 0;
     const day       = checkIn.getDate();
 
     if (nights > 0) {
@@ -758,8 +713,7 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
       guestNightsPerArrivalDay[day] = (guestNightsPerArrivalDay[day] || 0) + (nights * guestCount);
     }
 
-    // Spread rooms-occupied across each stay-night (at minimum the check-in day)
-    // so same-day stays (nights === 0) still count their rooms.
+    // Spread rooms-occupied across each stay-night
     const spreadDays = Math.max(1, nights);
     for (let n = 0; n < spreadDays; n++) {
       const stayDate = new Date(checkIn);
@@ -776,19 +730,18 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
 
   const listedSet = new Set(kCountryRows.map(c => c.country));
 
-  // ── Arrival / residency / country tallies (all records with a valid day) ────
-  breakdowns.forEach(b => {
-    const day = recordDay[b.guest_record_id];
+  // ── Arrival / residency / country tallies (from lead guest fields) ─────────
+  records.forEach(r => {
+    const day = recordDay[r.id];
     if (!day) return;
 
-    const country     = (b.country || '').toUpperCase();
-    const nationality = (b.nationality || '');
-    const sex         = (b.sex || '').toLowerCase();
-    const rawBucket   = _classifyResidenceBucket({ country, nationality, isOverseas: !!b.is_overseas });
-    const count       = _asInt(b.count);
+    const country     = (r.lead_country || '').toUpperCase();
+    const nationality = (r.lead_nationality || '');
+    const sex         = (r.lead_sex || '').toLowerCase();
+    const rawBucket   = _classifyResidenceBucket({ country, nationality, isOverseas: !!r.lead_is_overseas });
+    const count       = _asInt(r.total_guests);
 
-    // All foreign residents go into countryByDay (listed and unlisted countries).
-    // _otherCountriesTotal() later computes the unlisted subset for display.
+    // All foreign residents go into countryByDay
     if (rawBucket === 'foreign_resident' && country) {
       if (!countryByDay[country]) countryByDay[country] = { 0: 0 };
       countryByDay[country][day] = (countryByDay[country][day] || 0) + count;
@@ -801,7 +754,7 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
       bucket = listedSet.has(country) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
     }
 
-    // Residency bucket totals (day-level and grand total at key 0)
+    // Residency bucket totals
     residentsByDay[day] = residentsByDay[day] || {};
     residentsByDay[day][bucket] = (residentsByDay[day][bucket] || 0) + count;
     residentsByDay[0][bucket]   = (residentsByDay[0][bucket]   || 0) + count;
@@ -877,20 +830,67 @@ function _mergeMonthData(month, list) {
   };
 }
 
-async function _archiveMonthRecords(month, year) {
-  const firstDay = `${year}-${String(month).padStart(2, '0')}-01`;
-  const lastDay  = new Date(year, month, 0).toISOString().split('T')[0];
-  const [records] = await db.pool.execute(
-    `SELECT id FROM guest_records WHERE status = 'active' AND is_deleted = false
-     AND check_in >= ? AND check_in <= ?`,
-    [firstDay, lastDay]
-  );
-  const ids = records.map(r => r.id);
-  if (ids.length > 0) {
-    await db.pool.execute(
-      `UPDATE guest_records SET status = 'archived' WHERE id IN (${ids.map(() => '?').join(',')})`,
-      ids
-    );
+function _mergeMonthDataMulti(months, list) {
+  const byMonth = {};
+  months.forEach(m => { byMonth[m] = []; });
+  list.forEach(md => {
+    if (byMonth[md.month]) byMonth[md.month].push(md);
+  });
+
+  const result = {};
+  for (const m of months) {
+    result[m] = _mergeMonthData(m, byMonth[m] || []);
+  }
+  return result;
+}
+
+// ─── Sheet Property Copy ─────────────────────────────────────────────────────
+
+function _copySheetProperties(src, dst) {
+  if (src.properties) dst.properties = JSON.parse(JSON.stringify(src.properties));
+  if (src.pageSetup)  dst.pageSetup  = JSON.parse(JSON.stringify(src.pageSetup));
+  if (src.views)      dst.views      = JSON.parse(JSON.stringify(src.views));
+
+  if (src.columns) {
+    dst.columns = src.columns.map(c => ({
+      width:  c.width,
+      header: c.header,
+      key:    c.key,
+      style:  c.style ? JSON.parse(JSON.stringify(c.style)) : undefined,
+    }));
+  }
+
+  src.eachRow({ includeEmpty: true }, (row, rowNumber) => {
+    const dstRow = dst.getRow(rowNumber);
+    dstRow.height = row.height;
+    row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+      const dstCell = dstRow.getCell(colNumber);
+
+      if (cell.type === ExcelJS.ValueType.Formula) {
+        if (cell.formula && cell.formula.includes('!')) {
+          dstCell.value = cell.result ?? 0;
+        } else {
+          dstCell.value = {
+            formula: cell.formula,
+            result:  cell.result
+          };
+        }
+      } else {
+        dstCell.value = cell.value;
+      }
+
+      if (cell.style) dstCell.style = JSON.parse(JSON.stringify(cell.style));
+    });
+  });
+
+  if (src._merges) {
+    Object.values(src._merges).forEach(m => {
+      try {
+        dst.mergeCells(m.model.top, m.model.left, m.model.bottom, m.model.right);
+      } catch (e) {
+        // Ignore overlapping-merge errors from template
+      }
+    });
   }
 }
 
@@ -900,11 +900,9 @@ async function _archiveMonthRecords(month, year) {
 // ======================================== DAILY SHEET =========================================
 // ==============================================================================================
 
-
 function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   const r = kRows.daily;
 
-  // ── Header cells ────────────────────────────────────────────────────────────
   sheet.getCell('B3').value = {
     richText: [
       { text: 'Region: ' },
@@ -919,7 +917,7 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
     : (biz.business_line || []);
   kAccTypes.forEach(t => {
     if (bizLines.includes(t.key)) {
-      sheet.getCell(`B${t.row}`).value     = '✔';
+      sheet.getCell(`B${t.row}`).value     = '\u2714';
       sheet.getCell(`B${t.row}`).alignment = { horizontal: 'center' };
     }
   });
@@ -927,9 +925,6 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   sheet.getCell('A22').value = `City/Municipality: ${biz.city_municipality || ''}`;
   sheet.getCell('A23').value = `Province: ${biz.province || ''}`;
 
-  // ── Day-column writer ────────────────────────────────────────────────────────
-  // Days within the month get the real value (0 is written as 0, not blank).
-  // Days beyond the month end (e.g. day 31 in a 30-day month) are left null.
   const setDayValues = (rowNum, fn) => {
     for (let d = 1; d <= 31; d++) {
       sheet.getCell(rowNum, d + 1).value = d > daysInMonth ? null : (fn(d) ?? 0);
@@ -940,36 +935,21 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   const cnt = (country, d) => md.countryByDay[country.toUpperCase()]?.[d] || 0;
   const sex = (d, s, cat)  => md.sexByDay[d]?.[s]?.[cat] || 0;
 
-  // ── Residency rows ───────────────────────────────────────────────────────────
   setDayValues(r.phResFilipino, d => res(d, 'philippine_resident_filipino'));
   setDayValues(r.phResForeign, d => res(d, 'philippine_resident_foreign'));
-  
-  // TOTAL PHILIPPINE RESIDENTS
   setDayValues(r.phResTotal, d => res(d, 'philippine_resident_filipino') + res(d, 'philippine_resident_foreign'));
 
   kCountryRows.forEach(c => setDayValues(c.daily, d => cnt(c.country, d)));
 
-  // ── Regional Subtotals (Daily) ──────────────────────────────────────────────
   kRegionalGroups.forEach(g => {
-    setDayValues(g.dailyRow, d => {
-      return g.countries.reduce((sum, country) => sum + cnt(country, d), 0);
-    });
+    setDayValues(g.dailyRow, d => g.countries.reduce((sum, country) => sum + cnt(country, d), 0));
   });
 
-  // FIX: write catch-all "Other Countries" row so unlisted foreign nationals
-  // are not silently dropped from the sheet.
-  // LOGIC: Row 139/140 is "OTHERS AND UNSPECIFIED". It should include unlisted countries
-  // PLUS the 'unspecified_guest' bucket (OTHERS, UNKNOWN, empty).
   setDayValues(r.otherCountries, d => res(d, 'unlisted_foreign_resident') + res(d, 'unspecified_guest'));
-
-  // TOTAL FOREIGN RESIDENTS
-  // LOGIC: Row 141/142 "TOTAL NON-PHILIPPINE RESIDENTS" (Listed + Unlisted + Unspecified)
   setDayValues(r.totalForeign, d => res(d, 'listed_foreign_resident') + res(d, 'unlisted_foreign_resident') + res(d, 'unspecified_guest'));
-
   setDayValues(r.unspecified, d => res(d, 'unlisted_foreign_resident') + res(d, 'unspecified_guest'));
   setDayValues(r.overseasFilipino, d => res(d, 'overseas_filipino'));
 
-  // GRAND TOTAL
   setDayValues(r.grandTotal, d => {
     return res(d, 'philippine_resident_filipino') +
            res(d, 'philippine_resident_foreign') +
@@ -979,40 +959,29 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
            res(d, 'overseas_filipino');
   });
 
-  // ── Summary Rows (After Grand Total) ────────────────────────────────────────
   setDayValues(r.summaryPhTotal, d => res(d, 'philippine_resident_filipino') + res(d, 'philippine_resident_foreign'));
   setDayValues(r.summaryForeignTotal, d => res(d, 'listed_foreign_resident') + res(d, 'unlisted_foreign_resident') + res(d, 'unspecified_guest'));
   setDayValues(r.summaryOverseasTotal, d => res(d, 'overseas_filipino'));
 
-  // ── Rooms & guest-nights ────────────────────────────────────────────────────
   setDayValues(r.roomsOccupied, d => md.roomsOccupied[d] || 0);
   setDayValues(r.roomsAvailable, () => biz.total_rooms);
   setDayValues(r.guestNights, d => md.guestNightsByDay[d] || 0);
 
-  // ── Computed metrics ─────────────────────────────────────────────────────────
-  // Occupancy rate = rooms used / total rooms × 100  (stored as a real number)
   setDayValues(r.occupancyRate, d => {
     if (!biz.total_rooms) return 0;
     return parseFloat(((md.roomsOccupied[d] || 0) / biz.total_rooms * 100).toFixed(2));
   });
-  // ALOS for arrivals on day d = total guest-nights generated by those arrivals
-  // divided by the number of guests who checked in on day d.
   setDayValues(r.alos, d => {
     const arrivals = Object.values(md.residentsByDay[d] || {}).reduce((a, b) => a + b, 0);
     if (!arrivals) return 0;
     return parseFloat(((md.guestNightsPerArrivalDay[d] || 0) / arrivals).toFixed(2));
   });
 
-  // ── Sex breakdown ────────────────────────────────────────────────────────────
-  // FIX: corrected offsets (+0 to +4) to ensure data aligns with labels in template
   const setSexValues = (rowStart, gender) => {
     setDayValues(rowStart + 1, d => sex(d, gender, 'philippine_resident_filipino') + sex(d, gender, 'philippine_resident_foreign'));
-    // b. Non-Philippine/Foreign Residents (including unspecified)
     setDayValues(rowStart + 2, d => sex(d, gender, 'listed_foreign_resident') + sex(d, gender, 'unlisted_foreign_resident') + sex(d, gender, 'unspecified_guest'));
     setDayValues(rowStart + 3, d => sex(d, gender, 'overseas_filipino'));
-    // d. Others/Unspecified Guest
     setDayValues(rowStart + 4, d => sex(d, gender, 'unlisted_foreign_resident') + sex(d, gender, 'unspecified_guest'));
-    // TOTAL per sex
     setDayValues(rowStart + 5, d => {
       return sex(d, gender, 'philippine_resident_filipino') +
              sex(d, gender, 'philippine_resident_foreign') +
@@ -1025,10 +994,7 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   setSexValues(r.maleStart, 'male');
   setSexValues(r.femaleStart, 'female');
 
-  // ── FIX: Total column (AG = kTotalCol) ─────────────────────────────────────
-  // Writes the month grand-total to column AG for every data row.
-  // If the template already has SUM formulas there, this overwrites them with
-  // equivalent hard-coded numbers (more reliable — no formula recalculation risk).
+  // ── Total column (AG = kTotalCol) ──────────────────────────────────────────
   const writeTotal = (rowNum, value) => {
     sheet.getCell(rowNum, kTotalCol).value = value ?? 0;
   };
@@ -1039,62 +1005,44 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   const unlistedForeignTotal = md.residentsByDay[0]?.['unlisted_foreign_resident'] ?? 0;
   const unspecifiedTotal = md.residentsByDay[0]?.['unspecified_guest'] ?? 0;
   const overseasTotal = md.residentsByDay[0]?.['overseas_filipino'] ?? 0;
-
   const grandTotalAll = phTotal + listedForeignTotal + unlistedForeignTotal + unspecifiedTotal + overseasTotal;
 
-  // Residency totals
   writeTotal(r.phResFilipino, md.residentsByDay[0]?.['philippine_resident_filipino'] ?? 0);
   writeTotal(r.phResForeign, md.residentsByDay[0]?.['philippine_resident_foreign'] ?? 0);
   writeTotal(r.phResTotal, phTotal);
 
-  kCountryRows.forEach(c =>
-    writeTotal(c.daily, md.countryByDay[c.country]?.[0] ?? 0)
-  );
+  kCountryRows.forEach(c => writeTotal(c.daily, md.countryByDay[c.country]?.[0] ?? 0));
 
-  // ── Regional Subtotals (Totals Column) ──────────────────────────────────────
   kRegionalGroups.forEach(g => {
-    const subtotal = g.countries.reduce((sum, country) => {
-      return sum + (md.countryByDay[country.toUpperCase()]?.[0] ?? 0);
-    }, 0);
+    const subtotal = g.countries.reduce((sum, country) => sum + (md.countryByDay[country.toUpperCase()]?.[0] ?? 0), 0);
     writeTotal(g.dailyRow, subtotal);
   });
 
-  const othersAndUnspecifiedTotalAG = unlistedForeignTotal + unspecifiedTotal;
-  const totalForeignAG = listedForeignTotal + unlistedForeignTotal + unspecifiedTotal;
-
-  writeTotal(r.otherCountries, othersAndUnspecifiedTotalAG);
-  writeTotal(r.totalForeign, totalForeignAG);
-
-  writeTotal(r.unspecified, othersAndUnspecifiedTotalAG);
+  writeTotal(r.otherCountries, unlistedForeignTotal + unspecifiedTotal);
+  writeTotal(r.totalForeign, listedForeignTotal + unlistedForeignTotal + unspecifiedTotal);
+  writeTotal(r.unspecified, unlistedForeignTotal + unspecifiedTotal);
   writeTotal(r.overseasFilipino, overseasTotal);
   writeTotal(r.grandTotal, grandTotalAll);
 
-  // ── Summary Rows (Totals Column) ──────────────────────────────────────────
   writeTotal(r.summaryPhTotal, phTotal);
-  writeTotal(r.summaryForeignTotal, totalForeignAG);
+  writeTotal(r.summaryForeignTotal, listedForeignTotal + unlistedForeignTotal + unspecifiedTotal);
   writeTotal(r.summaryOverseasTotal, overseasTotal);
 
-  // Rooms & nights totals
   const totalRoomsOccAll = Object.values(md.roomsOccupied).reduce((a, b) => a + b, 0);
   const totalRoomsAvail  = (biz.total_rooms || 0) * daysInMonth;
   writeTotal(r.roomsOccupied, totalRoomsOccAll);
   writeTotal(r.roomsAvailable, totalRoomsAvail);
   writeTotal(r.guestNights, md.guestNights);
-
-  // Occupancy rate for the full month
   writeTotal(r.occupancyRate, totalRoomsAvail > 0
     ? parseFloat((totalRoomsOccAll / totalRoomsAvail * 100).toFixed(2))
     : 0
   );
-  // ALOS for the full month = total guest-nights / total arrivals
   const grandTotalArrivals = Object.values(md.residentsByDay[0] ?? {}).reduce((a, b) => a + b, 0);
   writeTotal(r.alos, grandTotalArrivals > 0
     ? parseFloat((md.guestNights / grandTotalArrivals).toFixed(2))
     : 0
   );
 
-  // Sex breakdown totals
-  // FIX: corrected offsets (+0 to +4) to ensure data aligns with labels in template
   writeTotal(r.maleStart + 1, sex(0, 'male', 'philippine_resident_filipino') + sex(0, 'male', 'philippine_resident_foreign'));
   writeTotal(r.maleStart + 2, sex(0, 'male', 'listed_foreign_resident') + sex(0, 'male', 'unlisted_foreign_resident') + sex(0, 'male', 'unspecified_guest'));
   writeTotal(r.maleStart + 3, sex(0, 'male', 'overseas_filipino'));
@@ -1110,13 +1058,11 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   writeTotal(r.femaleStart + 5, sex(0, 'female', 'philippine_resident_filipino') + sex(0, 'female', 'philippine_resident_foreign') +
                                 sex(0, 'female', 'listed_foreign_resident') + sex(0, 'female', 'unlisted_foreign_resident') +
                                 sex(0, 'female', 'overseas_filipino') + sex(0, 'female', 'unspecified_guest'));
-
 }
 
 // ==============================================================================================
 // ======================================== COUNTRY SUM =========================================
 // ==============================================================================================
-
 
 function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysInMonth, adminName, city, province, businessName, biz) {
   const r = kRows.sum;
@@ -1133,7 +1079,7 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
     : (biz?.business_line || []);
   kAccTypes.forEach(t => {
     if (bizLines.includes(t.key)) {
-      sheet.getCell(`B${t.row}`).value     = '✔';
+      sheet.getCell(`B${t.row}`).value     = '\u2714';
       sheet.getCell(`B${t.row}`).alignment = { horizontal: 'center' };
     }
   });
@@ -1142,34 +1088,23 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
   const cnt = country => md.countryByDay[country.toUpperCase()]?.[0] || 0;
   const sex = (s, cat) => md.sexByDay[0]?.[s]?.[cat] || 0;
 
-  // ── Residency rows (column B = grand total for the month) ────────────────────
   sheet.getCell(`B${r.phResFilipino}`).value = res('philippine_resident_filipino');
   sheet.getCell(`B${r.phResForeign}`).value = res('philippine_resident_foreign');
-  
-  // TOTAL PHILIPPINE RESIDENTS
   sheet.getCell(`B${r.phResTotal}`).value = res('philippine_resident_filipino') + res('philippine_resident_foreign');
 
   kCountryRows.forEach(c => { sheet.getCell(`B${c.sum}`).value = cnt(c.country); });
 
-  // ── Regional Subtotals (Sum) ────────────────────────────────────────────────
   kRegionalGroups.forEach(g => {
     const subtotal = g.countries.reduce((sum, country) => sum + cnt(country), 0);
     sheet.getCell(`B${g.sumRow}`).value = subtotal;
   });
 
-  // FIX: write catch-all "Other Countries" total
-  // Row 140 is "OTHERS AND UNSPECIFIED".
   const othersAndUnspecifiedTotal = res('unlisted_foreign_resident') + res('unspecified_guest');
   sheet.getCell(`B${r.otherCountries}`).value = othersAndUnspecifiedTotal;
-
-  // TOTAL FOREIGN RESIDENTS
-  // Row 142 "TOTAL NON-PHILIPPINE RESIDENTS" (Listed + Unlisted + Unspecified)
   sheet.getCell(`B${r.totalForeign}`).value = res('listed_foreign_resident') + res('unlisted_foreign_resident') + res('unspecified_guest');
-
   sheet.getCell(`B${r.unspecified}`).value = othersAndUnspecifiedTotal;
   sheet.getCell(`B${r.overseasFilipino}`).value = res('overseas_filipino');
 
-  // GRAND TOTAL
   const grandTotal =
     res('philippine_resident_filipino') +
     res('philippine_resident_foreign') +
@@ -1179,19 +1114,16 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
     res('overseas_filipino');
   sheet.getCell(`B${r.grandTotal}`).value = grandTotal;
 
-  // ── Summary Rows (After Grand Total) ────────────────────────────────────────
   sheet.getCell(`B${r.summaryPhTotal}`).value = res('philippine_resident_filipino') + res('philippine_resident_foreign');
   sheet.getCell(`B${r.summaryForeignTotal}`).value = res('listed_foreign_resident') + res('unlisted_foreign_resident') + res('unspecified_guest');
   sheet.getCell(`B${r.summaryOverseasTotal}`).value = res('overseas_filipino');
 
-  // ── Rooms & nights ──────────────────────────────────────────────────────────
   const totalRoomsOcc  = Object.values(md.roomsOccupied).reduce((a, b) => a + b, 0);
   const totalAvailRoom = totalRoomsAll * daysInMonth;
   sheet.getCell(`B${r.roomsOccupied}`).value = totalRoomsOcc;
   sheet.getCell(`B${r.roomsAvailable}`).value = totalAvailRoom;
   sheet.getCell(`B${r.guestNights}`).value = md.guestNights;
 
-  // ── Computed metrics ─────────────────────────────────────────────────────────
   sheet.getCell(`B${r.occupancyRate}`).value = totalAvailRoom > 0
     ? parseFloat((totalRoomsOcc / totalAvailRoom * 100).toFixed(2))
     : 0;
@@ -1199,16 +1131,11 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
     ? parseFloat((md.guestNights / grandTotal).toFixed(2))
     : 0;
 
-  // ── Sex breakdown ────────────────────────────────────────────────────────────
-  // FIX: corrected offsets (+0 to +4) to ensure data aligns with labels in template
   const setSexValues = (rowStart, gender) => {
     sheet.getCell(`B${rowStart + 1}`).value = sex(gender, 'philippine_resident_filipino') + sex(gender, 'philippine_resident_foreign');
-    // b. Non-Philippine/Foreign Residents (including unspecified)
     sheet.getCell(`B${rowStart + 2}`).value = sex(gender, 'listed_foreign_resident') + sex(gender, 'unlisted_foreign_resident') + sex(gender, 'unspecified_guest');
     sheet.getCell(`B${rowStart + 3}`).value = sex(gender, 'overseas_filipino');
-    // d. Others/Unspecified Guest
     sheet.getCell(`B${rowStart + 4}`).value = sex(gender, 'unlisted_foreign_resident') + sex(gender, 'unspecified_guest');
-    // TOTAL per sex
     sheet.getCell(`B${rowStart + 5}`).value = 
       sex(gender, 'philippine_resident_filipino') +
       sex(gender, 'philippine_resident_foreign') +
@@ -1222,9 +1149,8 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
 }
 
 // ==============================================================================================
-// ======================================== MONTHLY SUMMARY =========================================
+// ======================================== MONTHLY SUMMARY ======================================
 // ==============================================================================================
-
 
 function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminName, city, province, businessName, biz) {
   const r = kRows.sum;
@@ -1241,21 +1167,19 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
     : (biz?.business_line || []);
   kAccTypes.forEach(t => {
     if (bizLines.includes(t.key)) {
-      sheet.getCell(`B${t.row}`).value     = '✔';
+      sheet.getCell(`B${t.row}`).value     = '\u2714';
       sheet.getCell(`B${t.row}`).alignment = { horizontal: 'center' };
     }
   });
 
-  // Sets values for months 1-12 into columns B-M (col index 2-13).
-  // Also calculates the total for the year and writes to Column N (14).
   const setMonthValues = (rowNum, fn) => {
     let yearTotal = 0;
-    for (let m = 1; m <= 12; m++) {
-      const val = fn(m) ?? 0;
-      sheet.getCell(rowNum, m + 1).value = val;
+    for (let i = 0; i < allMonths.length; i++) {
+      const val = fn(allMonths[i].month) ?? 0;
+      sheet.getCell(rowNum, i + 2).value = val;
       if (typeof val === 'number') yearTotal += val;
     }
-    sheet.getCell(rowNum, 14).value = yearTotal;
+    sheet.getCell(rowNum, allMonths.length + 2).value = yearTotal;
   };
 
   const mdFor = m => allMonths.find(x => x.month === m) || {
@@ -1267,44 +1191,30 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   const mCnt = (country, m) => mdFor(m).countryByDay[country.toUpperCase()]?.[0] || 0;
   const mSex = (m, s, cat)  => mdFor(m).sexByDay[0]?.[s]?.[cat] || 0;
 
-  // ── Residency rows ───────────────────────────────────────────────────────────
   setMonthValues(r.phResFilipino, m => mRes(m, 'philippine_resident_filipino'));
   setMonthValues(r.phResForeign, m => mRes(m, 'philippine_resident_foreign'));
-  
-  // TOTAL PHILIPPINE RESIDENTS
   setMonthValues(r.phResTotal, m => mRes(m, 'philippine_resident_filipino') + mRes(m, 'philippine_resident_foreign'));
 
   kCountryRows.forEach(c => setMonthValues(c.sum, m => mCnt(c.country, m)));
 
-  // ── Regional Subtotals (Monthly Summary) ────────────────────────────────────
   kRegionalGroups.forEach(g => {
-    setMonthValues(g.sumRow, m => {
-      return g.countries.reduce((sum, country) => sum + mCnt(country, m), 0);
-    });
+    setMonthValues(g.sumRow, m => g.countries.reduce((sum, country) => sum + mCnt(country, m), 0));
   });
 
-  // FIX: write "Other Countries" row for monthly sheet
-  // Row 140 is "OTHERS AND UNSPECIFIED".
   setMonthValues(r.otherCountries, m => {
     const md = mdFor(m);
     return (md.residentsByDay[0]?.['unlisted_foreign_resident'] || 0) + (md.residentsByDay[0]?.['unspecified_guest'] || 0);
   });
-
-  // TOTAL FOREIGN RESIDENTS
-  // Row 142 "TOTAL NON-PHILIPPINE RESIDENTS" (Listed + Unlisted + Unspecified)
   setMonthValues(r.totalForeign, m => {
-    const md = mdFor(m);
-    const res = md.residentsByDay[0] || {};
+    const res = mdFor(m).residentsByDay[0] || {};
     return (res['listed_foreign_resident'] || 0) + (res['unlisted_foreign_resident'] || 0) + (res['unspecified_guest'] || 0);
   });
-
   setMonthValues(r.unspecified, m => {
     const md = mdFor(m);
     return (md.residentsByDay[0]?.['unlisted_foreign_resident'] || 0) + (md.residentsByDay[0]?.['unspecified_guest'] || 0);
   });
   setMonthValues(r.overseasFilipino, m => mRes(m, 'overseas_filipino'));
 
-  // GRAND TOTAL
   setMonthValues(r.grandTotal, m => {
     const md = mdFor(m).residentsByDay[0] || {};
     return (md.philippine_resident_filipino || 0) +
@@ -1315,7 +1225,6 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
            (md.overseas_filipino || 0);
   });
 
-  // ── Summary Rows (After Grand Total) ────────────────────────────────────────
   setMonthValues(r.summaryPhTotal, m => mRes(m, 'philippine_resident_filipino') + mRes(m, 'philippine_resident_foreign'));
   setMonthValues(r.summaryForeignTotal, m => {
     const res = mdFor(m).residentsByDay[0] || {};
@@ -1323,37 +1232,37 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   });
   setMonthValues(r.summaryOverseasTotal, m => mRes(m, 'overseas_filipino'));
 
-  // ── Rooms & nights ──────────────────────────────────────────────────────────
   setMonthValues(r.roomsOccupied, m => Object.values(mdFor(m).roomsOccupied).reduce((a, b) => a + b, 0));
   setMonthValues(r.roomsAvailable, m => totalRoomsAll * new Date(year, m, 0).getDate());
   setMonthValues(r.guestNights, m => mdFor(m).guestNights);
 
-  // ── Computed metrics ─────────────────────────────────────────────────────────
-  for (let m = 1; m <= 12; m++) {
+  for (let i = 0; i < allMonths.length; i++) {
+    const m = allMonths[i].month;
     const daysInM    = new Date(year, m, 0).getDate();
     const totalAvail = totalRoomsAll * daysInM;
     const totalOcc   = Object.values(mdFor(m).roomsOccupied).reduce((a, b) => a + b, 0);
-    sheet.getCell(r.occupancyRate, m + 1).value = totalAvail > 0
+    sheet.getCell(r.occupancyRate, i + 2).value = totalAvail > 0
       ? parseFloat((totalOcc / totalAvail * 100).toFixed(2))
       : 0;
 
     const md = mdFor(m).residentsByDay[0] || {};
-    const grandTotal =
+    const gt =
       (md.philippine_resident_filipino || 0) +
       (md.philippine_resident_foreign || 0) +
       (md.listed_foreign_resident || 0) +
       (md.unlisted_foreign_resident || 0) +
       (md.unspecified_guest || 0) +
       (md.overseas_filipino || 0);
-    sheet.getCell(r.alos, m + 1).value = grandTotal > 0
-      ? parseFloat((mdFor(m).guestNights / grandTotal).toFixed(2))
+    sheet.getCell(r.alos, i + 2).value = gt > 0
+      ? parseFloat((mdFor(m).guestNights / gt).toFixed(2))
       : 0;
   }
 
-  // Yearly totals for metrics (Column N / 14)
+  // Yearly totals for metrics
+  const lastCol = allMonths.length + 2;
   const yrOccTotal = allMonths.reduce((sum, m) => sum + Object.values(m.roomsOccupied).reduce((a, b) => a + b, 0), 0);
-  const yrAvailTotal = [1,2,3,4,5,6,7,8,9,10,11,12].reduce((sum, m) => sum + totalRoomsAll * new Date(year, m, 0).getDate(), 0);
-  sheet.getCell(r.occupancyRate, 14).value = yrAvailTotal > 0 ? parseFloat((yrOccTotal / yrAvailTotal * 100).toFixed(2)) : 0;
+  const yrAvailTotal = allMonths.reduce((sum, m) => sum + totalRoomsAll * new Date(year, m.month, 0).getDate(), 0);
+  sheet.getCell(r.occupancyRate, lastCol).value = yrAvailTotal > 0 ? parseFloat((yrOccTotal / yrAvailTotal * 100).toFixed(2)) : 0;
 
   const yrArrivals = allMonths.reduce((sum, m) => {
     const md = m.residentsByDay[0] || {};
@@ -1362,19 +1271,13 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
            (md.unspecified_guest || 0) + (md.overseas_filipino || 0);
   }, 0);
   const yrNights = allMonths.reduce((sum, m) => sum + m.guestNights, 0);
-  sheet.getCell(r.alos, 14).value = yrArrivals > 0 ? parseFloat((yrNights / yrArrivals).toFixed(2)) : 0;
+  sheet.getCell(r.alos, lastCol).value = yrArrivals > 0 ? parseFloat((yrNights / yrArrivals).toFixed(2)) : 0;
 
-
-  // ── Sex breakdown ────────────────────────────────────────────────────────────
-  // FIX: corrected offsets (+0 to +4) to ensure data aligns with labels in template
   const setMonthlySexValues = (rowStart, gender) => {
     setMonthValues(rowStart + 1, m => mSex(m, gender, 'philippine_resident_filipino') + mSex(m, gender, 'philippine_resident_foreign'));
-    // b. Non-Philippine/Foreign Residents (including unspecified)
     setMonthValues(rowStart + 2, m => mSex(m, gender, 'listed_foreign_resident') + mSex(m, gender, 'unlisted_foreign_resident') + mSex(m, gender, 'unspecified_guest'));
     setMonthValues(rowStart + 3, m => mSex(m, gender, 'overseas_filipino'));
-    // d. Others/Unspecified Guest
     setMonthValues(rowStart + 4, m => mSex(m, gender, 'unlisted_foreign_resident') + mSex(m, gender, 'unspecified_guest'));
-    // TOTAL per sex
     setMonthValues(rowStart + 5, m => {
       return mSex(m, gender, 'philippine_resident_filipino') +
              mSex(m, gender, 'philippine_resident_foreign') +
@@ -1388,23 +1291,7 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   setMonthlySexValues(r.femaleStart, 'female');
 }
 
-
-
 // ─── PDF Layout & Page-Break Config ─────────────────────────────────────────
-//
-// breakRows = row numbers (1-based, from ExcelJS) where a NEW PAGE begins
-//             BEFORE that row is rendered.
-//
-// Spreadsheet 1 & 3 — Daily / Monthly  →  landscape A3, 3 pages:
-//   page 1 : rows 1-32   (header, accommodation checkboxes, PH residents)
-//   page 2 : rows 33-90  (COUNTRY OF RESIDENCE — first half)   ← adjust if off
-//   page 3 : rows 91+    (COUNTRY OF RESIDENCE — second half)  ← adjust if off
-//
-// Spreadsheet 2 — Sum                  →  portrait  A3, 3 pages:
-//   page 1 : rows 1-65   (header … BAHRAIN)
-//   page 2 : rows 66-127 (EGYPT → before NEW ZEALAND)
-//   page 3 : rows 128+   (NEW ZEALAND onward)
-//
 const SHEET_PDF_CONFIG = {
   daily:   { layout: 'landscape', size: 'A3', margin: 45, breakRows: [64, 124] },
   monthly: { layout: 'landscape', size: 'A3', margin: 45, breakRows: [64, 124] },
@@ -1417,9 +1304,9 @@ function _getSheetPdfConfig(sheetName) {
   return SHEET_PDF_CONFIG.daily;
 }
 
-// ─── PDF Generation ──────────────────────────────────────────────────────────
+// ─── PDF Generation (returns Buffer instead of writing to file) ──────────────
 
-async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
+async function _generatePdfBuffer(workbook, month, year) {
   const sheets = [];
   workbook.eachSheet(sheet => sheets.push(sheet));
 
@@ -1432,14 +1319,17 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
     size:   firstConfig.size,
     margin: firstConfig.margin,
   });
-  const stream = fs.createWriteStream(pdfPath);
-  doc.pipe(stream);
+
+  // Collect PDF output into a buffer
+  const chunks = [];
+  doc.on('data', chunk => chunks.push(chunk));
+  const pdfPromise = new Promise(resolve => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+  });
 
   const BASE_HEIGHT_FACTOR = 0.75;
   const BASE_WIDTH_FACTOR  = 5.25;
-
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 } };
-
   const _pageSize = name => PAGE_DIMS[name] || PAGE_DIMS.A3;
 
   let isFirstSheet = true;
@@ -1457,17 +1347,13 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
     }
     isFirstSheet = false;
 
-    // Collect all rows (capped at 197)
     const rows = [];
     sheet.eachRow({ includeEmpty: true }, (row, rn) => {
       if (rn > 197) return;
       rows.push({ row, rn });
     });
 
-    // Build sections from break-row boundaries
     const breaks = [1, ...cfg.breakRows, Infinity];
-
-    // Pre-compute all sections and find the tallest one
     const sheetSections = [];
     for (let s = 0; s < breaks.length - 1; s++) {
       const lo = breaks[s];
@@ -1476,7 +1362,6 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
       if (section.length > 0) sheetSections.push(section);
     }
 
-    // Measure total width (identical for all sections)
     let totalW = 0;
     for (let c = 1; c <= 33; c++) {
       const w = sheet.getColumn(c).width;
@@ -1484,7 +1369,6 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
     }
     if (totalW === 0) totalW = 40;
 
-    // Find tallest section height for vertical constraint
     let maxSectionH = 0;
     for (const sec of sheetSections) {
       let h = 0;
@@ -1494,12 +1378,10 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
     if (maxSectionH === 0) maxSectionH = 300;
     const contentH = maxSectionH * (cfg.heightFactor ?? BASE_HEIGHT_FACTOR);
 
-    // Balance width and height: compute a widthFactor that equalises both constraints
     const balancedWF = aw * contentH / (totalW * ah);
     const wf = Math.min(balancedWF, BASE_WIDTH_FACTOR);
     const contentW = totalW * wf;
 
-    // Single uniform scale — fits both dimensions (constraints are now balanced)
     const scale = Math.min(aw / contentW, ah / contentH);
     const ox = (aw - contentW * scale) / 2;
     const oy = (ah - contentH * scale) / 2;
@@ -1512,7 +1394,6 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
         doc.addPage({ layout: cfg.layout, size: cfg.size, margin: cfg.margin });
       }
 
-      // ── Render ─────────────────────────────────────────────────────────────
       let curY = originY;
 
       for (const { row, rn } of section) {
@@ -1541,13 +1422,11 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
             }
           }
 
-          // Fill
           if (cell.fill?.fgColor?.argb) {
             doc.rect(curX, curY, bw, bh)
                .fill('#' + cell.fill.fgColor.argb.substring(2));
           }
 
-          // Borders
           if (cell.border) {
             doc.lineWidth(0.5).strokeColor('#000000');
             if (cell.border.top)    doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke();
@@ -1556,7 +1435,6 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
             if (cell.border.right)  doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke();
           }
 
-          // Text
           let text = '';
           if (cell.value?.richText) {
             text = cell.value.richText.map(rt => rt.text).join('');
@@ -1576,7 +1454,7 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
             }
           }
 
-          if (text === '✔') {
+          if (text === '\u2714') {
             const cx = curX + bw / 2;
             const cy = curY + bh / 2;
             const s  = Math.min(bw, bh) * 0.35;
@@ -1624,7 +1502,7 @@ async function _generatePdfFromWorkbook(workbook, pdfPath, month, year) {
   }
 
   doc.end();
-  return new Promise(resolve => stream.on('finish', resolve));
+  return pdfPromise;
 }
 
 function _findMergeRange(sheet, address) {
