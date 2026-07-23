@@ -361,7 +361,8 @@ router.post('/reports', adminGuard, async (req, res, next) => {
        WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
       [reportType, reportVariant, parseInt(periodYear, 10), JSON.stringify(months)]
     );
-    res.status(200).json({ batchId: rows[0].id, existing: true });
+    const isExisting = rows[0].id !== newBatchId;
+    res.status(200).json({ batchId: rows[0].id, existing: isExisting });
   } catch (err) {
     next(err);
   }
@@ -725,6 +726,7 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
 
   return {
     month,
+    year,
     countryByDay,
     residentsByDay,
     sexByDay,
