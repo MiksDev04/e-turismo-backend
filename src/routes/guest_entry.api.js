@@ -64,8 +64,11 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       leadSex,
     } = req.body;
 
-    if (!businessId || !checkIn || !checkOut || !totalGuests) {
+    if (!businessId || !checkIn || !checkOut || !totalGuests || !leadSex) {
       return res.status(400).json({ message: 'Missing required fields' });
+    }
+    if (!['male', 'female'].includes(leadSex?.toLowerCase())) {
+      return res.status(400).json({ message: 'leadSex must be "male" or "female"' });
     }
 
     const guestRecordId = id || uuidv4();

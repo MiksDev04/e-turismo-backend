@@ -527,10 +527,6 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     const adminName = userRows[0]?.full_name || 'System Admin';
 
     const daysInMonth = sortedMonths.length === 1 ? new Date(year, sortedMonths[0], 0).getDate() : 0;
-    const allBizMonthData = [];
-    const allBizAnnualData = [];
-    let totalRoomsSum = 0;
-    const unionLines = new Set();
     const monthLabel = sortedMonths.length === 1
       ? String(sortedMonths[0]).padStart(2, '0')
       : sortedMonths.length === 12 ? 'FULL' : sortedMonths.join('-');
@@ -545,15 +541,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         bizAllMonths = await Promise.all(
           sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
         );
-        allBizMonthData.push(...bizAllMonths);
       } else if (sortedMonths.length === 1) {
         const md = await _fetchMonthData(biz.id, sortedMonths[0], year);
-        allBizMonthData.push(md);
         bizAllMonths = [md];
       }
-
-      totalRoomsSum += biz.total_rooms || 0;
-      if (Array.isArray(biz.business_line)) biz.business_line.forEach(l => unionLines.add(l));
 
       if (reportVariant === 'daily' && bizAllMonths?.[0]) {
         const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
@@ -564,7 +555,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
       if (reportVariant === 'summary' && bizAllMonths?.[0]) {
         const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
-        const tmpl = templateWb?.getWorksheet('AE DAE-1B by Country (Sum)');
+        const tmpl = templateWb?.getWorksheet('AE DAE-1B by Country (Sum) ');
         const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
         _buildCountrySummarySheet(sheet, bizAllMonths[0], biz.total_rooms, sortedMonths[0], year,
           daysInMonth, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
@@ -577,47 +568,6 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         _buildMonthlySummarySheet(sheet, bizAllMonths, biz.total_rooms, year, adminName,
           biz.city_municipality || '', biz.province || '', biz.business_name, biz);
       }
-    }
-
-    // ── Totals sheet (across all businesses) ──────────────────────────────────
-    const totalBiz = {
-      business_name: 'TOTAL \u2013 ALL ACCOMMODATION',
-      total_rooms: totalRoomsSum,
-      business_line: [...unionLines],
-      region: '', city_municipality: 'San Pablo City', province: 'Laguna',
-    };
-
-    if (reportVariant === 'daily' && allBizMonthData.length > 0) {
-      const mergedMd = _mergeMonthData(sortedMonths[0], allBizMonthData);
-      const tmpl = templateWb?.getWorksheet('Name of Establishment');
-      const sheet = tmpl
-        ? _cloneSheetFromTemplate(tmpl, 'TOTAL \u2013 ALL ACCOMMODATION', wb)
-        : wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
-      _buildDailySheet(sheet, totalBiz, mergedMd, sortedMonths[0], year, daysInMonth, adminName);
-    }
-
-    if (reportVariant === 'summary' && allBizMonthData.length > 0) {
-      const mergedMd = _mergeMonthData(sortedMonths[0], allBizMonthData);
-      const tmpl = templateWb?.getWorksheet('AE DAE-1B by Country (Sum)');
-      const sheet = tmpl
-        ? _cloneSheetFromTemplate(tmpl, 'TOTAL \u2013 ALL ACCOMMODATION', wb)
-        : wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
-      _buildCountrySummarySheet(sheet, mergedMd, totalRoomsSum, sortedMonths[0], year,
-        daysInMonth, adminName, 'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
-    }
-
-    if (reportVariant === 'series' && allBizMonthData.length > 0) {
-      const mergedMonths = [];
-      for (const m of sortedMonths) {
-        const monthDataList = allBizMonthData.filter(md => md.month === m);
-        mergedMonths.push(_mergeMonthData(m, monthDataList));
-      }
-      const tmpl = templateWb?.getWorksheet('AE DAE-1B (Monthly)');
-      const sheet = tmpl
-        ? _cloneSheetFromTemplate(tmpl, 'TOTAL \u2013 ALL ACCOMMODATION', wb)
-        : wb.addWorksheet('TOTAL \u2013 ALL ACCOMMODATION');
-      _buildMonthlySummarySheet(sheet, mergedMonths, totalRoomsSum, year, adminName,
-        'San Pablo City', 'Laguna', totalBiz.business_name, totalBiz);
     }
 
     _purgeOrphanedDefinedNames(wb);
@@ -664,12 +614,15 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
     ? "AND status IN ('active', 'archived')"
     : "AND status = 'active'";
 
+  // Fetch records that have ANY presence in the month (not just check_in).
+  // This catches cross-month stays: check_in before the month but check_out after it starts,
+  // or check_in within the month but check_out after it ends.
   const [records] = await db.pool.execute(
-    `SELECT id, check_in, check_out, total_guests,
+    `SELECT id, check_in, check_out, actual_check_out, total_guests,
             lead_country, lead_sex, lead_nationality, lead_is_overseas
      FROM guest_records
      WHERE business_id = ? AND is_deleted = false
-       AND check_in >= ? AND check_in <= ? ${statusFilter}`,
+       AND COALESCE(actual_check_out, check_out) > ? AND check_in <= ? ${statusFilter}`,
     [businessId, firstDay, lastDay]
   );
 
@@ -687,13 +640,6 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
     grrRows.forEach(r => { roomCounts[r.guest_record_id] = r.room_count; });
   }
 
-  // Precompute check-in day in LOCAL time
-  const recordDay = {};
-  records.forEach(r => {
-    const d = _parseLocalDate(r.check_in);
-    if (d) recordDay[r.id] = d.getDate();
-  });
-
   const countryByDay            = {};
   const residentsByDay          = { 0: {} };
   const sexByDay                = { 0: { male: {}, female: {} } };
@@ -702,44 +648,23 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
   const guestNightsPerArrivalDay = {};
   let totalGuestNights = 0;
 
-  // ── Night / room calculations ──────────────────────────────────────────────
+  const listedSet = new Set(kCountryRows.map(c => c.country));
+
+  // ── Spread all tallies across each day of stay ───────────────────────────
+  // Tourist counts (country, residency, sex) are spread across every day the
+  // guest is present — not just the check-in day.  For overnight stays the
+  // check-out day is excluded ("Check-out data is not counted if tourist are
+  // overnight").  Same-day check-in/check-out counts on the single day.
   records.forEach(r => {
     const checkIn = _parseLocalDate(r.check_in);
     if (!checkIn) return;
     if (!r.check_out) return;
 
-    const checkOut  = _parseLocalDate(r.check_out);
-    const nights    = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    const rooms     = roomCounts[r.id] || 0;
+    const effectiveCheckOut = r.actual_check_out || r.check_out;
+    const checkOut   = _parseLocalDate(effectiveCheckOut);
+    const nights     = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
+    const rooms      = roomCounts[r.id] || 0;
     const guestCount = r.total_guests || 0;
-    const day       = checkIn.getDate();
-
-    if (nights > 0) {
-      totalGuestNights += nights * guestCount;
-      guestNightsPerArrivalDay[day] = (guestNightsPerArrivalDay[day] || 0) + (nights * guestCount);
-    }
-
-    // Spread rooms-occupied across each stay-night
-    const spreadDays = Math.max(1, nights);
-    for (let n = 0; n < spreadDays; n++) {
-      const stayDate = new Date(checkIn);
-      stayDate.setDate(checkIn.getDate() + n);
-      if (stayDate.getFullYear() === year && (stayDate.getMonth() + 1) === month) {
-        const stayDay = stayDate.getDate();
-        roomsOccupiedByDay[stayDay] = (roomsOccupiedByDay[stayDay] || 0) + rooms;
-        if (nights > 0) {
-          guestNightsByDay[stayDay] = (guestNightsByDay[stayDay] || 0) + guestCount;
-        }
-      }
-    }
-  });
-
-  const listedSet = new Set(kCountryRows.map(c => c.country));
-
-  // ── Arrival / residency / country tallies (from lead guest fields) ─────────
-  records.forEach(r => {
-    const day = recordDay[r.id];
-    if (!day) return;
 
     const country     = (r.lead_country || '').toUpperCase();
     const nationality = (r.lead_nationality || '');
@@ -747,31 +672,56 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
     const rawBucket   = _classifyResidenceBucket({ country, nationality, isOverseas: !!r.lead_is_overseas });
     const count       = _asInt(r.total_guests);
 
-    // All foreign residents go into countryByDay
-    if (rawBucket === 'foreign_resident' && country) {
-      if (!countryByDay[country]) countryByDay[country] = { 0: 0 };
-      countryByDay[country][day] = (countryByDay[country][day] || 0) + count;
-      countryByDay[country][0]   = (countryByDay[country][0]   || 0) + count;
-    }
-
-    // Determine final bucket for summary tallies
     let bucket = rawBucket;
     if (rawBucket === 'foreign_resident') {
       bucket = listedSet.has(country) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
     }
 
-    // Residency bucket totals
-    residentsByDay[day] = residentsByDay[day] || {};
-    residentsByDay[day][bucket] = (residentsByDay[day][bucket] || 0) + count;
-    residentsByDay[0][bucket]   = (residentsByDay[0][bucket]   || 0) + count;
+    const spreadDays = Math.max(1, nights);
+    const arrivalDay = checkIn.getDate();
 
-    // Sex × residency breakdown
-    sexByDay[day] = sexByDay[day] || { male: {}, female: {} };
-    if (!sexByDay[day][sex])   sexByDay[day][sex] = {};
-    if (!sexByDay[0][sex])     sexByDay[0][sex]   = {};
-    sexByDay[day][sex][bucket] = (sexByDay[day][sex][bucket] || 0) + count;
-    sexByDay[0][sex][bucket]   = (sexByDay[0][sex][bucket]   || 0) + count;
+    for (let n = 0; n < spreadDays; n++) {
+      const stayDate = new Date(checkIn);
+      stayDate.setDate(checkIn.getDate() + n);
+      if (stayDate.getFullYear() !== year || (stayDate.getMonth() + 1) !== month) continue;
+
+      const stayDay = stayDate.getDate();
+
+      // Rooms occupied per day
+      roomsOccupiedByDay[stayDay] = (roomsOccupiedByDay[stayDay] || 0) + rooms;
+
+      // Guest nights per day (only for overnight stays)
+      if (nights > 0) {
+        guestNightsByDay[stayDay] = (guestNightsByDay[stayDay] || 0) + guestCount;
+
+        // Guest nights attributed to the arrival day (for ALOS calculation)
+        if (stayDay === arrivalDay) {
+          guestNightsPerArrivalDay[stayDay] = (guestNightsPerArrivalDay[stayDay] || 0) + (nights * guestCount);
+        }
+      }
+
+      // Country breakdown (all guests in party)
+      if (rawBucket === 'foreign_resident' && country) {
+        if (!countryByDay[country]) countryByDay[country] = { 0: 0 };
+        countryByDay[country][stayDay] = (countryByDay[country][stayDay] || 0) + count;
+        countryByDay[country][0]       = (countryByDay[country][0]       || 0) + count;
+      }
+
+      // Residency bucket totals (all guests in party)
+      residentsByDay[stayDay] = residentsByDay[stayDay] || {};
+      residentsByDay[stayDay][bucket] = (residentsByDay[stayDay][bucket] || 0) + count;
+      residentsByDay[0][bucket]       = (residentsByDay[0][bucket]       || 0) + count;
+
+      // Sex × residency breakdown (1 per record — lead guest only)
+      sexByDay[stayDay] = sexByDay[stayDay] || { male: {}, female: {} };
+      if (!sexByDay[stayDay][sex]) sexByDay[stayDay][sex] = {};
+      if (!sexByDay[0][sex])       sexByDay[0][sex]       = {};
+      sexByDay[stayDay][sex][bucket] = (sexByDay[stayDay][sex][bucket] || 0) + 1;
+      sexByDay[0][sex][bucket]       = (sexByDay[0][sex][bucket]       || 0) + 1;
+    }
   });
+
+  totalGuestNights = Object.values(guestNightsByDay).reduce((a, b) => a + b, 0);
 
   return {
     month,
@@ -920,14 +870,9 @@ function _cloneSheetFromTemplate(templateSheet, newName, targetWb) {
 function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   const r = kRows.daily;
 
-  sheet.getCell('B3').value = {
-    richText: [
-      { text: 'Region: ' },
-      { font: { bold: true, underline: true, size: 10, name: 'Arial' }, text: biz.region || '4-A' },
-    ],
-  };
-  sheet.getCell('A4').value = biz.business_name;
-  sheet.getCell('A5').value = `     ${kMonthNames[month]}, ${year}    `;
+  sheet.getCell('B3').value = 'Region: __4-A';
+  sheet.getCell('A4').value = `${kMonthNames[month].substring(0, 3).charAt(0)}${kMonthNames[month].substring(1, 3).toLowerCase()}-${String(year).slice(-2)}`;
+  sheet.getCell('AG1').value = `${kMonthNames[month]}, ${year}`;
 
   const bizLines = typeof biz.business_line === 'string'
     ? JSON.parse(biz.business_line || '[]')
@@ -941,10 +886,17 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
 
   sheet.getCell('A22').value = `City/Municipality: ${biz.city_municipality || ''}`;
   sheet.getCell('A23').value = `Province: ${biz.province || ''}`;
+  sheet.getCell('A19').value = `AE ID Code (LGU Assigned): ${biz.ae_id || ''}`;
+  sheet.getCell('A20').value = `AE ID Code (LGU Assigned): ${biz.ae_id || ''}`;
 
+  // Subtotal/total rows show 0 by default (matching template formulas); data rows stay blank.
+  const _subtotalTotalRows = new Set([30, 45, 53, 62, 73, 80, 88, 99, 108, 116, 122, 131, 136, 139, 141, 143, 145, 146, 147, 148]);
   const setDayValues = (rowNum, fn) => {
+    const useZero = _subtotalTotalRows.has(rowNum);
     for (let d = 1; d <= 31; d++) {
-      sheet.getCell(rowNum, d + 1).value = d > daysInMonth ? null : (fn(d) ?? 0);
+      if (d > daysInMonth) { sheet.getCell(rowNum, d + 1).value = null; continue; }
+      const v = fn(d);
+      sheet.getCell(rowNum, d + 1).value = useZero ? (v ?? 0) : (v || null);
     }
   };
 
@@ -980,17 +932,25 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   setDayValues(r.summaryForeignTotal, d => res(d, 'listed_foreign_resident') + res(d, 'unlisted_foreign_resident') + res(d, 'unspecified_guest'));
   setDayValues(r.summaryOverseasTotal, d => res(d, 'overseas_filipino'));
 
-  setDayValues(r.roomsOccupied, d => md.roomsOccupied[d] || 0);
-  setDayValues(r.roomsAvailable, () => biz.total_rooms);
-  setDayValues(r.guestNights, d => md.guestNightsByDay[d] || 0);
+  // Rooms available per day = total rooms − rooms occupied that day
+  setDayValues(r.roomsOccupied, d => md.roomsOccupied[d] || null);
+  setDayValues(r.roomsAvailable, d => {
+    const totalRooms = biz.total_rooms || 0;
+    const occupied    = md.roomsOccupied[d] || 0;
+    return totalRooms > 0 ? totalRooms - occupied : null;
+  });
+  setDayValues(r.guestNights, d => md.guestNightsByDay[d] || null);
 
   setDayValues(r.occupancyRate, d => {
-    if (!biz.total_rooms) return 0;
-    return parseFloat(((md.roomsOccupied[d] || 0) / biz.total_rooms * 100).toFixed(2));
+    const totalRooms = biz.total_rooms || 0;
+    if (!totalRooms) return null;
+    const occupied = md.roomsOccupied[d] || 0;
+    if (!occupied) return null;
+    return parseFloat((occupied / totalRooms * 100).toFixed(2));
   });
   setDayValues(r.alos, d => {
     const arrivals = Object.values(md.residentsByDay[d] || {}).reduce((a, b) => a + b, 0);
-    if (!arrivals) return 0;
+    if (!arrivals) return null;
     return parseFloat(((md.guestNightsPerArrivalDay[d] || 0) / arrivals).toFixed(2));
   });
 
@@ -1046,18 +1006,19 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   writeTotal(r.summaryOverseasTotal, overseasTotal);
 
   const totalRoomsOccAll = Object.values(md.roomsOccupied).reduce((a, b) => a + b, 0);
-  const totalRoomsAvail  = (biz.total_rooms || 0) * daysInMonth;
+  const totalRoomsAll    = biz.total_rooms || 0;
+  const totalRoomsAvail  = totalRoomsAll * daysInMonth;
   writeTotal(r.roomsOccupied, totalRoomsOccAll);
-  writeTotal(r.roomsAvailable, totalRoomsAvail);
+  writeTotal(r.roomsAvailable, totalRoomsAvail > 0 ? totalRoomsAvail - totalRoomsOccAll : null);
   writeTotal(r.guestNights, md.guestNights);
   writeTotal(r.occupancyRate, totalRoomsAvail > 0
     ? parseFloat((totalRoomsOccAll / totalRoomsAvail * 100).toFixed(2))
-    : 0
+    : null
   );
   const grandTotalArrivals = Object.values(md.residentsByDay[0] ?? {}).reduce((a, b) => a + b, 0);
   writeTotal(r.alos, grandTotalArrivals > 0
     ? parseFloat((md.guestNights / grandTotalArrivals).toFixed(2))
-    : 0
+    : null
   );
 
   writeTotal(r.maleStart + 1, sex(0, 'male', 'philippine_resident_filipino') + sex(0, 'male', 'philippine_resident_foreign'));
@@ -1085,11 +1046,13 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
   const r = kRows.sum;
 
   sheet.getCell('B3').value = 'Region: __4-A';
-  sheet.getCell('A4').value = businessName;
-  sheet.getCell('A5').value = `${kMonthNames[month]}, ${year}`;
+  sheet.getCell('A4').value = `${kMonthNames[month].substring(0, 3).charAt(0)}${kMonthNames[month].substring(1, 3).toLowerCase()}-${String(year).slice(-2)}`;
+  sheet.getCell('AG1').value = `${kMonthNames[month]}, ${year}`;
 
   sheet.getCell('A22').value = `City/Municipality: ${city || ''}`;
   sheet.getCell('A23').value = `Province: ${province || ''}`;
+  sheet.getCell('A19').value = `AE ID Code (LGU Assigned): ${biz?.ae_id || ''}`;
+  sheet.getCell('A20').value = `AE ID Code (LGU Assigned): ${biz?.ae_id || ''}`;
 
   const bizLines = typeof biz?.business_line === 'string'
     ? JSON.parse(biz.business_line || '[]')
@@ -1105,22 +1068,22 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
   const cnt = country => md.countryByDay[country.toUpperCase()]?.[0] || 0;
   const sex = (s, cat) => md.sexByDay[0]?.[s]?.[cat] || 0;
 
-  sheet.getCell(`B${r.phResFilipino}`).value = res('philippine_resident_filipino');
-  sheet.getCell(`B${r.phResForeign}`).value = res('philippine_resident_foreign');
-  sheet.getCell(`B${r.phResTotal}`).value = res('philippine_resident_filipino') + res('philippine_resident_foreign');
+  sheet.getCell(`B${r.phResFilipino}`).value = res('philippine_resident_filipino') || null;
+  sheet.getCell(`B${r.phResForeign}`).value = res('philippine_resident_foreign') || null;
+  sheet.getCell(`B${r.phResTotal}`).value = (res('philippine_resident_filipino') + res('philippine_resident_foreign')) ?? 0;
 
-  kCountryRows.forEach(c => { sheet.getCell(`B${c.sum}`).value = cnt(c.country); });
+  kCountryRows.forEach(c => { sheet.getCell(`B${c.sum}`).value = cnt(c.country) || null; });
 
   kRegionalGroups.forEach(g => {
     const subtotal = g.countries.reduce((sum, country) => sum + cnt(country), 0);
-    sheet.getCell(`B${g.sumRow}`).value = subtotal;
+    sheet.getCell(`B${g.sumRow}`).value = subtotal ?? 0;
   });
 
   const othersAndUnspecifiedTotal = res('unlisted_foreign_resident') + res('unspecified_guest');
-  sheet.getCell(`B${r.otherCountries}`).value = othersAndUnspecifiedTotal;
-  sheet.getCell(`B${r.totalForeign}`).value = res('listed_foreign_resident') + res('unlisted_foreign_resident') + res('unspecified_guest');
-  sheet.getCell(`B${r.unspecified}`).value = othersAndUnspecifiedTotal;
-  sheet.getCell(`B${r.overseasFilipino}`).value = res('overseas_filipino');
+  sheet.getCell(`B${r.otherCountries}`).value = othersAndUnspecifiedTotal ?? 0;
+  sheet.getCell(`B${r.totalForeign}`).value = (res('listed_foreign_resident') + res('unlisted_foreign_resident') + res('unspecified_guest')) ?? 0;
+  sheet.getCell(`B${r.unspecified}`).value = othersAndUnspecifiedTotal ?? 0;
+  sheet.getCell(`B${r.overseasFilipino}`).value = res('overseas_filipino') ?? 0;
 
   const grandTotal =
     res('philippine_resident_filipino') +
@@ -1129,37 +1092,37 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
     res('unlisted_foreign_resident') +
     res('unspecified_guest') +
     res('overseas_filipino');
-  sheet.getCell(`B${r.grandTotal}`).value = grandTotal;
+  sheet.getCell(`B${r.grandTotal}`).value = grandTotal ?? 0;
 
-  sheet.getCell(`B${r.summaryPhTotal}`).value = res('philippine_resident_filipino') + res('philippine_resident_foreign');
-  sheet.getCell(`B${r.summaryForeignTotal}`).value = res('listed_foreign_resident') + res('unlisted_foreign_resident') + res('unspecified_guest');
-  sheet.getCell(`B${r.summaryOverseasTotal}`).value = res('overseas_filipino');
+  sheet.getCell(`B${r.summaryPhTotal}`).value = (res('philippine_resident_filipino') + res('philippine_resident_foreign')) ?? 0;
+  sheet.getCell(`B${r.summaryForeignTotal}`).value = (res('listed_foreign_resident') + res('unlisted_foreign_resident') + res('unspecified_guest')) ?? 0;
+  sheet.getCell(`B${r.summaryOverseasTotal}`).value = res('overseas_filipino') ?? 0;
 
   const totalRoomsOcc  = Object.values(md.roomsOccupied).reduce((a, b) => a + b, 0);
-  const totalAvailRoom = totalRoomsAll * daysInMonth;
-  sheet.getCell(`B${r.roomsOccupied}`).value = totalRoomsOcc;
-  sheet.getCell(`B${r.roomsAvailable}`).value = totalAvailRoom;
-  sheet.getCell(`B${r.guestNights}`).value = md.guestNights;
+  const totalRoomsAvail = totalRoomsAll * daysInMonth;
+  sheet.getCell(`B${r.roomsOccupied}`).value = totalRoomsOcc ?? 0;
+  sheet.getCell(`B${r.roomsAvailable}`).value = totalRoomsAvail > 0 ? totalRoomsAvail - totalRoomsOcc : 0;
+  sheet.getCell(`B${r.guestNights}`).value = md.guestNights ?? 0;
 
-  sheet.getCell(`B${r.occupancyRate}`).value = totalAvailRoom > 0
-    ? parseFloat((totalRoomsOcc / totalAvailRoom * 100).toFixed(2))
-    : 0;
+  sheet.getCell(`B${r.occupancyRate}`).value = totalRoomsAvail > 0
+    ? parseFloat((totalRoomsOcc / totalRoomsAvail * 100).toFixed(2))
+    : null;
   sheet.getCell(`B${r.alos}`).value = grandTotal > 0
     ? parseFloat((md.guestNights / grandTotal).toFixed(2))
-    : 0;
+    : null;
 
   const setSexValues = (rowStart, gender) => {
-    sheet.getCell(`B${rowStart + 1}`).value = sex(gender, 'philippine_resident_filipino') + sex(gender, 'philippine_resident_foreign');
-    sheet.getCell(`B${rowStart + 2}`).value = sex(gender, 'listed_foreign_resident') + sex(gender, 'unlisted_foreign_resident') + sex(gender, 'unspecified_guest');
-    sheet.getCell(`B${rowStart + 3}`).value = sex(gender, 'overseas_filipino');
-    sheet.getCell(`B${rowStart + 4}`).value = sex(gender, 'unlisted_foreign_resident') + sex(gender, 'unspecified_guest');
+    sheet.getCell(`B${rowStart + 1}`).value = (sex(gender, 'philippine_resident_filipino') + sex(gender, 'philippine_resident_foreign')) ?? 0;
+    sheet.getCell(`B${rowStart + 2}`).value = (sex(gender, 'listed_foreign_resident') + sex(gender, 'unlisted_foreign_resident') + sex(gender, 'unspecified_guest')) ?? 0;
+    sheet.getCell(`B${rowStart + 3}`).value = sex(gender, 'overseas_filipino') ?? 0;
+    sheet.getCell(`B${rowStart + 4}`).value = (sex(gender, 'unlisted_foreign_resident') + sex(gender, 'unspecified_guest')) ?? 0;
     sheet.getCell(`B${rowStart + 5}`).value = 
-      sex(gender, 'philippine_resident_filipino') +
-      sex(gender, 'philippine_resident_foreign') +
-      sex(gender, 'listed_foreign_resident') +
-      sex(gender, 'unlisted_foreign_resident') +
-      sex(gender, 'overseas_filipino') +
-      sex(gender, 'unspecified_guest');
+      (sex(gender, 'philippine_resident_filipino') +
+       sex(gender, 'philippine_resident_foreign') +
+       sex(gender, 'listed_foreign_resident') +
+       sex(gender, 'unlisted_foreign_resident') +
+       sex(gender, 'overseas_filipino') +
+       sex(gender, 'unspecified_guest')) ?? 0;
   };
   setSexValues(r.maleStart, 'male');
   setSexValues(r.femaleStart, 'female');
@@ -1173,11 +1136,13 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   const r = kRows.sum;
 
   sheet.getCell('B3').value = 'Region: __4-A';
-  sheet.getCell('A4').value = businessName;
-  sheet.getCell('A5').value = `${year}`;
+  sheet.getCell('A4').value = `Jan-Dec, ${year}`;
+  sheet.getCell('AG1').value = `${year}`;
 
   sheet.getCell('A22').value = `City/Municipality: ${city || ''}`;
   sheet.getCell('A23').value = `Province: ${province || ''}`;
+  sheet.getCell('A19').value = `AE ID Code (LGU Assigned): ${biz?.ae_id || ''}`;
+  sheet.getCell('A20').value = `AE ID Code (LGU Assigned): ${biz?.ae_id || ''}`;
 
   const bizLines = typeof biz?.business_line === 'string'
     ? JSON.parse(biz.business_line || '[]')
@@ -1189,14 +1154,16 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
     }
   });
 
+  const _sumTotalRows = new Set([30, 45, 53, 62, 72, 80, 88, 99, 108, 116, 122, 130, 137, 140, 142, 144, 146, 147, 148, 149, 150, 155, 156, 157, 159, 160, 163, 164, 165, 166, 167, 169, 170, 171, 172, 173]);
   const setMonthValues = (rowNum, fn) => {
+    const useZero = _sumTotalRows.has(rowNum);
     let yearTotal = 0;
     for (let i = 0; i < allMonths.length; i++) {
-      const val = fn(allMonths[i].month) ?? 0;
-      sheet.getCell(rowNum, i + 2).value = val;
+      const val = fn(allMonths[i].month);
+      sheet.getCell(rowNum, i + 2).value = useZero ? (val ?? 0) : (val || null);
       if (typeof val === 'number') yearTotal += val;
     }
-    sheet.getCell(rowNum, allMonths.length + 2).value = yearTotal;
+    sheet.getCell(rowNum, allMonths.length + 2).value = yearTotal ?? 0;
   };
 
   const mdFor = m => allMonths.find(x => x.month === m) || {
@@ -1250,7 +1217,12 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   setMonthValues(r.summaryOverseasTotal, m => mRes(m, 'overseas_filipino'));
 
   setMonthValues(r.roomsOccupied, m => Object.values(mdFor(m).roomsOccupied).reduce((a, b) => a + b, 0));
-  setMonthValues(r.roomsAvailable, m => totalRoomsAll * new Date(year, m, 0).getDate());
+  setMonthValues(r.roomsAvailable, m => {
+    const daysInM   = new Date(year, m, 0).getDate();
+    const totalOcc  = Object.values(mdFor(m).roomsOccupied).reduce((a, b) => a + b, 0);
+    const totalAvail = totalRoomsAll * daysInM;
+    return totalAvail > 0 ? totalAvail - totalOcc : null;
+  });
   setMonthValues(r.guestNights, m => mdFor(m).guestNights);
 
   for (let i = 0; i < allMonths.length; i++) {
@@ -1260,7 +1232,7 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
     const totalOcc   = Object.values(mdFor(m).roomsOccupied).reduce((a, b) => a + b, 0);
     sheet.getCell(r.occupancyRate, i + 2).value = totalAvail > 0
       ? parseFloat((totalOcc / totalAvail * 100).toFixed(2))
-      : 0;
+      : null;
 
     const md = mdFor(m).residentsByDay[0] || {};
     const gt =
@@ -1272,14 +1244,16 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
       (md.overseas_filipino || 0);
     sheet.getCell(r.alos, i + 2).value = gt > 0
       ? parseFloat((mdFor(m).guestNights / gt).toFixed(2))
-      : 0;
+      : null;
   }
 
   // Yearly totals for metrics
   const lastCol = allMonths.length + 2;
   const yrOccTotal = allMonths.reduce((sum, m) => sum + Object.values(m.roomsOccupied).reduce((a, b) => a + b, 0), 0);
   const yrAvailTotal = allMonths.reduce((sum, m) => sum + totalRoomsAll * new Date(year, m.month, 0).getDate(), 0);
-  sheet.getCell(r.occupancyRate, lastCol).value = yrAvailTotal > 0 ? parseFloat((yrOccTotal / yrAvailTotal * 100).toFixed(2)) : 0;
+  sheet.getCell(r.occupancyRate, lastCol).value = yrAvailTotal > 0
+    ? parseFloat((yrOccTotal / yrAvailTotal * 100).toFixed(2))
+    : null;
 
   const yrArrivals = allMonths.reduce((sum, m) => {
     const md = m.residentsByDay[0] || {};
@@ -1288,20 +1262,22 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
            (md.unspecified_guest || 0) + (md.overseas_filipino || 0);
   }, 0);
   const yrNights = allMonths.reduce((sum, m) => sum + m.guestNights, 0);
-  sheet.getCell(r.alos, lastCol).value = yrArrivals > 0 ? parseFloat((yrNights / yrArrivals).toFixed(2)) : 0;
+  sheet.getCell(r.alos, lastCol).value = yrArrivals > 0
+    ? parseFloat((yrNights / yrArrivals).toFixed(2))
+    : null;
 
   const setMonthlySexValues = (rowStart, gender) => {
-    setMonthValues(rowStart + 1, m => mSex(m, gender, 'philippine_resident_filipino') + mSex(m, gender, 'philippine_resident_foreign'));
-    setMonthValues(rowStart + 2, m => mSex(m, gender, 'listed_foreign_resident') + mSex(m, gender, 'unlisted_foreign_resident') + mSex(m, gender, 'unspecified_guest'));
-    setMonthValues(rowStart + 3, m => mSex(m, gender, 'overseas_filipino'));
-    setMonthValues(rowStart + 4, m => mSex(m, gender, 'unlisted_foreign_resident') + mSex(m, gender, 'unspecified_guest'));
+    setMonthValues(rowStart + 1, m => (mSex(m, gender, 'philippine_resident_filipino') + mSex(m, gender, 'philippine_resident_foreign')) || null);
+    setMonthValues(rowStart + 2, m => (mSex(m, gender, 'listed_foreign_resident') + mSex(m, gender, 'unlisted_foreign_resident') + mSex(m, gender, 'unspecified_guest')) || null);
+    setMonthValues(rowStart + 3, m => mSex(m, gender, 'overseas_filipino') || null);
+    setMonthValues(rowStart + 4, m => (mSex(m, gender, 'unlisted_foreign_resident') + mSex(m, gender, 'unspecified_guest')) || null);
     setMonthValues(rowStart + 5, m => {
-      return mSex(m, gender, 'philippine_resident_filipino') +
+      return (mSex(m, gender, 'philippine_resident_filipino') +
              mSex(m, gender, 'philippine_resident_foreign') +
              mSex(m, gender, 'listed_foreign_resident') +
              mSex(m, gender, 'unlisted_foreign_resident') +
              mSex(m, gender, 'overseas_filipino') +
-             mSex(m, gender, 'unspecified_guest');
+             mSex(m, gender, 'unspecified_guest')) || null;
     });
   };
   setMonthlySexValues(r.maleStart, 'male');

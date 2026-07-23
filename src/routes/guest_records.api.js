@@ -167,6 +167,10 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       leadSex,
     } = req.body;
 
+    if (!leadSex || !['male', 'female'].includes(leadSex?.toLowerCase())) {
+      return res.status(400).json({ message: 'leadSex must be "male" or "female"' });
+    }
+
     await connection.beginTransaction();
 
     const lengthOfStay = Math.max(1, Math.round((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24)));
