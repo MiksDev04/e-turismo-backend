@@ -333,9 +333,22 @@ router.post('/reports', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.body;
 
-    if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
-      return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series" (DAE)' });
+    if (!['dae', 'var'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
     }
+
+    if (reportType === 'dae') {
+      if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
+        return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series" (DAE)' });
+      }
+    } else {
+      if (reportVariant && reportVariant !== 'total') {
+        return res.status(400).json({ message: 'VAR reportVariant must be "total"' });
+      }
+    }
+
+    const effectiveVariant = reportType === 'var' ? 'total' : reportVariant;
+
     if (!periodYear || parseInt(periodYear, 10) < 2000) {
       return res.status(400).json({ message: 'periodYear must be >= 2000' });
     }
@@ -345,8 +358,8 @@ router.post('/reports', adminGuard, async (req, res, next) => {
 
     const months = [...new Set(periodMonths)].map(Number).filter(m => m >= 1 && m <= 12).sort((a, b) => a - b);
 
-    if (['daily', 'summary'].includes(reportVariant) && months.length !== 1) {
-      return res.status(400).json({ message: `"${reportVariant}" variant requires exactly one month` });
+    if (['daily', 'summary'].includes(effectiveVariant) && months.length !== 1) {
+      return res.status(400).json({ message: `"${effectiveVariant}" variant requires exactly one month` });
     }
 
     // Find-or-create (atomic: INSERT IGNORE + SELECT)
@@ -354,12 +367,12 @@ router.post('/reports', adminGuard, async (req, res, next) => {
     await db.pool.execute(
       `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [newBatchId, reportType, reportVariant, parseInt(periodYear, 10), JSON.stringify(months), req.user.id]
+      [newBatchId, reportType, effectiveVariant, parseInt(periodYear, 10), JSON.stringify(months), req.user.id]
     );
     const [rows] = await db.pool.execute(
       `SELECT id FROM report_batches
        WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
-      [reportType, reportVariant, parseInt(periodYear, 10), JSON.stringify(months)]
+      [reportType, effectiveVariant, parseInt(periodYear, 10), JSON.stringify(months)]
     );
     const isExisting = rows[0].id !== newBatchId;
     res.status(200).json({ batchId: rows[0].id, existing: isExisting });
@@ -373,9 +386,20 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.query;
 
-    if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
-      return res.status(400).json({ message: 'reportVariant is required (daily|summary|series)' });
+    if (!['dae', 'var'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
     }
+
+    let effectiveVariant;
+    if (reportType === 'dae') {
+      if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
+        return res.status(400).json({ message: 'reportVariant is required (daily|summary|series)' });
+      }
+      effectiveVariant = reportVariant;
+    } else {
+      effectiveVariant = 'total';
+    }
+
     if (!periodYear) {
       return res.status(400).json({ message: 'periodYear is required' });
     }
@@ -390,8 +414,8 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
 
     const sortedMonths = [...months].map(Number).sort((a, b) => a - b);
 
-    if (['daily', 'summary'].includes(reportVariant) && sortedMonths.length !== 1) {
-      return res.status(400).json({ message: `"${reportVariant}" requires exactly one month` });
+    if (['daily', 'summary'].includes(effectiveVariant) && sortedMonths.length !== 1) {
+      return res.status(400).json({ message: `"${effectiveVariant}" requires exactly one month` });
     }
 
     const year = parseInt(periodYear, 10);
@@ -401,12 +425,12 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
     await db.pool.execute(
       `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by, last_viewed_at)
        VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-      [newBatchId, reportType, reportVariant, year, JSON.stringify(sortedMonths), req.user.id]
+      [newBatchId, reportType, effectiveVariant, year, JSON.stringify(sortedMonths), req.user.id]
     );
     const [rows] = await db.pool.execute(
       `SELECT id FROM report_batches
        WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
-      [reportType, reportVariant, year, JSON.stringify(sortedMonths)]
+      [reportType, effectiveVariant, year, JSON.stringify(sortedMonths)]
     );
     const batchId = rows[0].id;
     await db.pool.execute('UPDATE report_batches SET last_viewed_at = NOW() WHERE id = ?', [batchId]);
@@ -472,9 +496,20 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx' } = req.body;
 
-    if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
-      return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series"' });
+    if (!['dae', 'var'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
     }
+
+    let effectiveVariant;
+    if (reportType === 'dae') {
+      if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
+        return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series"' });
+      }
+      effectiveVariant = reportVariant;
+    } else {
+      effectiveVariant = 'total';
+    }
+
     if (!periodYear) {
       return res.status(400).json({ message: 'periodYear is required' });
     }
@@ -496,8 +531,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
     const sortedMonths = [...months].map(Number).sort((a, b) => a - b);
 
-    if (['daily', 'summary'].includes(reportVariant) && sortedMonths.length !== 1) {
-      return res.status(400).json({ message: `"${reportVariant}" requires exactly one month` });
+    if (['daily', 'summary'].includes(effectiveVariant) && sortedMonths.length !== 1) {
+      return res.status(400).json({ message: `"${effectiveVariant}" requires exactly one month` });
     }
 
     const year = parseInt(periodYear, 10);
@@ -507,12 +542,12 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     await db.pool.execute(
       `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [newBatchId, reportType, reportVariant, year, JSON.stringify(sortedMonths), req.user.id]
+      [newBatchId, reportType, effectiveVariant, year, JSON.stringify(sortedMonths), req.user.id]
     );
     const [dlRows] = await db.pool.execute(
       `SELECT id FROM report_batches
        WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
-      [reportType, reportVariant, year, JSON.stringify(sortedMonths)]
+      [reportType, effectiveVariant, year, JSON.stringify(sortedMonths)]
     );
     const batchId = dlRows[0].id;
 
@@ -581,8 +616,13 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     });
 
     // ── Generate file ───────────────────────────────────────────────────────
-    const safeMonths = sortedMonths.join('-');
-    const baseFilename = `DAE_${reportVariant}_${year}_${safeMonths}`;
+    const _abbr = ['', 'Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const _fmtPeriod = (ms) => {
+      if (ms.length === 12) return 'Jan-Dec';
+      if (ms.length === 1) return _abbr[ms[0]];
+      return `${_abbr[ms[0]]}-${_abbr[ms[ms.length - 1]]}`;
+    };
+    const baseFilename = `${reportType.toUpperCase()}_${reportVariant}_${_fmtPeriod(sortedMonths)}_${year}`;
 
     if (format === 'xlsx') {
       const buffer = await wb.xlsx.writeBuffer();
@@ -1266,7 +1306,7 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   const yrNights = allMonths.reduce((sum, m) => sum + m.guestNights, 0);
   sheet.getCell(r.alos, lastCol).value = yrArrivals > 0
     ? parseFloat((yrNights / yrArrivals).toFixed(2))
-    : null;
+    : 0;
 
   const setMonthlySexValues = (rowStart, gender) => {
     setMonthValues(rowStart + 1, m => (mSex(m, gender, 'philippine_resident_filipino') + mSex(m, gender, 'philippine_resident_foreign')) || null);
