@@ -22,6 +22,7 @@ router.get('/rooms', auth.authenticate, auth.requireRole('business'), async (req
       fetchAll,
       status,
       search,
+      lastSync,
     } = req.query;
 
     if (!businessId) {
@@ -32,25 +33,32 @@ router.get('/rooms', auth.authenticate, auth.requireRole('business'), async (req
     const limit   = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 10));
     const offset  = (pageNum - 1) * limit;
 
+    const isDeltaSync = !!lastSync;
+
     // ── Build WHERE clause ────────────────────────────────────────────────
     const conditions = ['business_id = ?'];
     const params     = [businessId];
 
-    if (status && status !== 'All') {
-      conditions.push('room_status = ?');
-      params.push(status);
-    }
+    if (isDeltaSync) {
+      conditions.push('updated_at > ?');
+      params.push(lastSync);
+    } else {
+      if (status && status !== 'All') {
+        conditions.push('room_status = ?');
+        params.push(status);
+      }
 
-    if (search && search.trim()) {
-      conditions.push('room_number LIKE ?');
-      params.push(`%${search.trim()}%`);
+      if (search && search.trim()) {
+        conditions.push('room_number LIKE ?');
+        params.push(`%${search.trim()}%`);
+      }
     }
 
     const whereClause = conditions.join(' AND ');
 
     // ── Count total matching rows ─────────────────────────────────────────
     let totalCount = 0;
-    if (fetchAll !== 'true') {
+    if (fetchAll !== 'true' && !isDeltaSync) {
       const [countRows] = await connection.query(
         `SELECT COUNT(*) as total FROM rooms WHERE ${whereClause}`,
         params
@@ -66,9 +74,9 @@ router.get('/rooms', auth.authenticate, auth.requireRole('business'), async (req
     let query = `SELECT id, room_number, capacity, room_status, created_at, updated_at
                  FROM rooms
                  WHERE ${whereClause}
-                 ORDER BY room_number`;
+                 ORDER BY ${isDeltaSync ? 'updated_at ASC' : 'room_number'}`;
     const queryParams = [...params];
-    if (fetchAll !== 'true') {
+    if (fetchAll !== 'true' && !isDeltaSync) {
       query += ' LIMIT ? OFFSET ?';
       queryParams.push(limit, offset);
     }
@@ -83,7 +91,7 @@ router.get('/rooms', auth.authenticate, auth.requireRole('business'), async (req
       updatedAt: r.updated_at,
     }));
 
-    if (fetchAll === 'true') {
+    if (isDeltaSync || fetchAll === 'true') {
       return res.json({ data });
     }
     res.json({ data, totalCount, pageCount: Math.ceil(totalCount / limit) });

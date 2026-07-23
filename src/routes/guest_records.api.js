@@ -24,6 +24,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
       checkOutTo,
       purpose,
       transport,
+      lastSync,
     } = req.query;
 
     if (!businessId) {
@@ -34,14 +35,26 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     const limit   = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 10));
     const offset  = (pageNum - 1) * limit;
 
+    const isDeltaSync = !!lastSync;
+
     // ── Build WHERE clause ────────────────────────────────────────────────
-    const conditions = ['gr.business_id = ?', 'gr.is_deleted = FALSE'];
+    // When lastSync is provided (delta sync), we need to include soft-deleted
+    // records (is_deleted=TRUE) so the client can detect and prune them.
+    // We also skip status filtering to return all changed records.
+    const conditions = ['gr.business_id = ?'];
     const params     = [businessId];
 
-    if (status === 'archived') {
-      conditions.push("gr.status = 'archived'");
+    if (isDeltaSync) {
+      conditions.push('gr.updated_at > ?');
+      params.push(lastSync);
     } else {
-      conditions.push("gr.status = 'active'");
+      conditions.push('gr.is_deleted = FALSE');
+
+      if (status === 'archived') {
+        conditions.push("gr.status = 'archived'");
+      } else {
+        conditions.push("gr.status = 'active'");
+      }
     }
 
     if (checkInFrom) {
@@ -84,10 +97,10 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
                         gr.lead_country, gr.lead_city_municipality, gr.lead_province,
                         gr.lead_nationality, gr.lead_philippines_region, gr.lead_is_overseas,
                         gr.lead_birthdate, gr.lead_sex,
-                        gr.status, gr.created_at, gr.updated_at
+                        gr.status, gr.is_deleted, gr.created_at, gr.updated_at
                  FROM guest_records gr
                  WHERE ${whereClause}
-                 ORDER BY gr.created_at DESC`;
+                 ORDER BY gr.updated_at ASC`;
     const queryParams = [...params];
     if (fetchAll !== 'true') {
       query += ' LIMIT ? OFFSET ?';
@@ -125,6 +138,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     const data = records.map(r => ({
       ...r,
       leadIsOverseas: r.lead_is_overseas === 1,
+      isDeleted: r.is_deleted === 1 || r.is_deleted === true,
       rooms: roomsByRecord[r.id] || [],
     }));
 
@@ -374,6 +388,42 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
     res.json({ message: 'Record updated successfully', updated_at: now.toISOString() });
   } catch (err) {
     await connection.rollback();
+    next(err);
+  } finally {
+    connection.release();
+  }
+});
+
+/**
+ * DELETE /api/business/guest-records/:id
+ * Soft-delete a guest record (sets is_deleted = TRUE).
+ * This bumps updated_at so delta sync clients can detect the deletion.
+ */
+router.delete('/guest-records/:id', auth.authenticate, auth.requireRole('business'), async (req, res, next) => {
+  const connection = await db.pool.getConnection();
+  try {
+    const recordId = req.params.id;
+
+    const [existing] = await connection.execute(
+      `SELECT id, is_deleted FROM guest_records WHERE id = ?`,
+      [recordId]
+    );
+
+    if (existing.length === 0) {
+      return res.status(404).json({ message: 'Record not found' });
+    }
+
+    if (existing[0].is_deleted) {
+      return res.json({ message: 'Record already soft-deleted', id: recordId });
+    }
+
+    await connection.execute(
+      `UPDATE guest_records SET is_deleted = TRUE WHERE id = ?`,
+      [recordId]
+    );
+
+    res.json({ message: 'Record soft-deleted successfully', id: recordId });
+  } catch (err) {
     next(err);
   } finally {
     connection.release();
