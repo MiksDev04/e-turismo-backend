@@ -188,6 +188,16 @@ function _asInt(v) {
   return parseInt(v, 10) || 0;
 }
 
+function _normalizeCityName(name) {
+  return (name || '')
+    .toUpperCase()
+    .replace(/^CITY\s+OF\s+/, '')
+    .replace(/^MUNICIPALITY\s+OF\s+/, '')
+    .replace(/\s+CITY$/, '')
+    .replace(/\s+MUNICIPALITY$/, '')
+    .trim();
+}
+
 // Parse date strings as LOCAL time to prevent UTC-midnight shifting dates by
 // -1 day in Philippine timezone (UTC+8).
 function _parseLocalDate(dateStr) {
@@ -852,7 +862,7 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
     maleForeign: 0, femaleForeign: 0,
   };
 
-  const bCity = (businessCity || '').toUpperCase();
+  const bCity = _normalizeCityName(businessCity);
   const bProv = (businessProvince || '').toUpperCase();
 
   records.forEach(r => {
@@ -871,7 +881,7 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
     if (isForeign) {
       bucket = sex === 'female' ? 'femaleForeign' : 'maleForeign';
     } else {
-      const gCity = (r.lead_city_municipality || '').toUpperCase();
+      const gCity = _normalizeCityName(r.lead_city_municipality);
       const gProv = (r.lead_province || '').toUpperCase();
       if (gCity && gCity === bCity) {
         bucket = sex === 'female' ? 'femaleThisCity' : 'maleThisCity';
