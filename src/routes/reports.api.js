@@ -446,45 +446,96 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
     const establishments = [];
     const allMonthData = [];
 
-    for (const biz of businesses) {
-      const monthDataList = await Promise.all(
-        sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
-      );
-      allMonthData.push(...monthDataList);
+    if (reportType === 'var') {
+      // VAR: fetch per-establishment sex × residence aggregates
+      let totalsVar = {
+        maleThisCity: 0, femaleThisCity: 0,
+        maleOtherCity: 0, femaleOtherCity: 0,
+        maleOtherProvince: 0, femaleOtherProvince: 0,
+        maleForeign: 0, femaleForeign: 0,
+      };
 
-      establishments.push({
-        businessId: biz.id,
-        businessName: biz.business_name,
-        totalRooms: biz.total_rooms || 0,
-        aeId: biz.ae_id,
-        region: biz.region,
-        cityMunicipality: biz.city_municipality,
-        province: biz.province,
-        businessLine: typeof biz.business_line === 'string'
-          ? JSON.parse(biz.business_line || '[]')
-          : (biz.business_line || []),
-        monthData: reportVariant === 'series' ? null : monthDataList[0],
-        seriesData: reportVariant === 'series'
-          ? monthDataList.map(md => ({ month: md.month, data: md }))
-          : null,
+      for (const biz of businesses) {
+        const varDataList = await Promise.all(
+          sortedMonths.map(m => _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year))
+        );
+
+        const varData = {
+          maleThisCity: 0, femaleThisCity: 0,
+          maleOtherCity: 0, femaleOtherCity: 0,
+          maleOtherProvince: 0, femaleOtherProvince: 0,
+          maleForeign: 0, femaleForeign: 0,
+        };
+        for (const vd of varDataList) {
+          for (const k of Object.keys(vd)) varData[k] += vd[k];
+        }
+
+        for (const k of Object.keys(varData)) totalsVar[k] += varData[k];
+
+        establishments.push({
+          businessId: biz.id,
+          businessName: biz.business_name,
+          totalRooms: biz.total_rooms || 0,
+          aeId: biz.ae_id,
+          region: biz.region,
+          cityMunicipality: biz.city_municipality,
+          province: biz.province,
+          businessLine: typeof biz.business_line === 'string'
+            ? JSON.parse(biz.business_line || '[]')
+            : (biz.business_line || []),
+          monthData: null,
+          seriesData: null,
+          varData,
+        });
+      }
+
+      res.json({
+        batch: { id: batchId, reportType, reportVariant: effectiveVariant, periodYear: year, periodMonths: sortedMonths },
+        establishments,
+        totals: totalsVar,
+      });
+    } else {
+      // DAE: existing logic
+      for (const biz of businesses) {
+        const monthDataList = await Promise.all(
+          sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
+        );
+        allMonthData.push(...monthDataList);
+
+        establishments.push({
+          businessId: biz.id,
+          businessName: biz.business_name,
+          totalRooms: biz.total_rooms || 0,
+          aeId: biz.ae_id,
+          region: biz.region,
+          cityMunicipality: biz.city_municipality,
+          province: biz.province,
+          businessLine: typeof biz.business_line === 'string'
+            ? JSON.parse(biz.business_line || '[]')
+            : (biz.business_line || []),
+          monthData: reportVariant === 'series' ? null : monthDataList[0],
+          seriesData: reportVariant === 'series'
+            ? monthDataList.map(md => ({ month: md.month, data: md }))
+            : null,
+        });
+      }
+
+      // Compute merged totals
+      let totals;
+      if (sortedMonths.length === 1) {
+        totals = _mergeMonthData(sortedMonths[0], allMonthData);
+      } else {
+        totals = _mergeMonthDataMulti(sortedMonths, allMonthData);
+      }
+
+      const totalRoomsAll = businesses.reduce((sum, b) => sum + (b.total_rooms || 0), 0);
+
+      res.json({
+        batch: { id: batchId, reportType, reportVariant, periodYear: year, periodMonths: sortedMonths },
+        establishments,
+        totals: { ...totals, totalRooms: totalRoomsAll },
       });
     }
-
-    // Compute merged totals
-    let totals;
-    if (sortedMonths.length === 1) {
-      totals = _mergeMonthData(sortedMonths[0], allMonthData);
-    } else {
-      totals = _mergeMonthDataMulti(sortedMonths, allMonthData);
-    }
-
-    const totalRoomsAll = businesses.reduce((sum, b) => sum + (b.total_rooms || 0), 0);
-
-    res.json({
-      batch: { id: batchId, reportType, reportVariant, periodYear: year, periodMonths: sortedMonths },
-      establishments,
-      totals: { ...totals, totalRooms: totalRoomsAll },
-    });
   } catch (err) {
     next(err);
   }
@@ -631,7 +682,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       res.set('Content-Disposition', `attachment; filename="${baseFilename}.xlsx"`);
       res.send(Buffer.from(buffer));
     } else {
-      const pdfBuffer = await _generatePdfBuffer(wb, sortedMonths[0], year);
+      const pdfBuffer = await _generatePdfBuffer(wb, effectiveVariant, sortedMonths[0], year);
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
       res.set('Content-Type', 'application/pdf');
       res.set('Content-Disposition', `attachment; filename="${baseFilename}.pdf"`);
@@ -777,6 +828,66 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
   };
 }
 
+// ─── VAR Month Data (per-establishment aggregated by sex × residence) ────────
+
+async function _fetchVarMonthData(businessId, businessCity, businessProvince, month, year) {
+  const firstDay = `${year}-${String(month).padStart(2, '0')}-01`;
+  const lastDay  = new Date(year, month, 0).toISOString().split('T')[0];
+
+  const [records] = await db.pool.execute(
+    `SELECT id, check_in, check_out, actual_check_out, total_guests,
+            lead_country, lead_sex, lead_nationality, lead_is_overseas,
+            lead_city_municipality, lead_province
+     FROM guest_records
+     WHERE business_id = ? AND is_deleted = false
+       AND COALESCE(actual_check_out, check_out) > ? AND check_in <= ?
+       AND status = 'active'`,
+    [businessId, firstDay, lastDay]
+  );
+
+  const data = {
+    maleThisCity: 0, femaleThisCity: 0,
+    maleOtherCity: 0, femaleOtherCity: 0,
+    maleOtherProvince: 0, femaleOtherProvince: 0,
+    maleForeign: 0, femaleForeign: 0,
+  };
+
+  const bCity = (businessCity || '').toUpperCase();
+  const bProv = (businessProvince || '').toUpperCase();
+
+  records.forEach(r => {
+    const checkIn = _parseLocalDate(r.check_in);
+    if (!checkIn || !r.check_out) return;
+
+    const effectiveCheckOut = r.actual_check_out || r.check_out;
+    const checkOut = _parseLocalDate(effectiveCheckOut);
+    const nights   = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
+    const days     = Math.max(1, nights);
+    const sex      = (r.lead_sex || '').toLowerCase();
+    const gCountry = (r.lead_country || '').toUpperCase();
+    const isForeign = !!r.lead_is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
+
+    let bucket;
+    if (isForeign) {
+      bucket = sex === 'female' ? 'femaleForeign' : 'maleForeign';
+    } else {
+      const gCity = (r.lead_city_municipality || '').toUpperCase();
+      const gProv = (r.lead_province || '').toUpperCase();
+      if (gCity && gCity === bCity) {
+        bucket = sex === 'female' ? 'femaleThisCity' : 'maleThisCity';
+      } else if (gProv && gProv === bProv) {
+        bucket = sex === 'female' ? 'femaleOtherCity' : 'maleOtherCity';
+      } else {
+        bucket = sex === 'female' ? 'femaleOtherProvince' : 'maleOtherProvince';
+      }
+    }
+
+    data[bucket] += days;
+  });
+
+  return data;
+}
+
 // ─── Merge helpers ────────────────────────────────────────────────────────────
 
 function _mergeMonthData(month, list) {
@@ -914,8 +1025,6 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
 
   sheet.getCell('B3').value = 'Region: __4-A';
   sheet.getCell('A4').value = `${kMonthNames[month].substring(0, 3).charAt(0)}${kMonthNames[month].substring(1, 3).toLowerCase()}-${String(year).slice(-2)}`;
-  sheet.getCell('AG1').value = `${kMonthNames[month]}, ${year}`;
-
   const bizLines = typeof biz.business_line === 'string'
     ? JSON.parse(biz.business_line || '[]')
     : (biz.business_line || []);
@@ -1089,7 +1198,7 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
 
   sheet.getCell('B3').value = 'Region: __4-A';
   sheet.getCell('A4').value = `${kMonthNames[month].substring(0, 3).charAt(0)}${kMonthNames[month].substring(1, 3).toLowerCase()}-${String(year).slice(-2)}`;
-  sheet.getCell('AG1').value = `${kMonthNames[month]}, ${year}`;
+  sheet.getCell('A5').value = `${kMonthNames[month]}, ${year}`;
 
   sheet.getCell('A22').value = `City/Municipality: ${city || ''}`;
   sheet.getCell('A23').value = `Province: ${province || ''}`;
@@ -1110,11 +1219,11 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
   const cnt = country => md.countryByDay[country.toUpperCase()]?.[0] || 0;
   const sex = (s, cat) => md.sexByDay[0]?.[s]?.[cat] || 0;
 
-  sheet.getCell(`B${r.phResFilipino}`).value = res('philippine_resident_filipino') || null;
-  sheet.getCell(`B${r.phResForeign}`).value = res('philippine_resident_foreign') || null;
+  sheet.getCell(`B${r.phResFilipino}`).value = res('philippine_resident_filipino');
+  sheet.getCell(`B${r.phResForeign}`).value = res('philippine_resident_foreign');
   sheet.getCell(`B${r.phResTotal}`).value = (res('philippine_resident_filipino') + res('philippine_resident_foreign')) ?? 0;
 
-  kCountryRows.forEach(c => { sheet.getCell(`B${c.sum}`).value = cnt(c.country) || null; });
+  kCountryRows.forEach(c => { sheet.getCell(`B${c.sum}`).value = cnt(c.country); });
 
   kRegionalGroups.forEach(g => {
     const subtotal = g.countries.reduce((sum, country) => sum + cnt(country), 0);
@@ -1148,10 +1257,10 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
 
   sheet.getCell(`B${r.occupancyRate}`).value = totalRoomsAvail > 0
     ? parseFloat((totalRoomsOcc / totalRoomsAvail * 100).toFixed(2))
-    : null;
+    : 0;
   sheet.getCell(`B${r.alos}`).value = grandTotal > 0
     ? parseFloat((md.guestNights / grandTotal).toFixed(2))
-    : null;
+    : 0;
 
   const setSexValues = (rowStart, gender) => {
     sheet.getCell(`B${rowStart + 1}`).value = (sex(gender, 'philippine_resident_filipino') + sex(gender, 'philippine_resident_foreign')) ?? 0;
@@ -1179,8 +1288,6 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
 
   sheet.getCell('B3').value = 'Region: __4-A';
   sheet.getCell('A4').value = `Jan-Dec, ${year}`;
-  sheet.getCell('AG1').value = `${year}`;
-
   sheet.getCell('A22').value = `City/Municipality: ${city || ''}`;
   sheet.getCell('A23').value = `Province: ${province || ''}`;
   sheet.getCell('A19').value = `AE ID Code (LGU Assigned): ${biz?.ae_id || ''}`;
@@ -1196,7 +1303,7 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
     }
   });
 
-  const _sumTotalRows = new Set([30, 45, 53, 62, 72, 80, 88, 99, 108, 116, 122, 130, 137, 140, 142, 144, 146, 147, 148, 149, 150, 155, 156, 157, 159, 160, 163, 164, 165, 166, 167, 169, 170, 171, 172, 173]);
+  const _sumTotalRows = new Set([30, 45, 53, 62, 72, 80, 88, 99, 108, 116, 122, 130, 137, 140, 142, 144, 146, 147, 148, 149, 150, 159, 160]);
   const setMonthValues = (rowNum, fn) => {
     const useZero = _sumTotalRows.has(rowNum);
     let yearTotal = 0;
@@ -1272,7 +1379,7 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
     const daysInM    = new Date(year, m, 0).getDate();
     const totalAvail = totalRoomsAll * daysInM;
     const totalOcc   = Object.values(mdFor(m).roomsOccupied).reduce((a, b) => a + b, 0);
-    sheet.getCell(r.occupancyRate, i + 2).value = totalAvail > 0
+    sheet.getCell(r.occupancyRate, i + 2).value = totalAvail > 0 && totalOcc > 0
       ? parseFloat((totalOcc / totalAvail * 100).toFixed(2))
       : null;
 
@@ -1293,9 +1400,9 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   const lastCol = allMonths.length + 2;
   const yrOccTotal = allMonths.reduce((sum, m) => sum + Object.values(m.roomsOccupied).reduce((a, b) => a + b, 0), 0);
   const yrAvailTotal = allMonths.reduce((sum, m) => sum + totalRoomsAll * new Date(year, m.month, 0).getDate(), 0);
-  sheet.getCell(r.occupancyRate, lastCol).value = yrAvailTotal > 0
+  sheet.getCell(r.occupancyRate, lastCol).value = yrAvailTotal > 0 && yrOccTotal > 0
     ? parseFloat((yrOccTotal / yrAvailTotal * 100).toFixed(2))
-    : null;
+    : 0;
 
   const yrArrivals = allMonths.reduce((sum, m) => {
     const md = m.residentsByDay[0] || {};
@@ -1324,12 +1431,21 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   };
   setMonthlySexValues(r.maleStart, 'male');
   setMonthlySexValues(r.femaleStart, 'female');
+
+  // ── Remove unused month columns for the requested range ──────────────────
+  // Template has 12 month columns (B-M) + 1 total column (N).
+  // After writing, data occupies columns 2..(allMonths.length+1) and total at
+  // allMonths.length+2.  Delete leftover template columns after the total.
+  const unusedMonthCols = 12 - allMonths.length;
+  if (unusedMonthCols > 0) {
+    sheet.spliceColumns(allMonths.length + 3, unusedMonthCols);
+  }
 }
 
 // ─── PDF Layout & Page-Break Config ─────────────────────────────────────────
 const SHEET_PDF_CONFIG = {
   daily:   { layout: 'landscape', size: 'A3', margin: 45, breakRows: [64, 124] },
-  monthly: { layout: 'landscape', size: 'A3', margin: 45, breakRows: [64, 124] },
+  monthly: { layout: 'portrait',  size: 'A3', margin: 45, breakRows: [64, 124] },
   sum:     { layout: 'portrait',  size: 'A3', margin: 45, breakRows: [66, 128] },
 };
 
@@ -1341,18 +1457,18 @@ function _getSheetPdfConfig(sheetName) {
 
 // ─── PDF Generation (returns Buffer instead of writing to file) ──────────────
 
-async function _generatePdfBuffer(workbook, month, year) {
+async function _generatePdfBuffer(workbook, variant, month, year) {
   const sheets = [];
   workbook.eachSheet(sheet => sheets.push(sheet));
 
-  const firstConfig = sheets.length > 0
-    ? _getSheetPdfConfig(sheets[0].name)
+  const pdfConfig = variant === 'summary' ? SHEET_PDF_CONFIG.sum
+    : variant === 'series' ? SHEET_PDF_CONFIG.monthly
     : SHEET_PDF_CONFIG.daily;
 
   const doc = new PDFDocument({
-    layout: firstConfig.layout,
-    size:   firstConfig.size,
-    margin: firstConfig.margin,
+    layout: pdfConfig.layout,
+    size:   pdfConfig.size,
+    margin: pdfConfig.margin,
   });
 
   // Collect PDF output into a buffer
@@ -1370,7 +1486,7 @@ async function _generatePdfBuffer(workbook, month, year) {
   let isFirstSheet = true;
 
   for (const sheet of sheets) {
-    const cfg  = _getSheetPdfConfig(sheet.name);
+    const cfg  = pdfConfig;
     const ps   = _pageSize(cfg.size);
     const pgW  = cfg.layout === 'landscape' ? ps.h : ps.w;
     const pgH  = cfg.layout === 'landscape' ? ps.w : ps.h;
