@@ -125,7 +125,6 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
         b.business_line,
         b.status                              AS business_status,
         COUNT(gr.id)                          AS total_records,
-        COALESCE(SUM(gr.total_guests), 0)     AS total_guests,
         MAX(gr.created_at)                    AS last_activity,
         CASE
           WHEN COUNT(gr.id) = 0
@@ -151,10 +150,32 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
 
     const [rows] = await connection.query(sql, [...whereParams, ...havingParams, limit, offset]);
 
+    // Compute guest-days (spread) for each business
+    const businessIds = rows.map(r => r.id);
+    let guestDaysMap = new Map();
+    if (businessIds.length > 0) {
+      const placeholders = businessIds.map(() => '?').join(',');
+      const [guestRows] = await connection.query(
+        `SELECT business_id, check_in, check_out, actual_check_out, total_guests
+         FROM guest_records
+         WHERE business_id IN (${placeholders}) AND is_deleted = FALSE`,
+        businessIds
+      );
+      for (const gr of guestRows) {
+        const checkInRaw = new Date(gr.check_in);
+        const effectiveCheckOutRaw = new Date(gr.actual_check_out || gr.check_out);
+        const checkIn = new Date(checkInRaw.getFullYear(), checkInRaw.getMonth(), checkInRaw.getDate());
+        const effectiveCheckOut = new Date(effectiveCheckOutRaw.getFullYear(), effectiveCheckOutRaw.getMonth(), effectiveCheckOutRaw.getDate());
+        const nights = Math.max(1, Math.floor((effectiveCheckOut - checkIn) / 86400000));
+        const guestDays = Number(gr.total_guests) * nights;
+        guestDaysMap.set(gr.business_id, (guestDaysMap.get(gr.business_id) || 0) + guestDays);
+      }
+    }
+
     const data = rows.map(r => ({
       ...r,
       total_records: Number(r.total_records),
-      total_guests: Number(r.total_guests)
+      total_guests: guestDaysMap.get(r.id) || 0
     }));
 
     res.json({ data, totalCount, pageCount: Math.ceil(totalCount / limit), summaryCounts });
@@ -254,19 +275,65 @@ router.get('/daily-stats/:businessId', auth.authenticate, auth.requireRole('admi
     const lastDay = new Date(y, m, 0).getDate();
     const endStr = `${y}-${m.toString().padStart(2, '0')}-${lastDay.toString().padStart(2, '0')}`;
 
+    // Fetch all records that overlap with the target month
     const [rows] = await connection.execute(
-      `SELECT check_in, SUM(total_guests) as total_guests
+      `SELECT check_in, check_out, actual_check_out, total_guests
        FROM guest_records
-       WHERE business_id = ? AND is_deleted = FALSE AND check_in >= ? AND check_in <= ?
-       GROUP BY check_in
-       ORDER BY check_in ASC`,
-      [businessId, startStr, endStr]
+       WHERE business_id = ? AND is_deleted = FALSE
+         AND check_in <= ? AND COALESCE(actual_check_out, check_out) >= ?`,
+      [businessId, endStr, startStr]
     );
 
-    const result = rows.map(r => ({
-      check_in: r.check_in,
-      total_guests: Number(r.total_guests)
-    }));
+    // Build per-day map: day-of-month → total guest-days present
+    const periodStart = new Date(y, m - 1, 1);
+    const periodEnd = new Date(y, m - 1, lastDay);
+    const dayMap = new Map();
+    for (let d = 1; d <= lastDay; d++) {
+      dayMap.set(d, 0);
+    }
+
+    for (const row of rows) {
+      const checkInRaw = new Date(row.check_in);
+      const effectiveCheckOutRaw = new Date(row.actual_check_out || row.check_out);
+      const checkIn = new Date(checkInRaw.getFullYear(), checkInRaw.getMonth(), checkInRaw.getDate());
+      const effectiveCheckOut = new Date(effectiveCheckOutRaw.getFullYear(), effectiveCheckOutRaw.getMonth(), effectiveCheckOutRaw.getDate());
+      const guests = Number(row.total_guests);
+
+      // Clamp stay to the target month
+      const stayStart = checkIn < periodStart ? periodStart : checkIn;
+      const stayEnd = effectiveCheckOut > periodEnd ? periodEnd : effectiveCheckOut;
+      const isClamped = effectiveCheckOut > periodEnd;
+
+      if (stayEnd < stayStart) continue;
+
+      // Determine last PRESENCE day (checkout day is NOT a presence day)
+      const isSameDay = effectiveCheckOut.getTime() <= checkIn.getTime();
+      let lastPresenceDay;
+      if (isClamped) {
+        lastPresenceDay = stayEnd;
+      } else if (isSameDay) {
+        lastPresenceDay = checkIn;
+      } else {
+        lastPresenceDay = new Date(effectiveCheckOut);
+        lastPresenceDay.setDate(lastPresenceDay.getDate() - 1);
+      }
+
+      // Add 1 guest-day for each day the guest was present
+      const cur = new Date(stayStart);
+      while (cur <= lastPresenceDay) {
+        const dayOfMonth = cur.getDate();
+        if (dayMap.has(dayOfMonth)) {
+          dayMap.set(dayOfMonth, dayMap.get(dayOfMonth) + guests);
+        }
+        cur.setDate(cur.getDate() + 1);
+      }
+    }
+
+    const result = [];
+    for (let d = 1; d <= lastDay; d++) {
+      const dateStr = `${y}-${m.toString().padStart(2, '0')}-${d.toString().padStart(2, '0')}`;
+      result.push({ check_in: dateStr, total_guests: dayMap.get(d) });
+    }
 
     res.json(result);
   } catch (err) {

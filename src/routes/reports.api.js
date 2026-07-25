@@ -202,7 +202,7 @@ function _normalizeCityName(name) {
 // -1 day in Philippine timezone (UTC+8).
 function _parseLocalDate(dateStr) {
   if (!dateStr) return null;
-  const datePart = String(dateStr).split('T')[0];
+  const datePart = String(dateStr).split('T')[0].split(' ')[0];
   const [y, mo, d] = datePart.split('-').map(Number);
   if (!y || !mo || !d) return null;
   return new Date(y, mo - 1, d); // local midnight — getDate() is always correct

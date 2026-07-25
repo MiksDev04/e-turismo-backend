@@ -125,37 +125,30 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
     let query = '';
     const params = [];
 
+    // Build date range bounds
+    let periodStart, periodEnd;
     if (year !== 0 && month !== 0) {
-      // Filter by specific year and month
-      const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
       const nextMonth = month === 12 ? 1 : month + 1;
       const nextYear = month === 12 ? year + 1 : year;
-      const endDate = `${nextYear}-${String(nextMonth).padStart(2, '0')}-01`;
-
-      query = `SELECT gr.business_id, b.business_name, SUM(gr.total_guests) AS total_guests
-               FROM guest_records gr
-               JOIN businesses b ON gr.business_id = b.id
-               WHERE gr.is_deleted = false
-                 AND gr.check_in >= ? AND gr.check_in < ?
-               GROUP BY gr.business_id, b.business_name
-               ORDER BY total_guests DESC`;
-      params.push(startDate, endDate);
+      periodStart = new Date(`${year}-${String(month).padStart(2, '0')}-01`);
+      periodEnd = new Date(`${nextYear}-${String(nextMonth).padStart(2, '0')}-01`);
     } else if (year !== 0 && month === 0) {
-      // Filter by year only
-      const startDate = `${year}-01-01`;
-      const endDate = `${year + 1}-01-01`;
+      periodStart = new Date(`${year}-01-01`);
+      periodEnd = new Date(`${year + 1}-01-01`);
+    } else {
+      periodStart = null;
+      periodEnd = null;
+    }
 
-      query = `SELECT gr.business_id, b.business_name, SUM(gr.total_guests) AS total_guests
+    if (periodStart && periodEnd) {
+      query = `SELECT gr.business_id, b.business_name, gr.check_in, gr.check_out, gr.actual_check_out, gr.total_guests
                FROM guest_records gr
                JOIN businesses b ON gr.business_id = b.id
                WHERE gr.is_deleted = false
-                 AND gr.check_in >= ? AND gr.check_in < ?
-               GROUP BY gr.business_id, b.business_name
-               ORDER BY total_guests DESC`;
-      params.push(startDate, endDate);
+                 AND gr.check_in < ? AND COALESCE(gr.actual_check_out, gr.check_out) >= ?`;
+      params.push(periodEnd, periodStart);
     } else {
-      // Fetch all (year=0) — optionally filter by month in JS
-      query = `SELECT gr.business_id, b.business_name, gr.check_in, gr.total_guests
+      query = `SELECT gr.business_id, b.business_name, gr.check_in, gr.check_out, gr.actual_check_out, gr.total_guests
                FROM guest_records gr
                JOIN businesses b ON gr.business_id = b.id
                WHERE gr.is_deleted = false`;
@@ -163,38 +156,37 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
 
     const [rows] = await db.pool.execute(query, params);
 
-    let aggregated;
+    const map = new Map();
 
-    if (year === 0) {
-      // Need to aggregate in JS (optionally filtering by month)
-      const map = new Map();
+    for (const row of rows) {
+      const checkInRaw = new Date(row.check_in);
+      const effectiveCheckOutRaw = new Date(row.actual_check_out || row.check_out);
+      const checkIn = new Date(checkInRaw.getFullYear(), checkInRaw.getMonth(), checkInRaw.getDate());
+      const effectiveCheckOut = new Date(effectiveCheckOutRaw.getFullYear(), effectiveCheckOutRaw.getMonth(), effectiveCheckOutRaw.getDate());
 
-      for (const row of rows) {
-        if (month !== 0) {
-          const checkInDate = new Date(row.check_in);
-          if (checkInDate.getMonth() + 1 !== month) continue;
-        }
-
-        const key = row.business_id;
-        if (map.has(key)) {
-          map.get(key).total_guests += Number(row.total_guests);
-        } else {
-          map.set(key, {
-            business_id: row.business_id,
-            business_name: row.business_name,
-            total_guests: Number(row.total_guests),
-          });
-        }
+      let daysInPeriod;
+      if (periodStart && periodEnd) {
+        const stayStart = checkIn < periodStart ? periodStart : checkIn;
+        const stayEnd = effectiveCheckOut > periodEnd ? periodEnd : effectiveCheckOut;
+        daysInPeriod = Math.max(1, Math.floor((stayEnd - stayStart) / 86400000));
+      } else {
+        daysInPeriod = Math.max(1, Math.floor((effectiveCheckOut - checkIn) / 86400000));
       }
 
-      aggregated = Array.from(map.values()).sort((a, b) => b.total_guests - a.total_guests);
-    } else {
-      aggregated = rows.map((r) => ({
-        business_id: r.business_id,
-        business_name: r.business_name,
-        total_guests: Number(r.total_guests),
-      }));
+      const guestDays = Number(row.total_guests) * daysInPeriod;
+      const key = row.business_id;
+      if (map.has(key)) {
+        map.get(key).total_guests += guestDays;
+      } else {
+        map.set(key, {
+          business_id: row.business_id,
+          business_name: row.business_name,
+          total_guests: guestDays,
+        });
+      }
     }
+
+    const aggregated = Array.from(map.values()).sort((a, b) => b.total_guests - a.total_guests);
 
     // Assign dense ranks
     let currentRank = 0;
