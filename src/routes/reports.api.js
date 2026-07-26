@@ -1637,10 +1637,10 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
 
 // ─── PDF Layout & Page-Break Config ─────────────────────────────────────────
 const SHEET_PDF_CONFIG = {
-  daily:   { layout: 'landscape', size: 'A3', margin: 45, breakRows: [64, 124] },
-  monthly: { layout: 'portrait',  size: 'A3', margin: 45, breakRows: [64, 124] },
-  sum:     { layout: 'portrait',  size: 'A3', margin: 45, breakRows: [66, 128] },
-  var:     { layout: 'portrait', size: 'A3', margin: 35, breakRows: [] },
+  daily:   { layout: 'landscape', size: 'A3', margin: 30, breakRows: [64, 124] },
+  monthly: { layout: 'landscape', size: 'A3', margin: 40, breakRows: [64, 124] },
+  sum:     { layout: 'portrait',  size: 'A3', margin: 30, breakRows: [66, 128] },
+  var:     { layout: 'portrait', size: 'A3', margin: 30, breakRows: [] },
 };
 
 function _getSheetPdfConfig(sheetName, reportType) {
@@ -1748,6 +1748,13 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
         const rh = (row.height || 15) * (cfg.heightFactor ?? BASE_HEIGHT_FACTOR) * scale;
         let curX = originX;
 
+        // Pass 1: draw every cell's fill, border, and (if applicable) checkmark,
+        // and record its box + text for pass 2. Text is drawn in a separate pass
+        // AFTER every cell in the row has its background painted, so that text
+        // spilling out of its own cell into a blank neighbor never gets papered
+        // over by that neighbor's fill/border being drawn later.
+        const cellBlocks = [];
+
         row.eachCell({ includeEmpty: true }, (cell, cn) => {
           if (cn > maxCol) return;
 
@@ -1802,7 +1809,8 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
             }
           }
 
-          if (text === '\u2714') {
+          const isCheckmark = text === '\u2714';
+          if (isCheckmark) {
             const cx = curX + bw / 2;
             const cy = curY + bh / 2;
             const s  = Math.min(bw, bh) * 0.35;
@@ -1815,35 +1823,104 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
                .lineTo(cx - s * 0.1, cy + s * 0.4)
                .lineTo(cx + s * 0.6, cy - s * 0.3)
                .stroke();
-          } else if (text) {
-            const fontSize = ((cell.font?.size ?? 0) * 0.8 || 7) * scale;
-            const isBold   = !!cell.font?.bold;
-            const isItalic = !!cell.font?.italic;
-            const color    = cell.font?.color?.argb
-              ? '#' + cell.font.color.argb.substring(2)
-              : '#000000';
-
-            doc.fillColor(color)
-               .font(isBold
-                 ? (isItalic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold')
-                 : (isItalic ? 'Helvetica-Oblique'     : 'Helvetica'))
-               .fontSize(fontSize);
-
-            const align    = cell.alignment?.horizontal || 'left';
-            const pdfAlign = align === 'center'
-              ? 'center'
-              : (cn > 1 || align === 'right' ? 'right' : 'left');
-
-            doc.text(text, curX + 2, curY + 2, {
-              width:    bw - 4,
-              height:   bh - 4,
-              align:    pdfAlign,
-              ellipsis: true,
-            });
           }
+
+          cellBlocks.push({ cn, x: curX, bw, bh, text, cell, isCheckmark });
 
           curX += cw;
         });
+
+        // Pass 2: draw text on top of the fully-painted row. If a cell's text
+        // is wider than its own cell, let it bleed into consecutive blank
+        // neighboring cells (in the direction dictated by its alignment) the
+        // same way Excel itself displays overflowing, uncut text — only
+        // falling back to an ellipsis once it runs out of blank room to spill into.
+        for (let i = 0; i < cellBlocks.length; i++) {
+          const block = cellBlocks[i];
+          if (block.isCheckmark || !block.text) continue;
+
+          const { x, bw, bh, text, cell, cn } = block;
+          const fontSize = ((cell.font?.size ?? 0) * 0.8 || 7) * scale;
+          const isBold   = !!cell.font?.bold;
+          const isItalic = !!cell.font?.italic;
+          const color    = cell.font?.color?.argb
+            ? '#' + cell.font.color.argb.substring(2)
+            : '#000000';
+
+          doc.fillColor(color)
+             .font(isBold
+               ? (isItalic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold')
+               : (isItalic ? 'Helvetica-Oblique'     : 'Helvetica'))
+             .fontSize(fontSize);
+
+          // Alignment: honor an explicit alignment set on the cell; otherwise
+          // fall back to Excel's own default rule (numbers right-align, text
+          // left-aligns) based on the cell's actual value type. The previous
+          // "any column after the first is right-aligned" guess was tuned for
+          // the DAE sheets (label in col A, numbers afterward) but wrongly
+          // forced the VAR report's establishment-name/code text columns to
+          // right-align too, which also made them overflow in the wrong
+          // direction (left, into a near-zero-width margin column) instead of
+          // rightward into genuinely blank cells.
+          const rawValue = cell.value;
+          const isNumericValue = typeof rawValue === 'number'
+            || (rawValue && typeof rawValue === 'object' && typeof rawValue.result === 'number');
+          const align    = cell.alignment?.horizontal;
+          const pdfAlign = align === 'center' ? 'center'
+            : align === 'left'  ? 'left'
+            : align === 'right' ? 'right'
+            : (isNumericValue ? 'right' : 'left');
+
+          let boxX = x + 2;
+          let boxW = bw - 4;
+
+          // Only borrow neighboring space if the text actually doesn't fit —
+          // cells that fit as-is stay confined to their own column.
+          if (doc.widthOfString(text) > boxW) {
+            let extraRight = 0;
+            for (let j = i + 1; j < cellBlocks.length && !cellBlocks[j].isCheckmark && !cellBlocks[j].text; j++) {
+              extraRight += cellBlocks[j].bw;
+            }
+            let extraLeft = 0;
+            for (let j = i - 1; j >= 0 && !cellBlocks[j].isCheckmark && !cellBlocks[j].text; j--) {
+              extraLeft += cellBlocks[j].bw;
+            }
+
+            if (pdfAlign === 'left') {
+              boxW += extraRight;
+            } else if (pdfAlign === 'right') {
+              boxX -= extraLeft;
+              boxW += extraLeft;
+            } else {
+              boxX -= extraLeft;
+              boxW += extraLeft + extraRight;
+            }
+          }
+
+          // Shrink-to-fit fallback: dense tables (e.g. Monthly Series, where
+          // every month column tends to already hold a real value) often have
+          // no blank neighbor left to overflow into. Rather than immediately
+          // clipping with an ellipsis, nudge the font size down in small
+          // steps — same idea as Excel's own "Shrink to fit" cell option —
+          // and only fall back to the ellipsis if it still won't fit at the
+          // smallest allowed size.
+          if (doc.widthOfString(text) > boxW) {
+            const minFontSize = Math.max(fontSize * 0.6, 4);
+            let shrunkSize = fontSize;
+            while (shrunkSize > minFontSize && doc.widthOfString(text) > boxW) {
+              shrunkSize = Math.max(shrunkSize - 0.3, minFontSize);
+              doc.fontSize(shrunkSize);
+            }
+          }
+
+          doc.text(text, boxX, curY + 2, {
+            width:    boxW,
+            height:   bh - 4,
+            align:    pdfAlign,
+            ellipsis: true,
+          });
+        }
+
         curY += rh;
       }
     }
