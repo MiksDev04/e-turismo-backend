@@ -1536,7 +1536,7 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
 
   // Update header fields
   // Row 9: Month/Year — write value in the cells near E9
-  sheet.getCell('F9').value = monthLabel;
+  sheet.getCell('G9').value = monthLabel;
 
   // Row 10: Municipality — write the first business city or leave template default
   if (businesses.length === 1) {
