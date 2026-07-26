@@ -1674,8 +1674,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     doc.on('end', () => resolve(Buffer.concat(chunks)));
   });
 
-  const BASE_HEIGHT_FACTOR = 0.75;
-  const BASE_WIDTH_FACTOR  = 5.25;
+  const CHAR_WIDTH_PT = 5.25;
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 } };
   const _pageSize = name => PAGE_DIMS[name] || PAGE_DIMS.A3;
 
@@ -1686,8 +1685,6 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     const ps   = _pageSize(cfg.size);
     const pgW  = cfg.layout === 'landscape' ? ps.h : ps.w;
     const pgH  = cfg.layout === 'landscape' ? ps.w : ps.h;
-    const aw   = pgW - 2 * cfg.margin;
-    const ah   = pgH - 2 * cfg.margin;
 
     if (!isFirstSheet) {
       doc.addPage({ layout: cfg.layout, size: cfg.size, margin: cfg.margin });
@@ -1709,32 +1706,30 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       if (section.length > 0) sheetSections.push(section);
     }
 
-    let totalW = 0;
     const maxCol = reportType === 'var' ? 18 : 33;
+    let contentWidthPt = 0;
     for (let c = 1; c <= maxCol; c++) {
       const w = sheet.getColumn(c).width;
-      if (w != null && w > 0) totalW += w;
+      if (w != null && w > 0) contentWidthPt += w * CHAR_WIDTH_PT;
     }
-    if (totalW === 0) totalW = 40;
+    if (contentWidthPt === 0) contentWidthPt = 40 * CHAR_WIDTH_PT;
 
-    let maxSectionH = 0;
+    let maxHeightInAnySection = 0;
     for (const sec of sheetSections) {
       let h = 0;
-      for (const { row } of sec) h += row.height || 15;
-      if (h > maxSectionH) maxSectionH = h;
+      for (const { row } of sec) h += (row.height || 15);
+      if (h > maxHeightInAnySection) maxHeightInAnySection = h;
     }
-    if (maxSectionH === 0) maxSectionH = 300;
-    const contentH = maxSectionH * (cfg.heightFactor ?? BASE_HEIGHT_FACTOR);
+    if (maxHeightInAnySection === 0) maxHeightInAnySection = 300;
 
-    const balancedWF = aw * contentH / (totalW * ah);
-    const wf = Math.min(balancedWF, BASE_WIDTH_FACTOR);
-    const contentW = totalW * wf;
-
-    const scale = Math.min(aw / contentW, ah / contentH);
-    const ox = (aw - contentW * scale) / 2;
-    const oy = (ah - contentH * scale) / 2;
-    const originX = cfg.margin + ox;
-    const originY = cfg.margin + oy;
+    const effectiveMargin = Math.max(cfg.margin, 30);
+    const aw2 = pgW - 2 * effectiveMargin;
+    const ah2 = pgH - 2 * effectiveMargin;
+    const scale = Math.min(aw2 / contentWidthPt, ah2 / maxHeightInAnySection);
+    const ox = (aw2 - contentWidthPt * scale) / 2;
+    const oy = (ah2 - maxHeightInAnySection * scale) / 2;
+    const originX = effectiveMargin + ox;
+    const originY = effectiveMargin + oy;
 
     for (let s = 0; s < sheetSections.length; s++) {
       const section = sheetSections[s];
@@ -1745,7 +1740,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       let curY = originY;
 
       for (const { row, rn } of section) {
-        const rh = (row.height || 15) * (cfg.heightFactor ?? BASE_HEIGHT_FACTOR) * scale;
+        const rh = (row.height || 15) * scale;
         let curX = originX;
 
         // Pass 1: draw every cell's fill, border, and (if applicable) checkmark,
@@ -1758,7 +1753,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
         row.eachCell({ includeEmpty: true }, (cell, cn) => {
           if (cn > maxCol) return;
 
-          const cw = (sheet.getColumn(cn).width || 10) * wf * scale;
+          const cw = (sheet.getColumn(cn).width || 10) * CHAR_WIDTH_PT * scale;
 
           if (cell.isMerged && cell.address !== cell.master.address) {
             curX += cw;
@@ -1771,9 +1766,9 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
             const mr = _findMergeRange(sheet, cell.address);
             if (mr) {
               bw = 0;
-              for (let c = mr.left; c <= mr.right; c++) bw += (sheet.getColumn(c).width || 10) * wf * scale;
+              for (let c = mr.left; c <= mr.right; c++) bw += (sheet.getColumn(c).width || 10) * CHAR_WIDTH_PT * scale;
               bh = 0;
-              for (let r = mr.top; r <= mr.bottom; r++) bh += (sheet.getRow(r).height || 15) * BASE_HEIGHT_FACTOR * scale;
+              for (let r = mr.top; r <= mr.bottom; r++) bh += (sheet.getRow(r).height || 15) * scale;
             }
           }
 
@@ -1818,7 +1813,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
               ? '#' + cell.font.color.argb.substring(2)
               : '#000000';
             doc.fillColor(color)
-               .lineWidth(Math.max(1, 1.5 * scale))
+               .lineWidth(1.5 * scale)
                .moveTo(cx - s * 0.5, cy - s * 0.05)
                .lineTo(cx - s * 0.1, cy + s * 0.4)
                .lineTo(cx + s * 0.6, cy - s * 0.3)
@@ -1840,7 +1835,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
           if (block.isCheckmark || !block.text) continue;
 
           const { x, bw, bh, text, cell, cn } = block;
-          const fontSize = ((cell.font?.size ?? 0) * 0.8 || 7) * scale;
+          const fontSize = (cell.font?.size || 7) * scale;
           const isBold   = !!cell.font?.bold;
           const isItalic = !!cell.font?.italic;
           const color    = cell.font?.color?.argb
