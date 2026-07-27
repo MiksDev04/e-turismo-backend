@@ -156,7 +156,7 @@ CREATE TABLE `guest_records` (
   `transportation_mode` varchar(255) NOT NULL,
 
   -- Lead guest: the one whose valid ID was checked
-  `lead_country` varchar(255) NOT NULL,
+  `lead_country` varchar(255) DEFAULT NULL,
   `lead_city_municipality` varchar(255) DEFAULT NULL,
   `lead_province` varchar(255) DEFAULT NULL,
   `lead_nationality` enum('Filipino','Foreign') DEFAULT NULL,
