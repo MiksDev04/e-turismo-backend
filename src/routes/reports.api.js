@@ -1545,93 +1545,70 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
 
   const c = kVarCols;
 
+  // ── Inject per-row formulas (template formulas are lost during clone) ───
+  // Match VAR-REPORT.xlsx: F=D+E, I=G+H, L=J+K, O=M+N, R=F+I+L+O
+  for (let row = kVarDataRowStart; row < kVarTotalRow; row++) {
+    sheet.getRow(row).getCell(c.totalThisCity).value  = { formula: `D${row}+E${row}` };
+    sheet.getRow(row).getCell(c.totalOtherCity).value  = { formula: `G${row}+H${row}` };
+    sheet.getRow(row).getCell(c.totalOtherProv).value  = { formula: `J${row}+K${row}` };
+    sheet.getRow(row).getCell(c.totalForeign).value    = { formula: `M${row}+N${row}` };
+    sheet.getRow(row).getCell(c.grandTotal).value      = { formula: `F${row}+I${row}+L${row}+O${row}` };
+  }
+
   // ── Write data rows (one per establishment) ──────────────────────────────
   businesses.forEach((biz, i) => {
     const rowNum = kVarDataRowStart + i;
-    if (rowNum > kVarTotalRow - 1) return; // template has 41 data rows max
+    if (rowNum > kVarTotalRow - 1) return;
 
     const vd = varDataList[i] || {};
 
-    const maleThisCity  = vd.maleThisCity || 0;
+    const maleThisCity   = vd.maleThisCity || 0;
     const femaleThisCity = vd.femaleThisCity || 0;
-    const maleOtherCity = vd.maleOtherCity || 0;
+    const maleOtherCity  = vd.maleOtherCity || 0;
     const femaleOtherCity = vd.femaleOtherCity || 0;
-    const maleOtherProv = vd.maleOtherProvince || 0;
+    const maleOtherProv  = vd.maleOtherProvince || 0;
     const femaleOtherProv = vd.femaleOtherProvince || 0;
-    const maleForeign   = vd.maleForeign || 0;
-    const femaleForeign = vd.femaleForeign || 0;
+    const maleForeign    = vd.maleForeign || 0;
+    const femaleForeign  = vd.femaleForeign || 0;
 
-    const totalThisCity   = maleThisCity + femaleThisCity;
-    const totalOtherCity  = maleOtherCity + femaleOtherCity;
-    const totalOtherProv  = maleOtherProv + femaleOtherProv;
-    const totalForeign    = maleForeign + femaleForeign;
-    const grandMale       = maleThisCity + maleOtherCity + maleOtherProv + maleForeign;
-    const grandFemale     = femaleThisCity + femaleOtherCity + femaleOtherProv + femaleForeign;
-    const grandTotal      = totalThisCity + totalOtherCity + totalOtherProv + totalForeign;
+    const grandMale   = maleThisCity + maleOtherCity + maleOtherProv + maleForeign;
+    const grandFemale = femaleThisCity + femaleOtherCity + femaleOtherProv + femaleForeign;
 
-    sheet.getRow(rowNum).getCell(c.name).value       = biz.business_name;
-    sheet.getRow(rowNum).getCell(c.attrCode).value    = '9-902';
+    sheet.getRow(rowNum).getCell(c.name).value          = biz.business_name;
+    sheet.getRow(rowNum).getCell(c.attrCode).value      = '9-902';
     sheet.getRow(rowNum).getCell(c.maleThisCity).value   = maleThisCity || 0;
     sheet.getRow(rowNum).getCell(c.femaleThisCity).value  = femaleThisCity || 0;
-    sheet.getRow(rowNum).getCell(c.totalThisCity).value   = totalThisCity;
     sheet.getRow(rowNum).getCell(c.maleOtherCity).value   = maleOtherCity || 0;
     sheet.getRow(rowNum).getCell(c.femaleOtherCity).value  = femaleOtherCity || 0;
-    sheet.getRow(rowNum).getCell(c.totalOtherCity).value   = totalOtherCity;
     sheet.getRow(rowNum).getCell(c.maleOtherProv).value   = maleOtherProv || 0;
     sheet.getRow(rowNum).getCell(c.femaleOtherProv).value  = femaleOtherProv || 0;
-    sheet.getRow(rowNum).getCell(c.totalOtherProv).value   = totalOtherProv;
     sheet.getRow(rowNum).getCell(c.maleForeign).value     = maleForeign || 0;
     sheet.getRow(rowNum).getCell(c.femaleForeign).value    = femaleForeign || 0;
-    sheet.getRow(rowNum).getCell(c.totalForeign).value     = totalForeign;
     sheet.getRow(rowNum).getCell(c.grandMale).value        = grandMale;
     sheet.getRow(rowNum).getCell(c.grandFemale).value      = grandFemale;
-    sheet.getRow(rowNum).getCell(c.grandTotal).value       = grandTotal;
-
   });
 
-  // ── Write total row (row 57) ────────────────────────────────────────────
+  // ── Write total row (row 57) with SUM formulas ──────────────────────────
+  // Match VAR-REPORT.xlsx: SUM for D,E,F,I,J,K,L,O,P,Q,R; static 0 for G,H,M,N
   const totalRow = sheet.getRow(kVarTotalRow);
-  let sumMaleThisCity = 0, sumFemaleThisCity = 0;
-  let sumMaleOtherCity = 0, sumFemaleOtherCity = 0;
-  let sumMaleOtherProv = 0, sumFemaleOtherProv = 0;
-  let sumMaleForeign = 0, sumFemaleForeign = 0;
+  const lastDataRow = kVarTotalRow - 1;
+  const sumFormula = (col) => ({ formula: `SUM(${col}${kVarDataRowStart}:${col}${lastDataRow})` });
 
-  businesses.forEach((biz, i) => {
-    const rowNum = kVarDataRowStart + i;
-    if (rowNum > kVarTotalRow - 1) return;
-    sumMaleThisCity   += (sheet.getRow(rowNum).getCell(c.maleThisCity).value) || 0;
-    sumFemaleThisCity  += (sheet.getRow(rowNum).getCell(c.femaleThisCity).value) || 0;
-    sumMaleOtherCity  += (sheet.getRow(rowNum).getCell(c.maleOtherCity).value) || 0;
-    sumFemaleOtherCity += (sheet.getRow(rowNum).getCell(c.femaleOtherCity).value) || 0;
-    sumMaleOtherProv  += (sheet.getRow(rowNum).getCell(c.maleOtherProv).value) || 0;
-    sumFemaleOtherProv += (sheet.getRow(rowNum).getCell(c.femaleOtherProv).value) || 0;
-    sumMaleForeign    += (sheet.getRow(rowNum).getCell(c.maleForeign).value) || 0;
-    sumFemaleForeign  += (sheet.getRow(rowNum).getCell(c.femaleForeign).value) || 0;
-  });
-
-  const sumTotalThisCity  = sumMaleThisCity + sumFemaleThisCity;
-  const sumTotalOtherCity = sumMaleOtherCity + sumFemaleOtherCity;
-  const sumTotalOtherProv = sumMaleOtherProv + sumFemaleOtherProv;
-  const sumTotalForeign   = sumMaleForeign + sumFemaleForeign;
-  const sumGrandMale      = sumMaleThisCity + sumMaleOtherCity + sumMaleOtherProv + sumMaleForeign;
-  const sumGrandFemale    = sumFemaleThisCity + sumFemaleOtherCity + sumFemaleOtherProv + sumFemaleForeign;
-  const sumGrandTotal     = sumTotalThisCity + sumTotalOtherCity + sumTotalOtherProv + sumTotalForeign;
-
-  totalRow.getCell(c.maleThisCity).value   = sumMaleThisCity;
-  totalRow.getCell(c.femaleThisCity).value  = sumFemaleThisCity;
-  totalRow.getCell(c.totalThisCity).value   = sumTotalThisCity;
-  totalRow.getCell(c.maleOtherCity).value   = sumMaleOtherCity;
-  totalRow.getCell(c.femaleOtherCity).value  = sumFemaleOtherCity;
-  totalRow.getCell(c.totalOtherCity).value   = sumTotalOtherCity;
-  totalRow.getCell(c.maleOtherProv).value   = sumMaleOtherProv;
-  totalRow.getCell(c.femaleOtherProv).value  = sumFemaleOtherProv;
-  totalRow.getCell(c.totalOtherProv).value   = sumTotalOtherProv;
-  totalRow.getCell(c.maleForeign).value     = sumMaleForeign;
-  totalRow.getCell(c.femaleForeign).value    = sumFemaleForeign;
-  totalRow.getCell(c.totalForeign).value     = sumTotalForeign;
-  totalRow.getCell(c.grandMale).value        = sumGrandMale;
-  totalRow.getCell(c.grandFemale).value      = sumGrandFemale;
-  totalRow.getCell(c.grandTotal).value       = sumGrandTotal;
+  totalRow.getCell(c.maleThisCity).value   = sumFormula('D');
+  totalRow.getCell(c.femaleThisCity).value  = sumFormula('E');
+  totalRow.getCell(c.totalThisCity).value   = sumFormula('F');
+  totalRow.getCell(c.maleOtherCity).value   = 0;
+  totalRow.getCell(c.femaleOtherCity).value  = 0;
+  totalRow.getCell(c.totalOtherCity).value   = sumFormula('I');
+  totalRow.getCell(c.maleOtherProv).value   = sumFormula('J');
+  totalRow.getCell(c.femaleOtherProv).value  = sumFormula('K');
+  totalRow.getCell(c.totalOtherProv).value   = sumFormula('L');
+  totalRow.getCell(c.maleForeign).value     = 0;
+  totalRow.getCell(c.femaleForeign).value    = 0;
+  totalRow.getCell(c.totalForeign).value     = sumFormula('O');
+  totalRow.getCell(c.grandMale).value        = sumFormula('P');
+  totalRow.getCell(c.grandFemale).value      = sumFormula('Q');
+  totalRow.getCell(c.grandTotal).value       = sumFormula('R');
 
 }
 
