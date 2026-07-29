@@ -1307,18 +1307,8 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   });
   setDayValues(r.guestNights, d => md.guestNightsByDay[d] || null);
 
-  setDayValues(r.occupancyRate, d => {
-    const totalRooms = biz.total_rooms || 0;
-    if (!totalRooms) return null;
-    const occupied = md.roomsOccupied[d] || 0;
-    if (!occupied) return null;
-    return parseFloat((occupied / totalRooms * 100).toFixed(2));
-  });
-  setDayValues(r.alos, d => {
-    const arrivals = Object.values(md.residentsByDay[d] || {}).reduce((a, b) => a + b, 0);
-    if (!arrivals) return null;
-    return parseFloat(((md.guestNightsPerArrivalDay[d] || 0) / arrivals).toFixed(2));
-  });
+  setDayValues(r.occupancyRate, _ => null);
+  setDayValues(r.alos, _ => null);
 
   const setSexValues = (rowStart, gender) => {
     setDayValues(rowStart + 1, d => sex(d, gender, 'philippine_resident_filipino') + sex(d, gender, 'philippine_resident_foreign'));
@@ -1377,15 +1367,8 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   writeTotal(r.roomsOccupied, totalRoomsOccAll);
   writeTotal(r.roomsAvailable, totalRoomsAvail > 0 ? totalRoomsAvail - totalRoomsOccAll : null);
   writeTotal(r.guestNights, md.guestNights);
-  writeTotal(r.occupancyRate, totalRoomsAvail > 0
-    ? parseFloat((totalRoomsOccAll / totalRoomsAvail * 100).toFixed(2))
-    : null
-  );
-  const grandTotalArrivals = Object.values(md.residentsByDay[0] ?? {}).reduce((a, b) => a + b, 0);
-  writeTotal(r.alos, grandTotalArrivals > 0
-    ? parseFloat((md.guestNights / grandTotalArrivals).toFixed(2))
-    : null
-  );
+  writeTotal(r.occupancyRate);
+  writeTotal(r.alos);
 
   writeTotal(r.maleStart + 1, sex(0, 'male', 'philippine_resident_filipino') + sex(0, 'male', 'philippine_resident_foreign'));
   writeTotal(r.maleStart + 2, sex(0, 'male', 'listed_foreign_resident') + sex(0, 'male', 'unlisted_foreign_resident') + sex(0, 'male', 'unspecified_guest'));
@@ -1470,12 +1453,8 @@ function _buildCountrySummarySheet(sheet, md, totalRoomsAll, month, year, daysIn
   sheet.getCell(`B${r.roomsAvailable}`).value = totalRoomsAvail > 0 ? totalRoomsAvail - totalRoomsOcc : 0;
   sheet.getCell(`B${r.guestNights}`).value = md.guestNights ?? 0;
 
-  sheet.getCell(`B${r.occupancyRate}`).value = totalRoomsAvail > 0
-    ? parseFloat((totalRoomsOcc / totalRoomsAvail * 100).toFixed(2))
-    : 0;
-  sheet.getCell(`B${r.alos}`).value = grandTotal > 0
-    ? parseFloat((md.guestNights / grandTotal).toFixed(2))
-    : 0;
+  sheet.getCell(`B${r.occupancyRate}`).value = 0;
+  sheet.getCell(`B${r.alos}`).value = 0;
 
   const setSexValues = (rowStart, gender) => {
     sheet.getCell(`B${rowStart + 1}`).value = (sex(gender, 'philippine_resident_filipino') + sex(gender, 'philippine_resident_foreign')) ?? 0;
@@ -1608,34 +1587,15 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   setMonthValues(r.guestNights, m => mdFor(m).guestNights);
 
   for (let i = 0; i < allMonths.length; i++) {
-    const m = allMonths[i].month;
-    const daysInM    = new Date(year, m, 0).getDate();
-    const totalAvail = totalRoomsAll * daysInM;
-    const totalOcc   = Object.values(mdFor(m).roomsOccupied).reduce((a, b) => a + b, 0);
-    sheet.getCell(r.occupancyRate, i + 2).value = totalAvail > 0 && totalOcc > 0
-      ? parseFloat((totalOcc / totalAvail * 100).toFixed(2))
-      : null;
-
-    const md = mdFor(m).residentsByDay[0] || {};
-    const gt =
-      (md.philippine_resident_filipino || 0) +
-      (md.philippine_resident_foreign || 0) +
-      (md.listed_foreign_resident || 0) +
-      (md.unlisted_foreign_resident || 0) +
-      (md.unspecified_guest || 0) +
-      (md.overseas_filipino || 0);
-    sheet.getCell(r.alos, i + 2).value = gt > 0
-      ? parseFloat((mdFor(m).guestNights / gt).toFixed(2))
-      : null;
+    sheet.getCell(r.occupancyRate, i + 2).value = null;
+    sheet.getCell(r.alos, i + 2).value = null;
   }
 
-  // Yearly totals for metrics — use AVERAGE formula per template
   const lastCol = allMonths.length + 2;
   const _firstCol = _colLetter(2);
   const _lastMonthCol = _colLetter(allMonths.length + 1);
-  sheet.getCell(r.occupancyRate, lastCol).value = { formula: `AVERAGE(${_firstCol}${r.occupancyRate}:${_lastMonthCol}${r.occupancyRate})` };
-
-  sheet.getCell(r.alos, lastCol).value = { formula: `AVERAGE(${_firstCol}${r.alos}:${_lastMonthCol}${r.alos})` };
+  sheet.getCell(r.occupancyRate, lastCol).value = 0;
+  sheet.getCell(r.alos, lastCol).value = 0;
 
   const setMonthlySexValues = (rowStart, gender) => {
     setMonthValues(rowStart + 1, m => (mSex(m, gender, 'philippine_resident_filipino') + mSex(m, gender, 'philippine_resident_foreign')) || null);
