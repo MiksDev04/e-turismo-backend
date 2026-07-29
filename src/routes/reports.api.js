@@ -718,7 +718,7 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
 router.post('/reports/download', adminGuard, async (req, res, next) => {
   // TODO: large annual series across many establishments may be slow on free tier
   try {
-    const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx' } = req.body;
+    const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx', pageWidth, pageHeight } = req.body;
 
     if (!['dae', 'var'].includes(reportType)) {
       return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
@@ -887,7 +887,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     } else {
       // Evaluate all formulas so the PDF renderer can read cached results
       wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
-      const pdfBuffer = await _generatePdfBuffer(wb, effectiveVariant, sortedMonths[0], year, reportType);
+      const pdfBuffer = await _generatePdfBuffer(wb, effectiveVariant, sortedMonths[0], year, reportType, { pageWidth, pageHeight });
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
       res.set('Content-Type', 'application/pdf');
       res.set('Content-Disposition', `attachment; filename="${baseFilename}.pdf"`);
@@ -1845,14 +1845,20 @@ function _getSheetPdfConfig(sheetName, reportType) {
 
 // ─── PDF Generation (returns Buffer instead of writing to file) ──────────────
 
-async function _generatePdfBuffer(workbook, variant, month, year, reportType = 'dae') {
+async function _generatePdfBuffer(workbook, variant, month, year, reportType = 'dae', options = {}) {
   const sheets = [];
   workbook.eachSheet(sheet => sheets.push(sheet));
 
-  const pdfConfig = reportType === 'var' ? SHEET_PDF_CONFIG.var
+  const pdfConfig = { ...(reportType === 'var' ? SHEET_PDF_CONFIG.var
     : variant === 'summary' ? SHEET_PDF_CONFIG.sum
     : variant === 'series' ? SHEET_PDF_CONFIG.monthly
-    : SHEET_PDF_CONFIG.daily;
+    : SHEET_PDF_CONFIG.daily) };
+
+  const { pageWidth, pageHeight } = options;
+  if (pageWidth != null && pageHeight != null) {
+    pdfConfig.size = [pageWidth, pageHeight];
+    pdfConfig.layout = 'portrait';
+  }
 
   const doc = new PDFDocument({
     layout: pdfConfig.layout,
@@ -1869,7 +1875,10 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
   const CHAR_WIDTH_PT = 5.25;
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 } };
-  const _pageSize = name => PAGE_DIMS[name] || PAGE_DIMS.A3;
+  const _pageSize = (size) => {
+    if (Array.isArray(size)) return { w: size[0], h: size[1] };
+    return PAGE_DIMS[size] || PAGE_DIMS.A3;
+  };
 
   let isFirstSheet = true;
 
