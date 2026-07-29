@@ -180,6 +180,58 @@ const kRegionalGroups = [
 // so the grand-total column is col AG (33).  The PDF renderer also stops at 33.
 const kTotalCol = 33;
 
+// ─── Daily Sheet Formula Mappings ────────────────────────────────────────────
+// Subtotal rows: each day column gets a SUM formula referencing component rows.
+const kDailySubtotalFormulas = {
+  30: { start: 28, end: 29 },    // PH Res Total
+  45: { start: 36, end: 44 },    // ASEAN
+  53: { start: 48, end: 52 },    // East Asia
+  62: { start: 56, end: 61 },    // South Asia
+  73: { start: 66, end: 72 },    // Middle East
+  80: { start: 77, end: 79 },    // North America
+  88: { start: 83, end: 87 },    // South America
+  99: { start: 92, end: 98 },    // Western Europe
+  108: { start: 102, end: 107 }, // Northern Europe
+  116: { start: 111, end: 115 }, // Southern Europe
+  122: { start: 119, end: 121 }, // Eastern Europe
+  131: { start: 126, end: 130 }, // Australasia
+  136: { start: 134, end: 135 }, // Africa
+};
+// Special rows: each day column gets an additive formula referencing specific rows.
+const kDailySpecialFormulas = {
+  141: [139, 136, 131, 122, 116, 108, 99, 88, 80, 73, 62, 53, 45], // Total Foreign
+  145: [143, 141, 30, 149],   // Grand Total
+  146: [30],                    // Summary PH Total (alias)
+  147: [141],                   // Summary Foreign Total (alias)
+  148: [143],                   // Summary Overseas Total (alias)
+};
+
+// ─── Monthly Sheet Formula Mappings ──────────────────────────────────────────
+const kMonthlySubtotalFormulas = {
+  30: { start: 28, end: 29 },
+  45: { start: 36, end: 44 },
+  53: { start: 48, end: 52 },
+  62: { start: 56, end: 61 },
+  72: { start: 65, end: 71 },
+  80: { start: 77, end: 79 },
+  88: { start: 83, end: 87 },
+  99: { start: 92, end: 98 },
+  108: { start: 102, end: 107 },
+  116: { start: 111, end: 115 },
+  122: { start: 119, end: 121 },
+  130: { start: 125, end: 129 },
+  137: { start: 135, end: 136 },
+};
+const kMonthlySpecialFormulas = {
+  142: [140, 137, 130, 122, 116, 108, 99, 88, 80, 72, 62, 53, 45],
+  147: [30],
+  148: [142],
+  149: [144],
+};
+const kMonthlyRangeFormulas = {
+  146: { start: 147, end: 149 }, // Grand Total = SUM(B147:B149)
+};
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function _classifyResidenceBucket({ country, nationality, isOverseas }) {
@@ -218,6 +270,17 @@ function _parseLocalDate(dateStr) {
   return new Date(y, mo - 1, d); // local midnight — getDate() is always correct
 }
 
+function _colLetter(colNum) {
+  let result = '';
+  let n = colNum;
+  while (n > 0) {
+    n--;
+    result = String.fromCharCode(65 + (n % 26)) + result;
+    n = Math.floor(n / 26);
+  }
+  return result;
+}
+
 // Returns the arrival count for foreign-resident countries NOT in kCountryRows
 // for a given day key (0 = grand total, 1-31 = that calendar day).
 function _otherCountriesTotal(countryByDay, dayKey) {
@@ -237,6 +300,96 @@ function _purgeOrphanedDefinedNames(workbook) {
   } catch (err) {
     console.warn('[report] Named-range cleanup skipped:', err.message);
   }
+}
+
+// ─── Formula Evaluator for PDF rendering ──────────────────────────────────────
+// ExcelJS does not compute formula results.  The xlsx writer stores the formula
+// string so Excel can compute on open, but the PDF renderer needs a cached
+// result.  This evaluator handles the three simple formula patterns used in
+// this codebase:  SUM(range), AVERAGE(range), and cellRef+cellRef+…
+
+function _colLetterToNum(letter) {
+  let result = 0;
+  for (let i = 0; i < letter.length; i++) {
+    result = result * 26 + (letter.charCodeAt(i) - 64);
+  }
+  return result;
+}
+
+function _parseCellRef(ref) {
+  const m = ref.match(/^([A-Z]+)(\d+)$/);
+  if (!m) return null;
+  return { col: _colLetterToNum(m[1]), row: parseInt(m[2], 10) };
+}
+
+function _parseRange(range) {
+  const [start, end] = range.split(':');
+  const s = _parseCellRef(start);
+  const e = _parseCellRef(end);
+  if (!s || !e) return [];
+  const cells = [];
+  for (let r = s.row; r <= e.row; r++) {
+    for (let c = s.col; c <= e.col; c++) {
+      cells.push({ row: r, col: c });
+    }
+  }
+  return cells;
+}
+
+function _evaluateFormulasInSheet(sheet) {
+  function _ensureEvaluated(row, col) {
+    const cell = sheet.getCell(row, col);
+    if (!cell.value || typeof cell.value !== 'object') return;
+    if (!cell.value.formula) return;
+    if (cell.value.result !== undefined && cell.value.result !== null) return;
+    _evaluateCell(cell);
+  }
+
+  function _cellNum(row, col) {
+    _ensureEvaluated(row, col);
+    const v = sheet.getCell(row, col).value;
+    if (v === null || v === undefined) return 0;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'object') {
+      if (v.result !== undefined && v.result !== null) return Number(v.result) || 0;
+    }
+    return Number(v) || 0;
+  }
+
+  function _evaluateCell(cell) {
+    const formula = cell.value.formula;
+    let result = 0;
+
+    const sumMatch = formula.match(/^SUM\(([A-Z]+\d+):([A-Z]+\d+)\)$/);
+    const avgMatch = formula.match(/^AVERAGE\(([A-Z]+\d+):([A-Z]+\d+)\)$/);
+
+    if (sumMatch) {
+      const cells = _parseRange(`${sumMatch[1]}:${sumMatch[2]}`);
+      result = cells.reduce((s, rc) => s + _cellNum(rc.row, rc.col), 0);
+    } else if (avgMatch) {
+      const cells = _parseRange(`${avgMatch[1]}:${avgMatch[2]}`);
+      const vals = cells.map(rc => _cellNum(rc.row, rc.col));
+      result = vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+    } else {
+      // cellRef+cellRef+…  (addition only)
+      const parts = formula.split('+');
+      result = parts.reduce((s, p) => {
+        const ref = _parseCellRef(p.trim());
+        return s + (ref ? _cellNum(ref.row, ref.col) : 0);
+      }, 0);
+    }
+
+    cell.value = { formula, result };
+  }
+
+  sheet.eachRow({ includeEmpty: true }, (row) => {
+    row.eachCell({ includeEmpty: true }, (cell) => {
+      if (cell.value && typeof cell.value === 'object' && cell.value.formula
+          && (cell.value.result === undefined || cell.value.result === null)) {
+        _evaluateCell(cell);
+      }
+    });
+  });
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -732,6 +885,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       res.set('Content-Disposition', `attachment; filename="${baseFilename}.xlsx"`);
       res.send(Buffer.from(buffer));
     } else {
+      // Evaluate all formulas so the PDF renderer can read cached results
+      wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
       const pdfBuffer = await _generatePdfBuffer(wb, effectiveVariant, sortedMonths[0], year, reportType);
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
       res.set('Content-Type', 'application/pdf');
@@ -1094,10 +1249,20 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   const _subtotalTotalRows = new Set([30, 45, 53, 62, 73, 80, 88, 99, 108, 116, 122, 131, 136, 139, 141, 143, 145, 146, 147, 148]);
   const setDayValues = (rowNum, fn) => {
     const useZero = _subtotalTotalRows.has(rowNum);
+    const subForm = kDailySubtotalFormulas[rowNum];
+    const specForm = kDailySpecialFormulas[rowNum];
     for (let d = 1; d <= 31; d++) {
       if (d > daysInMonth) { sheet.getCell(rowNum, d + 1).value = null; continue; }
-      const v = fn(d);
-      sheet.getCell(rowNum, d + 1).value = useZero ? (v ?? 0) : (v || null);
+      if (subForm) {
+        const col = _colLetter(d + 1);
+        sheet.getCell(rowNum, d + 1).value = { formula: `SUM(${col}${subForm.start}:${col}${subForm.end})` };
+      } else if (specForm) {
+        const col = _colLetter(d + 1);
+        sheet.getCell(rowNum, d + 1).value = { formula: specForm.map(ref => `${col}${ref}`).join('+') };
+      } else {
+        const v = fn(d);
+        sheet.getCell(rowNum, d + 1).value = useZero ? (v ?? 0) : (v || null);
+      }
     }
   };
 
@@ -1173,8 +1338,8 @@ function _buildDailySheet(sheet, biz, md, month, year, daysInMonth, adminName) {
   setSexValues(r.femaleStart, 'female');
 
   // ── Total column (AG = kTotalCol) ──────────────────────────────────────────
-  const writeTotal = (rowNum, value) => {
-    sheet.getCell(rowNum, kTotalCol).value = value ?? 0;
+  const writeTotal = (rowNum) => {
+    sheet.getCell(rowNum, kTotalCol).value = { formula: `SUM(B${rowNum}:AF${rowNum})` };
   };
 
   const phTotal = (md.residentsByDay[0]?.['philippine_resident_filipino'] ?? 0) + 
@@ -1356,13 +1521,31 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   const _sumTotalRows = new Set([30, 45, 53, 62, 72, 80, 88, 99, 108, 116, 122, 130, 137, 140, 142, 144, 146, 147, 148, 149, 150, 159, 160]);
   const setMonthValues = (rowNum, fn) => {
     const useZero = _sumTotalRows.has(rowNum);
-    let yearTotal = 0;
+    const subForm = kMonthlySubtotalFormulas[rowNum];
+    const specForm = kMonthlySpecialFormulas[rowNum];
+    const rangeForm = kMonthlyRangeFormulas[rowNum];
     for (let i = 0; i < allMonths.length; i++) {
-      const val = fn(allMonths[i].month);
-      sheet.getCell(rowNum, i + 2).value = useZero ? (val ?? 0) : (val || null);
-      if (typeof val === 'number') yearTotal += val;
+      const col = _colLetter(i + 2);
+      if (subForm) {
+        sheet.getCell(rowNum, i + 2).value = { formula: `SUM(${col}${subForm.start}:${col}${subForm.end})` };
+      } else if (rangeForm) {
+        sheet.getCell(rowNum, i + 2).value = { formula: `SUM(${col}${rangeForm.start}:${col}${rangeForm.end})` };
+      } else if (specForm) {
+        sheet.getCell(rowNum, i + 2).value = { formula: specForm.map(ref => `${col}${ref}`).join('+') };
+      } else {
+        const val = fn(allMonths[i].month);
+        sheet.getCell(rowNum, i + 2).value = useZero ? (val ?? 0) : (val || null);
+      }
     }
-    sheet.getCell(rowNum, allMonths.length + 2).value = yearTotal ?? 0;
+    // Year total column — inject formula instead of pre-computed value
+    const totalCol = allMonths.length + 2;
+    const firstCol = _colLetter(2);
+    const lastCol = _colLetter(allMonths.length + 1);
+    if (rowNum === 159 || rowNum === 160) {
+      sheet.getCell(rowNum, totalCol).value = { formula: `AVERAGE(${firstCol}${rowNum}:${lastCol}${rowNum})` };
+    } else {
+      sheet.getCell(rowNum, totalCol).value = { formula: `SUM(${firstCol}${rowNum}:${lastCol}${rowNum})` };
+    }
   };
 
   const mdFor = m => allMonths.find(x => x.month === m) || {
@@ -1446,24 +1629,13 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
       : null;
   }
 
-  // Yearly totals for metrics
+  // Yearly totals for metrics — use AVERAGE formula per template
   const lastCol = allMonths.length + 2;
-  const yrOccTotal = allMonths.reduce((sum, m) => sum + Object.values(m.roomsOccupied).reduce((a, b) => a + b, 0), 0);
-  const yrAvailTotal = allMonths.reduce((sum, m) => sum + totalRoomsAll * new Date(year, m.month, 0).getDate(), 0);
-  sheet.getCell(r.occupancyRate, lastCol).value = yrAvailTotal > 0 && yrOccTotal > 0
-    ? parseFloat((yrOccTotal / yrAvailTotal * 100).toFixed(2))
-    : 0;
+  const _firstCol = _colLetter(2);
+  const _lastMonthCol = _colLetter(allMonths.length + 1);
+  sheet.getCell(r.occupancyRate, lastCol).value = { formula: `AVERAGE(${_firstCol}${r.occupancyRate}:${_lastMonthCol}${r.occupancyRate})` };
 
-  const yrArrivals = allMonths.reduce((sum, m) => {
-    const md = m.residentsByDay[0] || {};
-    return sum + (md.philippine_resident_filipino || 0) + (md.philippine_resident_foreign || 0) +
-           (md.listed_foreign_resident || 0) + (md.unlisted_foreign_resident || 0) + 
-           (md.unspecified_guest || 0) + (md.overseas_filipino || 0);
-  }, 0);
-  const yrNights = allMonths.reduce((sum, m) => sum + m.guestNights, 0);
-  sheet.getCell(r.alos, lastCol).value = yrArrivals > 0
-    ? parseFloat((yrNights / yrArrivals).toFixed(2))
-    : 0;
+  sheet.getCell(r.alos, lastCol).value = { formula: `AVERAGE(${_firstCol}${r.alos}:${_lastMonthCol}${r.alos})` };
 
   const setMonthlySexValues = (rowStart, gender) => {
     setMonthValues(rowStart + 1, m => (mSex(m, gender, 'philippine_resident_filipino') + mSex(m, gender, 'philippine_resident_foreign')) || null);
@@ -1545,70 +1717,114 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
 
   const c = kVarCols;
 
-  // ── Inject per-row formulas (template formulas are lost during clone) ───
-  // Match VAR-REPORT.xlsx: F=D+E, I=G+H, L=J+K, O=M+N, R=F+I+L+O
+  // ── Inject default per-row formulas (evaluated later for PDF) ─────────────
+  // Formulas get no cached result — _evaluateFormulasInSheet computes them
+  // before PDF rendering.  Business rows below overwrite with the actual data.
   for (let row = kVarDataRowStart; row < kVarTotalRow; row++) {
     sheet.getRow(row).getCell(c.totalThisCity).value  = { formula: `D${row}+E${row}` };
     sheet.getRow(row).getCell(c.totalOtherCity).value  = { formula: `G${row}+H${row}` };
     sheet.getRow(row).getCell(c.totalOtherProv).value  = { formula: `J${row}+K${row}` };
     sheet.getRow(row).getCell(c.totalForeign).value    = { formula: `M${row}+N${row}` };
+    sheet.getRow(row).getCell(c.grandMale).value       = { formula: `D${row}+G${row}+J${row}+M${row}` };
+    sheet.getRow(row).getCell(c.grandFemale).value     = { formula: `E${row}+H${row}+K${row}+N${row}` };
     sheet.getRow(row).getCell(c.grandTotal).value      = { formula: `F${row}+I${row}+L${row}+O${row}` };
   }
 
   // ── Write data rows (one per establishment) ──────────────────────────────
+  // Input columns D,E,G,H,J,K,M,N get raw numbers.  Computed columns
+  // F,I,L,O,P,Q,R get formula + cached JS result (for PDF rendering).
   businesses.forEach((biz, i) => {
     const rowNum = kVarDataRowStart + i;
     if (rowNum > kVarTotalRow - 1) return;
 
     const vd = varDataList[i] || {};
 
-    const maleThisCity   = vd.maleThisCity || 0;
-    const femaleThisCity = vd.femaleThisCity || 0;
-    const maleOtherCity  = vd.maleOtherCity || 0;
+    const maleThisCity    = vd.maleThisCity || 0;
+    const femaleThisCity  = vd.femaleThisCity || 0;
+    const maleOtherCity   = vd.maleOtherCity || 0;
     const femaleOtherCity = vd.femaleOtherCity || 0;
-    const maleOtherProv  = vd.maleOtherProvince || 0;
+    const maleOtherProv   = vd.maleOtherProvince || 0;
     const femaleOtherProv = vd.femaleOtherProvince || 0;
-    const maleForeign    = vd.maleForeign || 0;
-    const femaleForeign  = vd.femaleForeign || 0;
+    const maleForeign     = vd.maleForeign || 0;
+    const femaleForeign   = vd.femaleForeign || 0;
 
-    const grandMale   = maleThisCity + maleOtherCity + maleOtherProv + maleForeign;
-    const grandFemale = femaleThisCity + femaleOtherCity + femaleOtherProv + femaleForeign;
+    const totalThisCity   = maleThisCity + femaleThisCity;
+    const totalOtherCity  = maleOtherCity + femaleOtherCity;
+    const totalOtherProv  = maleOtherProv + femaleOtherProv;
+    const totalForeign    = maleForeign + femaleForeign;
+    const grandMale       = maleThisCity + maleOtherCity + maleOtherProv + maleForeign;
+    const grandFemale     = femaleThisCity + femaleOtherCity + femaleOtherProv + femaleForeign;
+    const grandTotal      = totalThisCity + totalOtherCity + totalOtherProv + totalForeign;
 
-    sheet.getRow(rowNum).getCell(c.name).value          = biz.business_name;
-    sheet.getRow(rowNum).getCell(c.attrCode).value      = '9-902';
-    sheet.getRow(rowNum).getCell(c.maleThisCity).value   = maleThisCity || 0;
-    sheet.getRow(rowNum).getCell(c.femaleThisCity).value  = femaleThisCity || 0;
-    sheet.getRow(rowNum).getCell(c.maleOtherCity).value   = maleOtherCity || 0;
-    sheet.getRow(rowNum).getCell(c.femaleOtherCity).value  = femaleOtherCity || 0;
-    sheet.getRow(rowNum).getCell(c.maleOtherProv).value   = maleOtherProv || 0;
-    sheet.getRow(rowNum).getCell(c.femaleOtherProv).value  = femaleOtherProv || 0;
-    sheet.getRow(rowNum).getCell(c.maleForeign).value     = maleForeign || 0;
-    sheet.getRow(rowNum).getCell(c.femaleForeign).value    = femaleForeign || 0;
-    sheet.getRow(rowNum).getCell(c.grandMale).value        = grandMale;
-    sheet.getRow(rowNum).getCell(c.grandFemale).value      = grandFemale;
+    sheet.getRow(rowNum).getCell(c.name).value           = biz.business_name;
+    sheet.getRow(rowNum).getCell(c.attrCode).value       = '9-902';
+    sheet.getRow(rowNum).getCell(c.maleThisCity).value    = maleThisCity || null;
+    sheet.getRow(rowNum).getCell(c.femaleThisCity).value   = femaleThisCity || null;
+    sheet.getRow(rowNum).getCell(c.maleOtherCity).value    = maleOtherCity || null;
+    sheet.getRow(rowNum).getCell(c.femaleOtherCity).value   = femaleOtherCity || null;
+    sheet.getRow(rowNum).getCell(c.maleOtherProv).value    = maleOtherProv || null;
+    sheet.getRow(rowNum).getCell(c.femaleOtherProv).value   = femaleOtherProv || null;
+    sheet.getRow(rowNum).getCell(c.maleForeign).value      = maleForeign || null;
+    sheet.getRow(rowNum).getCell(c.femaleForeign).value     = femaleForeign || null;
+    // Override default with formula (evaluated by _evaluateFormulasInSheet for PDF)
+    sheet.getRow(rowNum).getCell(c.totalThisCity).value   = { formula: `D${rowNum}+E${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalOtherCity).value  = { formula: `G${rowNum}+H${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalOtherProv).value  = { formula: `J${rowNum}+K${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalForeign).value    = { formula: `M${rowNum}+N${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandMale).value       = { formula: `D${rowNum}+G${rowNum}+J${rowNum}+M${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandFemale).value     = { formula: `E${rowNum}+H${rowNum}+K${rowNum}+N${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandTotal).value      = { formula: `F${rowNum}+I${rowNum}+L${rowNum}+O${rowNum}` };
   });
 
-  // ── Write total row (row 57) with SUM formulas ──────────────────────────
-  // Match VAR-REPORT.xlsx: SUM for D,E,F,I,J,K,L,O,P,Q,R; static 0 for G,H,M,N
+  // ── Write total row (row 57) with SUM formulas ────────────────────────────
+  // Formulas are evaluated by _evaluateFormulasInSheet before PDF rendering.
   const totalRow = sheet.getRow(kVarTotalRow);
   const lastDataRow = kVarTotalRow - 1;
-  const sumFormula = (col) => ({ formula: `SUM(${col}${kVarDataRowStart}:${col}${lastDataRow})` });
 
-  totalRow.getCell(c.maleThisCity).value   = sumFormula('D');
-  totalRow.getCell(c.femaleThisCity).value  = sumFormula('E');
-  totalRow.getCell(c.totalThisCity).value   = sumFormula('F');
-  totalRow.getCell(c.maleOtherCity).value   = 0;
-  totalRow.getCell(c.femaleOtherCity).value  = 0;
-  totalRow.getCell(c.totalOtherCity).value   = sumFormula('I');
-  totalRow.getCell(c.maleOtherProv).value   = sumFormula('J');
-  totalRow.getCell(c.femaleOtherProv).value  = sumFormula('K');
-  totalRow.getCell(c.totalOtherProv).value   = sumFormula('L');
-  totalRow.getCell(c.maleForeign).value     = 0;
-  totalRow.getCell(c.femaleForeign).value    = 0;
-  totalRow.getCell(c.totalForeign).value     = sumFormula('O');
-  totalRow.getCell(c.grandMale).value        = sumFormula('P');
-  totalRow.getCell(c.grandFemale).value      = sumFormula('Q');
-  totalRow.getCell(c.grandTotal).value       = sumFormula('R');
+  const _sumCol = (col) => {
+    let total = 0;
+    for (let r = kVarDataRowStart; r <= lastDataRow; r++) {
+      const cell = sheet.getCell(r, col);
+      const v = cell.value;
+      if (v === null || v === undefined) continue;
+      if (typeof v === 'number') total += v;
+      else if (typeof v === 'object' && v.result !== undefined && v.result !== null) total += Number(v.result) || 0;
+    }
+    return total;
+  };
+
+  const dTotal = _sumCol(c.maleThisCity);
+  const eTotal = _sumCol(c.femaleThisCity);
+  const gTotal = _sumCol(c.maleOtherCity);
+  const hTotal = _sumCol(c.femaleOtherCity);
+  const jTotal = _sumCol(c.maleOtherProv);
+  const kTotal = _sumCol(c.femaleOtherProv);
+  const mTotal = _sumCol(c.maleForeign);
+  const nTotal = _sumCol(c.femaleForeign);
+
+  const fTotal = dTotal + eTotal;
+  const iTotal = gTotal + hTotal;
+  const lTotal = jTotal + kTotal;
+  const oTotal = mTotal + nTotal;
+  const pTotal = dTotal + gTotal + jTotal + mTotal;
+  const qTotal = eTotal + hTotal + kTotal + nTotal;
+  const rTotal = fTotal + iTotal + lTotal + oTotal;
+
+  totalRow.getCell(c.maleThisCity).value   = { formula: `SUM(D${kVarDataRowStart}:D${lastDataRow})` };
+  totalRow.getCell(c.femaleThisCity).value  = { formula: `SUM(E${kVarDataRowStart}:E${lastDataRow})` };
+  totalRow.getCell(c.totalThisCity).value   = { formula: `SUM(F${kVarDataRowStart}:F${lastDataRow})` };
+  totalRow.getCell(c.maleOtherCity).value   = { formula: `SUM(G${kVarDataRowStart}:G${lastDataRow})` };
+  totalRow.getCell(c.femaleOtherCity).value  = { formula: `SUM(H${kVarDataRowStart}:H${lastDataRow})` };
+  totalRow.getCell(c.totalOtherCity).value   = { formula: `SUM(I${kVarDataRowStart}:I${lastDataRow})` };
+  totalRow.getCell(c.maleOtherProv).value   = { formula: `SUM(J${kVarDataRowStart}:J${lastDataRow})` };
+  totalRow.getCell(c.femaleOtherProv).value  = { formula: `SUM(K${kVarDataRowStart}:K${lastDataRow})` };
+  totalRow.getCell(c.totalOtherProv).value   = { formula: `SUM(L${kVarDataRowStart}:L${lastDataRow})` };
+  totalRow.getCell(c.maleForeign).value     = { formula: `SUM(M${kVarDataRowStart}:M${lastDataRow})` };
+  totalRow.getCell(c.femaleForeign).value    = { formula: `SUM(N${kVarDataRowStart}:N${lastDataRow})` };
+  totalRow.getCell(c.totalForeign).value     = { formula: `SUM(O${kVarDataRowStart}:O${lastDataRow})` };
+  totalRow.getCell(c.grandMale).value        = { formula: `SUM(P${kVarDataRowStart}:P${lastDataRow})` };
+  totalRow.getCell(c.grandFemale).value      = { formula: `SUM(Q${kVarDataRowStart}:Q${lastDataRow})` };
+  totalRow.getCell(c.grandTotal).value       = { formula: `F${kVarTotalRow}+I${kVarTotalRow}+L${kVarTotalRow}+O${kVarTotalRow}` };
 
 }
 
@@ -1770,7 +1986,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
               if (cell.value.result !== undefined && cell.value.result !== null) {
                 text = cell.value.result.toString();
               } else if (cell.value.formula) {
-                text = '';
+                text = '0';
               } else if (cell.value instanceof Date) {
                 text = cell.value.toLocaleDateString();
               } else {
@@ -1836,7 +2052,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
           // rightward into genuinely blank cells.
           const rawValue = cell.value;
           const isNumericValue = typeof rawValue === 'number'
-            || (rawValue && typeof rawValue === 'object' && typeof rawValue.result === 'number');
+            || (rawValue && typeof rawValue === 'object' && (typeof rawValue.result === 'number' || rawValue.formula));
           const align    = cell.alignment?.horizontal;
           const pdfAlign = align === 'center' ? 'center'
             : align === 'left'  ? 'left'
