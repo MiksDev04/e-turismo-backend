@@ -1067,7 +1067,7 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
     const effectiveCheckOut = r.actual_check_out || r.check_out;
     const checkOut = _parseLocalDate(effectiveCheckOut);
     const nights   = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    const days     = Math.max(1, nights);
+    const spreadDays = Math.max(1, nights);
     const sex      = (r.lead_sex || '').toLowerCase();
     const gCountry = (r.lead_country || '').toUpperCase();
     const isForeign = !!r.lead_is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
@@ -1087,7 +1087,12 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
       }
     }
 
-    data[bucket] += days;
+    for (let n = 0; n < spreadDays; n++) {
+      const stayDate = new Date(checkIn);
+      stayDate.setDate(checkIn.getDate() + n);
+      if (stayDate.getFullYear() !== year || (stayDate.getMonth() + 1) !== month) continue;
+      data[bucket] += 1;
+    }
   });
 
   return data;
