@@ -906,7 +906,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
 async function _fetchMonthData(businessId, month, year, includeArchived = false) {
   const firstDay    = `${year}-${String(month).padStart(2, '0')}-01`;
-  const lastDay     = new Date(year, month, 0).toISOString().split('T')[0];
+  const lastDay     = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
   const statusFilter = includeArchived
     ? "AND status IN ('active', 'archived')"
     : "AND status = 'active'";
@@ -919,7 +919,7 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
             lead_country, lead_sex, lead_nationality, lead_is_overseas
      FROM guest_records
      WHERE business_id = ? AND is_deleted = false
-       AND COALESCE(actual_check_out, check_out) > ? AND check_in <= ? ${statusFilter}`,
+       AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ? ${statusFilter}`,
     [businessId, firstDay, lastDay]
   );
 
@@ -1037,7 +1037,7 @@ async function _fetchMonthData(businessId, month, year, includeArchived = false)
 
 async function _fetchVarMonthData(businessId, businessCity, businessProvince, month, year) {
   const firstDay = `${year}-${String(month).padStart(2, '0')}-01`;
-  const lastDay  = new Date(year, month, 0).toISOString().split('T')[0];
+  const lastDay  = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
 
   const [records] = await db.pool.execute(
     `SELECT id, check_in, check_out, actual_check_out, total_guests,
@@ -1045,7 +1045,7 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
             lead_city_municipality, lead_province
      FROM guest_records
      WHERE business_id = ? AND is_deleted = false
-       AND COALESCE(actual_check_out, check_out) > ? AND check_in <= ?
+       AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?
        AND status = 'active'`,
     [businessId, firstDay, lastDay]
   );
