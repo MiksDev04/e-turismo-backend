@@ -1166,9 +1166,14 @@ function _mergeMonthDataMulti(months, list) {
 function _cloneSheetFromTemplate(templateSheet, newName, targetWb) {
   const newSheet = targetWb.addWorksheet(newName);
 
-  // ── Column widths ────────────────────────────────────────────────────────
+  // ── Column widths & properties ───────────────────────────────────────────
   templateSheet.columns.forEach((col, i) => {
-    if (col.width) newSheet.getColumn(i + 1).width = col.width;
+    const nc = newSheet.getColumn(i + 1);
+    if (col.width) nc.width = col.width;
+    if (col.style !== undefined) nc.style = col.style;
+    if (col.outlineLevel) nc.outlineLevel = col.outlineLevel;
+    if (col.hidden) nc.hidden = col.hidden;
+    if (col.collapsed) nc.collapsed = col.collapsed;
   });
 
   // ── Row-by-row clone (values + styles) ───────────────────────────────────
@@ -1205,6 +1210,16 @@ function _cloneSheetFromTemplate(templateSheet, newName, targetWb) {
           merge.model.bottom, merge.model.right,
         );
       } catch (_) { /* ignore overlapping merges from template */ }
+    }
+  }
+
+  // ── Sheet-level properties ──────────────────────────────────────────────
+  if (templateSheet.properties) {
+    if (templateSheet.properties.defaultRowHeight !== undefined) {
+      newSheet.properties.defaultRowHeight = templateSheet.properties.defaultRowHeight;
+    }
+    if (templateSheet.properties.defaultColumnWidth !== undefined) {
+      newSheet.properties.defaultColumnWidth = templateSheet.properties.defaultColumnWidth;
     }
   }
 
