@@ -125,16 +125,20 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
     let query = '';
     const params = [];
 
-    // Build date range bounds
+    // Build date range bounds using local-midnight dates so the period aligns
+    // with how check_in/actual_check_out are parsed below. Using date-only
+    // strings (new Date("YYYY-MM-01")) parses as UTC midnight, which shifts the
+    // effective month window by the timezone offset and mis-attributes records
+    // that check in on the 1st of the month (see reports.api.js _parseLocalDate).
     let periodStart, periodEnd;
     if (year !== 0 && month !== 0) {
       const nextMonth = month === 12 ? 1 : month + 1;
       const nextYear = month === 12 ? year + 1 : year;
-      periodStart = new Date(`${year}-${String(month).padStart(2, '0')}-01`);
-      periodEnd = new Date(`${nextYear}-${String(nextMonth).padStart(2, '0')}-01`);
+      periodStart = new Date(year, month - 1, 1);
+      periodEnd = new Date(nextYear, nextMonth - 1, 1);
     } else if (year !== 0 && month === 0) {
-      periodStart = new Date(`${year}-01-01`);
-      periodEnd = new Date(`${year + 1}-01-01`);
+      periodStart = new Date(year, 0, 1);
+      periodEnd = new Date(year + 1, 0, 1);
     } else {
       periodStart = null;
       periodEnd = null;
@@ -162,16 +166,39 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
       const checkInRaw = new Date(row.check_in);
       const effectiveCheckOutRaw = new Date(row.actual_check_out || row.check_out);
       const checkIn = new Date(checkInRaw.getFullYear(), checkInRaw.getMonth(), checkInRaw.getDate());
-      const effectiveCheckOut = new Date(effectiveCheckOutRaw.getFullYear(), effectiveCheckOutRaw.getMonth(), effectiveCheckOutRaw.getDate());
+
+      // Actual check-out takes priority; check_out is only the fallback when
+      // actual_check_out is null/empty. If neither is present, treat the stay
+      // as a same-day stay on the check-in date.
+      let effectiveCheckOut;
+      if (!isNaN(effectiveCheckOutRaw.getTime())) {
+        effectiveCheckOut = new Date(
+          effectiveCheckOutRaw.getFullYear(),
+          effectiveCheckOutRaw.getMonth(),
+          effectiveCheckOutRaw.getDate()
+        );
+      } else {
+        effectiveCheckOut = new Date(checkIn);
+      }
+
+      // The check-out day is not a presence day, so the last presence day is
+      // the day before check-out (same-day stays count their single day).
+      const lastPresenceDay = new Date(effectiveCheckOut);
+      lastPresenceDay.setDate(lastPresenceDay.getDate() - 1);
+      if (lastPresenceDay < checkIn) lastPresenceDay.setTime(checkIn.getTime());
 
       let daysInPeriod;
       if (periodStart && periodEnd) {
+        const periodLastDay = new Date(periodEnd);
+        periodLastDay.setDate(periodLastDay.getDate() - 1); // periodEnd is exclusive
         const stayStart = checkIn < periodStart ? periodStart : checkIn;
-        const stayEnd = effectiveCheckOut > periodEnd ? periodEnd : effectiveCheckOut;
-        daysInPeriod = Math.max(1, Math.floor((stayEnd - stayStart) / 86400000));
+        const stayEnd = lastPresenceDay > periodLastDay ? periodLastDay : lastPresenceDay;
+        daysInPeriod = stayEnd < stayStart ? 0 : Math.floor((stayEnd - stayStart) / 86400000) + 1;
       } else {
-        daysInPeriod = Math.max(1, Math.floor((effectiveCheckOut - checkIn) / 86400000));
+        daysInPeriod = Math.floor((lastPresenceDay - checkIn) / 86400000) + 1;
       }
+
+      if (daysInPeriod <= 0) continue;
 
       const guestDays = Number(row.total_guests) * daysInPeriod;
       const key = row.business_id;
