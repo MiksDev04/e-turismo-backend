@@ -1,5 +1,6 @@
 import express from 'express';
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import PDFDocument from 'pdfkit';
 import { promises as fsp } from 'fs';
 import db from '../config/db.js';
@@ -15,11 +16,28 @@ const router = express.Router();
 
 const adminGuard = [auth.authenticate, auth.requireRole('admin')];
 
+// ─── Template default font extraction ────────────────────────────────────────
+// ExcelJS always writes Calibri as the workbook default (zero) font, but column
+// widths are stored in "characters of the default font".  The templates use
+// MS PGothic (VAR) / Arial (DAE), so a Calibri default makes the same stored
+// width render ~9% narrower.  We capture each template's default font here so
+// exports can be patched back to render identically to the template.
+
+async function _readTemplateDefaultFont(filePath) {
+  const zip = await JSZip.loadAsync(await fsp.readFile(filePath));
+  const styles = await zip.file('xl/styles.xml').async('string');
+  const match = styles.match(/(<fonts[^>]*>)(<font>[\s\S]*?<\/font>)/);
+  return match ? match[2] : null;
+}
+
 // ─── Load template workbook for styled Excel exports ─────────────────────────
+const defaultFontXml = { var: null, dae: null };
+
 let templateWb = null;
 try {
   templateWb = new ExcelJS.Workbook();
   await templateWb.xlsx.readFile(path.join(__dirname, '..', '..', 'sample', 'ON Blank Form.xlsx'));
+  defaultFontXml.dae = await _readTemplateDefaultFont(path.join(__dirname, '..', '..', 'sample', 'ON Blank Form.xlsx'));
   console.log('[report] DAE Template loaded successfully');
 } catch (err) {
   console.warn('[report] DAE Template not found, exports will be unformatted:', err.message);
@@ -30,6 +48,7 @@ let varTemplateWb = null;
 try {
   varTemplateWb = new ExcelJS.Workbook();
   await varTemplateWb.xlsx.readFile(path.join(__dirname, '..', '..', 'sample', 'VAR-REPORT.xlsx'));
+  defaultFontXml.var = await _readTemplateDefaultFont(path.join(__dirname, '..', '..', 'sample', 'VAR-REPORT.xlsx'));
   console.log('[report] VAR Template loaded successfully');
 } catch (err) {
   console.warn('[report] VAR Template not found, VAR exports will be unformatted:', err.message);
@@ -903,11 +922,17 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     const baseFilename = `${reportType.toUpperCase()}_${reportVariant}_${_fmtPeriod(sortedMonths)}_${year}`;
 
     if (format === 'xlsx') {
+      // Evaluate all formulas so the exported file carries cached results
+      // (viewers that don't recalculate show 0 in totals/subtotals otherwise).
+      wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
+      wb.calcProperties.fullCalcOnLoad = true;
       const buffer = await wb.xlsx.writeBuffer();
+      const fontXml = reportType === 'var' ? defaultFontXml.var : defaultFontXml.dae;
+      const outBuffer = fontXml ? await _patchDefaultFont(buffer, fontXml) : buffer;
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
       res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.set('Content-Disposition', `attachment; filename="${baseFilename}.xlsx"`);
-      res.send(Buffer.from(buffer));
+      res.send(Buffer.from(outBuffer));
     } else {
       // Evaluate all formulas so the PDF renderer can read cached results
       wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
@@ -1185,6 +1210,29 @@ function _mergeMonthDataMulti(months, list) {
     result[m] = _mergeMonthData(m, byMonth[m] || []);
   }
   return result;
+}
+
+// ─── Default-font patch ───────────────────────────────────────────────────────
+// ExcelJS always writes Calibri as the workbook default (zero) font, which
+// changes how stored column widths ("characters of the default font") render.
+// This swaps font[0] in the generated styles.xml back to the template's default
+// font so exports display at the same widths as the templates.
+
+async function _patchDefaultFont(buffer, fontXml) {
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+    const styles = await zip.file('xl/styles.xml').async('string');
+    const patched = styles.replace(/(<fonts[^>]*>)(<font>[\s\S]*?<\/font>)/, `$1${fontXml}`);
+    if (patched === styles) {
+      console.warn('[report] Default font patch: no <fonts> block found, export unchanged');
+      return buffer;
+    }
+    zip.file('xl/styles.xml', patched);
+    return await zip.generateAsync({ type: 'nodebuffer' });
+  } catch (err) {
+    console.warn('[report] Default font patch skipped:', err.message);
+    return buffer;
+  }
 }
 
 // ─── Template Cloning ────────────────────────────────────────────────────────
