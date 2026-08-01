@@ -1282,7 +1282,7 @@ function _cloneSheetFromTemplate(templateSheet, newName, targetWb) {
   if (templateSheet._merges) {
     for (const merge of Object.values(templateSheet._merges)) {
       try {
-        newSheet.mergeCells(
+        newSheet.mergeCellsWithoutStyle(
           merge.model.top, merge.model.left,
           merge.model.bottom, merge.model.right,
         );
@@ -1927,6 +1927,15 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
   const CHAR_WIDTH_PT = 5.25;
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 } };
+  const BORDER_WIDTH = {
+    hairline: 0.25,
+    dotted: 0.5, dashed: 0.5, dashDot: 0.5, dashDotDot: 0.5,
+    thin: 0.5,
+    mediumDashDotDot: 1.0, mediumDashDot: 1.0, mediumDash: 1.0,
+    medium: 1.0, slantDashDot: 1.0,
+    thick: 1.5, double: 1.5,
+  };
+  const _borderWidth = (b) => (b && BORDER_WIDTH[b.style]) || 0;
   const _pageSize = (size) => {
     if (Array.isArray(size)) return { w: size[0], h: size[1] };
     return PAGE_DIMS[size] || PAGE_DIMS.A3;
@@ -2031,12 +2040,32 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
                .fill('#' + cell.fill.fgColor.argb.substring(2));
           }
 
-          if (cell.border) {
-            doc.lineWidth(0.5).strokeColor('#000000');
-            if (cell.border.top)    doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke();
-            if (cell.border.bottom) doc.moveTo(curX, curY + bh).lineTo(curX + bw, curY + bh).stroke();
-            if (cell.border.left)   doc.moveTo(curX, curY).lineTo(curX, curY + bh).stroke();
-            if (cell.border.right)  doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke();
+          if (cell.isMerged) {
+            const mr = _findMergeRange(sheet, cell.address);
+            let tW = 0, bW = 0, lW = 0, rW = 0;
+            if (mr) {
+              for (let c = mr.left; c <= mr.right; c++) {
+                tW = Math.max(tW, _borderWidth(sheet.getCell(mr.top, c).border?.top));
+                bW = Math.max(bW, _borderWidth(sheet.getCell(mr.bottom, c).border?.bottom));
+              }
+              for (let r = mr.top; r <= mr.bottom; r++) {
+                lW = Math.max(lW, _borderWidth(sheet.getCell(r, mr.left).border?.left));
+                rW = Math.max(rW, _borderWidth(sheet.getCell(r, mr.right).border?.right));
+              }
+            }
+            if (tW || bW || lW || rW) {
+              doc.strokeColor('#000000');
+              if (tW) { doc.lineWidth(tW); doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke(); }
+              if (bW) { doc.lineWidth(bW); doc.moveTo(curX, curY + bh).lineTo(curX + bw, curY + bh).stroke(); }
+              if (lW) { doc.lineWidth(lW); doc.moveTo(curX, curY).lineTo(curX, curY + bh).stroke(); }
+              if (rW) { doc.lineWidth(rW); doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke(); }
+            }
+          } else if (cell.border) {
+            doc.strokeColor('#000000');
+            if (cell.border.top)    { doc.lineWidth(_borderWidth(cell.border.top) || 0.5);    doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke(); }
+            if (cell.border.bottom) { doc.lineWidth(_borderWidth(cell.border.bottom) || 0.5); doc.moveTo(curX, curY + bh).lineTo(curX + bw, curY + bh).stroke(); }
+            if (cell.border.left)   { doc.lineWidth(_borderWidth(cell.border.left) || 0.5);   doc.moveTo(curX, curY).lineTo(curX, curY + bh).stroke(); }
+            if (cell.border.right)  { doc.lineWidth(_borderWidth(cell.border.right) || 0.5);  doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke(); }
           }
 
           let text = '';
