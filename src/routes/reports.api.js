@@ -1,6 +1,7 @@
 import express from 'express';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
+import { promises as fsp } from 'fs';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -33,6 +34,15 @@ try {
 } catch (err) {
   console.warn('[report] VAR Template not found, VAR exports will be unformatted:', err.message);
   varTemplateWb = null;
+}
+
+// ─── Load the tourism office logo for the VAR header ─────────────────────────
+let varLogoBuffer = null;
+try {
+  varLogoBuffer = await fsp.readFile(path.join(__dirname, '..', '..', 'sample', 'tourism_office_logo.jpg'));
+  console.log('[report] VAR logo loaded');
+} catch (err) {
+  console.warn('[report] VAR logo not found, VAR exports will have no logo:', err.message);
 }
 
 // ─── Country / Region Definitions ────────────────────────────────────────────
@@ -822,6 +832,20 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       }
 
       _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year);
+
+      // Embed the tourism office logo in the header (mirrors the template's
+      // B1 anchor spanning rows 1-4).
+      if (varLogoBuffer) {
+        try {
+          const logoId = wb.addImage({ buffer: varLogoBuffer, extension: 'jpeg' });
+          sheet.addImage(logoId, {
+            tl: { nativeCol: 1, nativeColOff: 1038225, nativeRow: 0, nativeRowOff: 57150 },
+            ext: { width: 64, height: 64 },
+          });
+        } catch (err) {
+          console.warn('[report] Could not embed VAR logo:', err.message);
+        }
+      }
     } else {
       // ── DAE: Per-establishment worksheets ──────────────────────────────────
       for (const biz of businesses) {
@@ -2099,6 +2123,16 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
         }
 
         curY += rh;
+      }
+
+      // Draw the tourism office logo over the VAR header block (B1, rows 1-4)
+      // on the first page, using the same origin/scale math as the cell grid.
+      if (reportType === 'var' && s === 0 && varLogoBuffer) {
+        const colAW = (sheet.getColumn(1).width || 10) * CHAR_WIDTH_PT * scale;
+        const logoX = originX + colAW + (1038225 / 914400) * 72 * scale;
+        const logoY = originY + (57150 / 914400) * 72 * scale;
+        const logoPx = 64 * 0.75 * scale;
+        doc.image(varLogoBuffer, logoX, logoY, { width: logoPx, height: logoPx });
       }
     }
   }
