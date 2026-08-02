@@ -36,6 +36,12 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
       whereParams.push(businessStatus.toLowerCase());
     }
 
+    if (businessLine && businessLine !== 'all' && businessLine !== 'All Business Lines') {
+      const normalized = businessLine.trim().toLowerCase().replace(/\s+/g, '_');
+      whereConditions.push('JSON_CONTAINS(b.business_line, JSON_QUOTE(?))');
+      whereParams.push(normalized);
+    }
+
     const havingConditions = [];
     const havingParams     = [];
 
@@ -55,8 +61,8 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
       if (mapped) {
         havingConditions.push(`CASE
           WHEN COUNT(gr.id) = 0 THEN 'no_activity'
-          WHEN MAX(gr.created_at) < DATE_SUB(NOW(), INTERVAL 30 DAY) THEN 'inactive'
-          WHEN MAX(gr.created_at) < DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 'low_activity'
+          WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 30 DAY) THEN 'inactive'
+          WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN 'low_activity'
           ELSE 'active'
         END = ?`);
         havingParams.push(mapped);
@@ -76,6 +82,7 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
         LEFT JOIN guest_records gr
           ON  gr.business_id = b.id
           AND gr.is_deleted  = FALSE
+          AND gr.check_in <= CURDATE()
         WHERE ${whereClause}
         GROUP BY b.id, b.business_name, b.status
         ${havingClause}
@@ -95,14 +102,15 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
         SELECT
           CASE
             WHEN COUNT(gr.id) = 0 THEN 'no_activity'
-            WHEN MAX(gr.created_at) < DATE_SUB(NOW(), INTERVAL 30 DAY) THEN 'inactive'
-            WHEN MAX(gr.created_at) < DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 'low_activity'
+            WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 30 DAY) THEN 'inactive'
+            WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN 'low_activity'
             ELSE 'active'
           END AS activity_status
         FROM businesses b
         LEFT JOIN guest_records gr
           ON  gr.business_id = b.id
           AND gr.is_deleted  = FALSE
+          AND gr.check_in <= CURDATE()
         WHERE b.status IN ('approved', 'warning')
           AND b.deleted_at IS NULL
         GROUP BY b.id
@@ -125,13 +133,13 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
         b.business_line,
         b.status                              AS business_status,
         COUNT(gr.id)                          AS total_records,
-        MAX(gr.created_at)                    AS last_activity,
+        DATE(MAX(COALESCE(gr.actual_check_out, CURDATE()))) AS last_activity,
         CASE
           WHEN COUNT(gr.id) = 0
                THEN 'no_activity'
-          WHEN MAX(gr.created_at) < DATE_SUB(NOW(), INTERVAL 30 DAY)
+          WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 30 DAY)
                THEN 'inactive'
-          WHEN MAX(gr.created_at) < DATE_SUB(NOW(), INTERVAL 7 DAY)
+          WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 7 DAY)
                THEN 'low_activity'
           ELSE 'active'
         END                                   AS activity_status
@@ -139,6 +147,7 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
       LEFT JOIN guest_records gr
         ON  gr.business_id = b.id
         AND gr.is_deleted  = FALSE
+        AND gr.check_in <= CURDATE()
       WHERE ${whereClause}
       GROUP BY
         b.id,
@@ -158,12 +167,16 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
       const [guestRows] = await connection.query(
         `SELECT business_id, check_in, check_out, actual_check_out, total_guests
          FROM guest_records
-         WHERE business_id IN (${placeholders}) AND is_deleted = FALSE`,
+         WHERE business_id IN (${placeholders}) AND is_deleted = FALSE AND check_in <= CURDATE()`,
         businessIds
       );
+      // For open stays (no actual_check_out yet), count nights to today — the
+      // current date stands in for the checkout day and is not itself counted.
+      const today = new Date();
+      const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
       for (const gr of guestRows) {
         const checkInRaw = new Date(gr.check_in);
-        const effectiveCheckOutRaw = new Date(gr.actual_check_out || gr.check_out);
+        const effectiveCheckOutRaw = gr.actual_check_out ? new Date(gr.actual_check_out) : todayMidnight;
         const checkIn = new Date(checkInRaw.getFullYear(), checkInRaw.getMonth(), checkInRaw.getDate());
         const effectiveCheckOut = new Date(effectiveCheckOutRaw.getFullYear(), effectiveCheckOutRaw.getMonth(), effectiveCheckOutRaw.getDate());
         const nights = Math.max(1, Math.floor((effectiveCheckOut - checkIn) / 86400000));

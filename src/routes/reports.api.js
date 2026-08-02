@@ -2073,12 +2073,25 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
             text = cell.value.richText.map(rt => rt.text).join('');
           } else if (cell.value !== null && cell.value !== undefined) {
             if (typeof cell.value === 'object') {
-              if (cell.value.result !== undefined && cell.value.result !== null) {
-                text = cell.value.result.toString();
-              } else if (cell.value.formula) {
+              if (cell.value.text !== undefined && cell.value.text !== null) {
+                text = cell.value.text.toString();
+              } else if (cell.value.result !== undefined && cell.value.result !== null) {
+                // A formula result may itself be an ExcelJS error object
+                // (e.g. AVERAGE over empty cells -> { error: "#DIV/0!" }).
+                // Render error results as 0 so totals/ratios never show junk.
+                const res = cell.value.result;
+                text = (res && typeof res === 'object' && res.error !== undefined)
+                  ? '0'
+                  : res.toString();
+              } else if (cell.value.formula || cell.value.sharedFormula) {
+                // Formula (and shared-formula) cells with no cached result
+                // default to 0 so totals/subtotals never render blank.
                 text = '0';
               } else if (cell.value instanceof Date) {
                 text = cell.value.toLocaleDateString();
+              } else if (cell.value.error !== undefined) {
+                // Bare error cells (no formula/result wrapper) default to 0.
+                text = '0';
               } else {
                 text = cell.value.toString();
               }
@@ -2108,11 +2121,13 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
           curX += cw;
         });
 
-        // Pass 2: draw text on top of the fully-painted row. If a cell's text
-        // is wider than its own cell, let it bleed into consecutive blank
-        // neighboring cells (in the direction dictated by its alignment) the
-        // same way Excel itself displays overflowing, uncut text — only
-        // falling back to an ellipsis once it runs out of blank room to spill into.
+        // Pass 2: draw text on top of the fully-painted row, mirroring Excel's
+        // text layout. Unwrapped text is drawn as single lines positioned by
+        // horizontal alignment, so overflow spills into adjacent cells instead
+        // of being clipped; embedded '\n' becomes additional stacked lines.
+        // Text wraps within the box only when the cell has wrap_text set, and
+        // the cell's vertical alignment is honored for both single- and
+        // multi-line values.
         for (let i = 0; i < cellBlocks.length; i++) {
           const block = cellBlocks[i];
           if (block.isCheckmark || !block.text) continue;
@@ -2142,61 +2157,51 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
           // rightward into genuinely blank cells.
           const rawValue = cell.value;
           const isNumericValue = typeof rawValue === 'number'
-            || (rawValue && typeof rawValue === 'object' && (typeof rawValue.result === 'number' || rawValue.formula));
+            || (rawValue && typeof rawValue === 'object' && (typeof rawValue.result === 'number' || rawValue.formula || rawValue.sharedFormula));
           const align    = cell.alignment?.horizontal;
           const pdfAlign = align === 'center' ? 'center'
             : align === 'left'  ? 'left'
             : align === 'right' ? 'right'
             : (isNumericValue ? 'right' : 'left');
 
-          let boxX = x + 2;
-          let boxW = bw - 4;
+          const boxX = x + 2;
+          const boxW = bw - 4;
 
-          // Only borrow neighboring space if the text actually doesn't fit —
-          // cells that fit as-is stay confined to their own column.
-          if (doc.widthOfString(text) > boxW) {
-            let extraRight = 0;
-            for (let j = i + 1; j < cellBlocks.length && !cellBlocks[j].isCheckmark && !cellBlocks[j].text; j++) {
-              extraRight += cellBlocks[j].bw;
-            }
-            let extraLeft = 0;
-            for (let j = i - 1; j >= 0 && !cellBlocks[j].isCheckmark && !cellBlocks[j].text; j--) {
-              extraLeft += cellBlocks[j].bw;
-            }
+          const wrap = !!cell.alignment?.wrap_text;
 
-            if (pdfAlign === 'left') {
-              boxW += extraRight;
-            } else if (pdfAlign === 'right') {
-              boxX -= extraLeft;
-              boxW += extraLeft;
-            } else {
-              boxX -= extraLeft;
-              boxW += extraLeft + extraRight;
-            }
+          const lineH = doc.currentLineHeight();
+          let textH;
+          if (wrap) {
+            textH = doc.heightOfString(text, { width: boxW, lineBreak: true });
+          } else {
+            textH = String(text).split('\n').length * lineH;
+          }
+          const valign = cell.alignment?.vertical;
+          let textY = curY + 2;
+          if (valign === 'center' || valign === 'middle') {
+            textY = curY + (bh - textH) / 2;
+          } else if (valign === 'bottom') {
+            textY = curY + bh - textH - 2;
           }
 
-          // Shrink-to-fit fallback: dense tables (e.g. Monthly Series, where
-          // every month column tends to already hold a real value) often have
-          // no blank neighbor left to overflow into. Rather than immediately
-          // clipping with an ellipsis, nudge the font size down in small
-          // steps — same idea as Excel's own "Shrink to fit" cell option —
-          // and only fall back to the ellipsis if it still won't fit at the
-          // smallest allowed size.
-          if (doc.widthOfString(text) > boxW) {
-            const minFontSize = Math.max(fontSize * 0.6, 4);
-            let shrunkSize = fontSize;
-            while (shrunkSize > minFontSize && doc.widthOfString(text) > boxW) {
-              shrunkSize = Math.max(shrunkSize - 0.3, minFontSize);
-              doc.fontSize(shrunkSize);
+          if (wrap) {
+            doc.text(text, boxX, textY, {
+              width: boxW, height: bh - 4, align: pdfAlign, lineBreak: true, ellipsis: false,
+            });
+          } else {
+            // Excel-style overflow: draw each line as a single unwrapped line
+            // positioned by its horizontal alignment, so overflowing text
+            // spills into adjacent cells (never clipped, never wrapped below).
+            let ly = textY;
+            for (const ln of String(text).split('\n')) {
+              const w = doc.widthOfString(ln);
+              let dx = boxX;
+              if (pdfAlign === 'center') dx = boxX + (boxW - w) / 2;
+              else if (pdfAlign === 'right') dx = boxX + boxW - w;
+              doc.text(ln, dx, ly, { width: 0, lineBreak: false, ellipsis: false, align: 'left' });
+              ly += lineH;
             }
           }
-
-          doc.text(text, boxX, curY + 2, {
-            width:    boxW,
-            height:   bh - 4,
-            align:    pdfAlign,
-            ellipsis: true,
-          });
         }
 
         curY += rh;
