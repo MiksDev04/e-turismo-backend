@@ -2,6 +2,7 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
+import { parseDbDate } from '../utils/date.js';
 
 const router = express.Router();
 
@@ -187,7 +188,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
 
     await connection.beginTransaction();
 
-    const lengthOfStay = Math.max(1, Math.round((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24)));
+    const lengthOfStay = Math.max(1, Math.round((parseDbDate(checkOut) - parseDbDate(checkIn)) / (1000 * 60 * 60 * 24)));
 
     // Check if record exists
     const [existing] = await connection.execute(

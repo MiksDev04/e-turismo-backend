@@ -14,12 +14,24 @@ export const pool = mysql.createPool({
   queueLimit:         isVercel ? 5 : 0,
   // Abort connection attempt after 10 s (Aiven MySQL may be slower from Vercel edge)
   connectTimeout:     10000,
-  // Return dates as strings to avoid timezone shifting
+  // Return dates as strings to avoid client-side timezone shifting
   dateStrings:        true,
+  // Serialize JS Date params as Philippine (UTC+8) wall-clock so writes are
+  // host-independent and consistent with NOW()/CURDATE() under the session
+  // time zone set below.
+  timezone:           '+08:00',
   supportBigNumbers:  true,
   bigNumberStrings:   false,
   enableKeepAlive:    true,
   keepAliveInitialDelay: 10000,
+});
+
+// Pin every connection's session time zone to Asia/Manila (UTC+8) so SQL-side
+// NOW(), CURDATE() and date arithmetic reflect the app's canonical timezone.
+pool.on('connection', (conn) => {
+  conn.query("SET time_zone = '+08:00'", (err) => {
+    if (err) console.error('Failed to set session time zone:', err.message);
+  });
 });
 
 

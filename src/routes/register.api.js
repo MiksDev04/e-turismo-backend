@@ -123,7 +123,8 @@ router.get('/register/confirm', async (req, res, next) => {
     }
 
     const [rows] = await db.pool.execute(
-      `SELECT id, email, expires_at, confirmed_at
+      `SELECT id, email, expires_at, confirmed_at,
+              expires_at < NOW() AS is_expired
        FROM pending_email_confirmations
        WHERE purpose = 'business_registration' AND confirmation_token = ?
        LIMIT 1`,
@@ -140,7 +141,7 @@ router.get('/register/confirm', async (req, res, next) => {
       return res.send(simpleHtmlPage('Already Confirmed', 'Your email has already been confirmed. You can close this tab and continue your registration.'));
     }
 
-    if (new Date(pending.expires_at) < new Date()) {
+    if (pending.is_expired) {
       await db.pool.execute('DELETE FROM pending_email_confirmations WHERE id = ?', [pending.id]);
       return res.status(400).send(simpleHtmlPage('Link Expired', 'This confirmation link has expired. Please start your registration again.'));
     }

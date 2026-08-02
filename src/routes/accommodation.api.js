@@ -1,6 +1,7 @@
 import express from 'express';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
+import { parseDbDate } from '../utils/date.js';
 
 const router = express.Router();
 
@@ -163,23 +164,12 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
     const map = new Map();
 
     for (const row of rows) {
-      const checkInRaw = new Date(row.check_in);
-      const effectiveCheckOutRaw = new Date(row.actual_check_out || row.check_out);
-      const checkIn = new Date(checkInRaw.getFullYear(), checkInRaw.getMonth(), checkInRaw.getDate());
+      const checkIn = parseDbDate(row.check_in);
 
       // Actual check-out takes priority; check_out is only the fallback when
       // actual_check_out is null/empty. If neither is present, treat the stay
       // as a same-day stay on the check-in date.
-      let effectiveCheckOut;
-      if (!isNaN(effectiveCheckOutRaw.getTime())) {
-        effectiveCheckOut = new Date(
-          effectiveCheckOutRaw.getFullYear(),
-          effectiveCheckOutRaw.getMonth(),
-          effectiveCheckOutRaw.getDate()
-        );
-      } else {
-        effectiveCheckOut = new Date(checkIn);
-      }
+      const effectiveCheckOut = parseDbDate(row.actual_check_out || row.check_out) || new Date(checkIn);
 
       // The check-out day is not a presence day, so the last presence day is
       // the day before check-out (same-day stays count their single day).

@@ -135,7 +135,7 @@ router.post('/forgot-password', async (req, res, next) => {
 
     // 1. Find user by email
     const [users] = await db.pool.execute(
-      'SELECT id, email FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
       [email.trim().toLowerCase()]
     );
 
@@ -199,7 +199,7 @@ router.post('/verify-otp', async (req, res, next) => {
       return res.status(400).json({ message: 'Incorrect reset code.' });
     }
 
-    if (new Date() > new Date(user.reset_otp_expiry)) {
+    if (!user.otp_valid) {
       return res.status(400).json({ message: 'Reset code has expired.' });
     }
 
@@ -224,7 +224,7 @@ router.post('/reset-password', async (req, res, next) => {
 
     // 1. Verify OTP again for security
     const [users] = await db.pool.execute(
-      'SELECT id, reset_otp, reset_otp_expiry FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
       [email.trim().toLowerCase()]
     );
 
@@ -238,7 +238,7 @@ router.post('/reset-password', async (req, res, next) => {
       return res.status(400).json({ message: 'Invalid or expired reset session.' });
     }
 
-    if (new Date() > new Date(user.reset_otp_expiry)) {
+    if (!user.otp_valid) {
       return res.status(400).json({ message: 'Reset session has expired.' });
     }
 

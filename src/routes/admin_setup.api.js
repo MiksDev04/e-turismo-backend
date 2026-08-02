@@ -145,7 +145,8 @@ router.get('/admin-setup/confirm', async (req, res, next) => {
     }
 
     const [rows] = await connection.execute(
-      `SELECT id, full_name, username, email, phone, password_hash, expires_at
+      `SELECT id, full_name, username, email, phone, password_hash, expires_at,
+              expires_at < NOW() AS is_expired
        FROM pending_email_confirmations
        WHERE purpose = 'admin_setup' AND confirmation_token = ?
        LIMIT 1`,
@@ -158,7 +159,7 @@ router.get('/admin-setup/confirm', async (req, res, next) => {
 
     const pending = rows[0];
 
-    if (new Date(pending.expires_at) < new Date()) {
+    if (pending.is_expired) {
       await connection.execute('DELETE FROM pending_email_confirmations WHERE id = ?', [pending.id]);
       return res.status(400).send(simpleHtmlPage('Link Expired', 'This confirmation link has expired. Please start the admin setup again.'));
     }
