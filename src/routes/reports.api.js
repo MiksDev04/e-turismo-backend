@@ -953,12 +953,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
 // ─── Data Fetching (new schema: guest_records lead fields + guest_record_rooms) ─
 
-async function _fetchMonthData(businessId, month, year, includeArchived = false) {
+async function _fetchMonthData(businessId, month, year) {
   const firstDay    = `${year}-${String(month).padStart(2, '0')}-01`;
   const lastDay     = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
-  const statusFilter = includeArchived
-    ? "AND status IN ('active', 'archived')"
-    : "AND status = 'active'";
+  const statusFilter = "AND status IN ('active', 'archived')";
 
   // Fetch records that have ANY presence in the month (not just check_in).
   // This catches cross-month stays: check_in before the month but check_out after it starts,
@@ -1095,7 +1093,7 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
      FROM guest_records
      WHERE business_id = ? AND is_deleted = false
        AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?
-       AND status = 'active'`,
+       AND status IN ('active', 'archived')`,
     [businessId, firstDay, lastDay]
   );
 

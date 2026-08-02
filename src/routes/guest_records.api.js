@@ -101,7 +101,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
                         gr.status, gr.is_deleted, gr.created_at, gr.updated_at
                  FROM guest_records gr
                  WHERE ${whereClause}
-                 ORDER BY gr.updated_at ${isDeltaSync ? 'ASC' : 'DESC'}`;
+                 ORDER BY gr.${isDeltaSync || fetchAll === 'true' ? 'updated_at' : 'created_at'} ${isDeltaSync ? 'ASC' : 'DESC'}`;
     const queryParams = [...params];
     if (fetchAll !== 'true') {
       query += ' LIMIT ? OFFSET ?';

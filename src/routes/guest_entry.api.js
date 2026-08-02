@@ -63,6 +63,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       leadIsOverseas,
       leadBirthdate,
       leadSex,
+      status,
     } = req.body;
 
     if (!businessId || !checkIn || !checkOut || !totalGuests || !leadSex) {
@@ -109,7 +110,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
         lead_nationality, lead_philippines_region, lead_is_overseas,
         lead_birthdate, lead_sex,
         status, is_deleted
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', FALSE)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)`,
       [
         guestRecordId,
         businessId,
@@ -128,6 +129,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
         leadIsOverseas ? 1 : 0,
         leadBirthdate || null,
         leadSex || null,
+        status || 'active',
       ]
     );
 
