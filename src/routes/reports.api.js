@@ -970,18 +970,24 @@ async function _fetchMonthData(businessId, month, year) {
     [businessId, firstDay, lastDay]
   );
 
-  // Fetch room assignments to compute rooms_occupied per record
+  // Fetch room assignment windows to compute rooms_occupied per record per day.
+  // Each room link carries its own active window (created_at → deleted_at) so a
+  // room removed mid-stay is only counted for the days it was actually occupied.
   const recordIds = records.map(r => r.id);
-  let roomCounts = {};
+  let roomWindows = {};
   if (recordIds.length > 0) {
     const [grrRows] = await db.pool.execute(
-      `SELECT guest_record_id, COUNT(DISTINCT room_id) AS room_count
+      `SELECT guest_record_id, room_id,
+              DATE(created_at) AS start_date,
+              DATE(deleted_at)  AS end_date
        FROM guest_record_rooms
-       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')})
-       GROUP BY guest_record_id`,
+       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')})`,
       recordIds
     );
-    grrRows.forEach(r => { roomCounts[r.guest_record_id] = r.room_count; });
+    grrRows.forEach(r => {
+      if (!roomWindows[r.guest_record_id]) roomWindows[r.guest_record_id] = [];
+      roomWindows[r.guest_record_id].push({ startDate: r.start_date, endDate: r.end_date });
+    });
   }
 
   const countryByDay            = {};
@@ -1007,7 +1013,6 @@ async function _fetchMonthData(businessId, month, year) {
     const effectiveCheckOut = r.actual_check_out || r.check_out;
     const checkOut   = _parseLocalDate(effectiveCheckOut);
     const nights     = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    const rooms      = roomCounts[r.id] || 0;
     const guestCount = r.total_guests || 0;
 
     const country     = (r.lead_country || '').toUpperCase();
@@ -1030,6 +1035,16 @@ async function _fetchMonthData(businessId, month, year) {
       if (stayDate.getFullYear() !== year || (stayDate.getMonth() + 1) !== month) continue;
 
       const stayDay = stayDate.getDate();
+
+      // Rooms active on this specific day — each room counted only within its
+      // own active window, not for the whole stay.
+      const stayDateStr =
+        `${stayDate.getFullYear()}-${String(stayDate.getMonth() + 1).padStart(2, '0')}-${String(stayDate.getDate()).padStart(2, '0')}`;
+      const windows = roomWindows[r.id] || [];
+      const rooms = windows.filter(w =>
+        (!w.startDate || stayDateStr >= w.startDate) &&
+        (!w.endDate || stayDateStr < w.endDate)
+      ).length;
 
       // Rooms occupied per day
       roomsOccupiedByDay[stayDay] = (roomsOccupiedByDay[stayDay] || 0) + rooms;

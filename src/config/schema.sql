@@ -191,6 +191,7 @@ CREATE TABLE `guest_record_rooms` (
   `guest_record_id` char(36) NOT NULL,
   `room_id` char(36) NOT NULL,
   `status` enum('active','completed') NOT NULL DEFAULT 'active',
+  `deleted_at` datetime DEFAULT NULL COMMENT 'Soft-delete: when this room link was removed from the stay',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
@@ -198,6 +199,7 @@ CREATE TABLE `guest_record_rooms` (
   KEY `idx_grr_guest_record_id` (`guest_record_id`),
   KEY `idx_grr_room_id` (`room_id`),
   KEY `idx_grr_status` (`status`),
+  KEY `idx_grr_deleted_at` (`deleted_at`),
   CONSTRAINT `guest_record_rooms_guest_record_id_fkey` FOREIGN KEY (`guest_record_id`) REFERENCES `guest_records` (`id`) ON DELETE CASCADE,
   CONSTRAINT `guest_record_rooms_room_id_fkey` FOREIGN KEY (`room_id`) REFERENCES `rooms` (`id`) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

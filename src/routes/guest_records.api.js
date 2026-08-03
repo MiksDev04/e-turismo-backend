@@ -116,10 +116,13 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     if (recordIds.length > 0) {
       const placeholders = recordIds.map(() => '?').join(',');
       const [roomLinks] = await connection.execute(
-        `SELECT grr.guest_record_id, r.id AS room_id, r.room_number, r.capacity, grr.status AS link_status
+        `SELECT grr.guest_record_id, r.id AS room_id, r.room_number, r.capacity,
+                grr.status AS link_status, grr.deleted_at AS deleted_at
          FROM guest_record_rooms grr
          JOIN rooms r ON r.id = grr.room_id
-         WHERE grr.guest_record_id IN (${placeholders})`,
+         JOIN guest_records gr ON gr.id = grr.guest_record_id
+         WHERE grr.guest_record_id IN (${placeholders})
+           AND (gr.status = 'archived' OR (grr.status = 'active' AND grr.deleted_at IS NULL))`,
         recordIds
       );
 
@@ -132,6 +135,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
           roomNumber: rl.room_number,
           capacity: rl.capacity,
           status: rl.link_status,
+          deletedAt: rl.deleted_at,
         });
       }
     }
@@ -319,7 +323,8 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
 
         // Mark junction rows as completed (preserved as history)
         await connection.execute(
-          `UPDATE guest_record_rooms SET status = 'completed' WHERE guest_record_id = ? AND status = 'active'`,
+          `UPDATE guest_record_rooms SET status = 'completed', deleted_at = NOW(), updated_at = NOW()
+           WHERE guest_record_id = ? AND status = 'active' AND deleted_at IS NULL`,
           [recordId]
         );
       }
@@ -345,7 +350,8 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
         if (removedIds.length > 0) {
           const removedPlaceholders = removedIds.map(() => '?').join(',');
           await connection.execute(
-            `UPDATE guest_record_rooms SET status = 'completed' WHERE guest_record_id = ? AND room_id IN (${removedPlaceholders}) AND status = 'active'`,
+            `UPDATE guest_record_rooms SET status = 'completed', deleted_at = NOW(), updated_at = NOW()
+             WHERE guest_record_id = ? AND room_id IN (${removedPlaceholders}) AND status = 'active' AND deleted_at IS NULL`,
             [recordId, ...removedIds]
           );
         }
@@ -354,17 +360,17 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       // Insert new room assignments as active
       if (roomIds.length > 0) {
         for (const roomId of roomIds) {
-          // Check if a completed link already exists for this room
+          // Check if a link already exists for this room (active or soft-deleted)
           const [existingLink] = await connection.execute(
-            `SELECT id, status FROM guest_record_rooms WHERE guest_record_id = ? AND room_id = ?`,
+            `SELECT id, status, deleted_at FROM guest_record_rooms WHERE guest_record_id = ? AND room_id = ?`,
             [recordId, roomId]
           );
 
           if (existingLink.length > 0) {
-            // Reactivate if it was completed
-            if (existingLink[0].status === 'completed') {
+            // Reactivate if it was completed/soft-deleted
+            if (existingLink[0].status === 'completed' || existingLink[0].deleted_at !== null) {
               await connection.execute(
-                `UPDATE guest_record_rooms SET status = 'active' WHERE guest_record_id = ? AND room_id = ?`,
+                `UPDATE guest_record_rooms SET status = 'active', deleted_at = NULL, updated_at = NOW() WHERE guest_record_id = ? AND room_id = ?`,
                 [recordId, roomId]
               );
             }
