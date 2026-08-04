@@ -134,13 +134,13 @@ router.post('/forgot-password', async (req, res, next) => {
     }
 
     // 1. Find user by email
-    const [users] = await db.pool.execute(
-      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
+const [users] = await db.pool.execute(
+      'SELECT id, email, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
       [email.trim().toLowerCase()]
     );
 
     if (users.length === 0) {
-      // For security, don't reveal if email exists, but the frontend expects an error if it doesn't 
+      // For security, don't reveal if email exists, but the frontend expects an error if it doesn't
       // based on the catch block in LoginApi.dart. However, many systems prefer a generic message.
       // Given the requirement "make sure the otp works", I'll provide clear feedback.
       return res.status(404).json({ message: 'No account found with that email address.' });
@@ -185,7 +185,7 @@ router.post('/verify-otp', async (req, res, next) => {
     }
 
     const [users] = await db.pool.execute(
-      'SELECT id, reset_otp, reset_otp_expiry FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
       [email.trim().toLowerCase()]
     );
 
