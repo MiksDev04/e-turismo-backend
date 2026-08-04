@@ -1935,13 +1935,14 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 }, A4: { w: 595.28, h: 841.89 } };
   const BORDER_WIDTH = {
     hairline: 0.25,
-    dotted: 0.5, dashed: 0.5, dashDot: 0.5, dashDotDot: 0.5,
-    thin: 0.5,
-    mediumDashDotDot: 1.0, mediumDashDot: 1.0, mediumDash: 1.0,
-    medium: 1.0, slantDashDot: 1.0,
-    thick: 1.5, double: 1.5,
+    dotted: 0.75, dashed: 0.75, dashDot: 0.75, dashDotDot: 0.75,
+    thin: 0.75,
+    mediumDashDotDot: 1.5, mediumDashDot: 1.5, mediumDash: 1.5,
+    medium: 1.5, slantDashDot: 1.5,
+    thick: 2.25, double: 2.25,
   };
   const _borderWidth = (b) => (b && BORDER_WIDTH[b.style]) || 0;
+  const _lineWidth = (b, scale) => (_borderWidth(b) || 0.5) * scale;
   const _pageSize = (size) => {
     if (Array.isArray(size)) return { w: size[0], h: size[1] };
     return PAGE_DIMS[size] || PAGE_DIMS.A3;
@@ -2099,17 +2100,17 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
             }
             if (tW || bW || lW || rW) {
               doc.strokeColor('#000000');
-              if (tW) { doc.lineWidth(tW); doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke(); }
-              if (bW) { doc.lineWidth(bW); doc.moveTo(curX, curY + bh).lineTo(curX + bw, curY + bh).stroke(); }
-              if (lW) { doc.lineWidth(lW); doc.moveTo(curX, curY).lineTo(curX, curY + bh).stroke(); }
-              if (rW) { doc.lineWidth(rW); doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke(); }
+              if (tW) { doc.lineWidth(tW * scale); doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke(); }
+              if (bW) { doc.lineWidth(bW * scale); doc.moveTo(curX, curY + bh).lineTo(curX + bw, curY + bh).stroke(); }
+              if (lW) { doc.lineWidth(lW * scale); doc.moveTo(curX, curY).lineTo(curX, curY + bh).stroke(); }
+              if (rW) { doc.lineWidth(rW * scale); doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke(); }
             }
           } else if (cell.border) {
             doc.strokeColor('#000000');
-            if (cell.border.top)    { doc.lineWidth(_borderWidth(cell.border.top) || 0.5);    doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke(); }
-            if (cell.border.bottom) { doc.lineWidth(_borderWidth(cell.border.bottom) || 0.5); doc.moveTo(curX, curY + bh).lineTo(curX + bw, curY + bh).stroke(); }
-            if (cell.border.left)   { doc.lineWidth(_borderWidth(cell.border.left) || 0.5);   doc.moveTo(curX, curY).lineTo(curX, curY + bh).stroke(); }
-            if (cell.border.right)  { doc.lineWidth(_borderWidth(cell.border.right) || 0.5);  doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke(); }
+            if (cell.border.top)    { doc.lineWidth(_lineWidth(cell.border.top, scale));    doc.moveTo(curX, curY).lineTo(curX + bw, curY).stroke(); }
+            if (cell.border.bottom) { doc.lineWidth(_lineWidth(cell.border.bottom, scale)); doc.moveTo(curX, curY + bh).lineTo(curX + bw, curY + bh).stroke(); }
+            if (cell.border.left)   { doc.lineWidth(_lineWidth(cell.border.left, scale));   doc.moveTo(curX, curY).lineTo(curX, curY + bh).stroke(); }
+            if (cell.border.right)  { doc.lineWidth(_lineWidth(cell.border.right, scale));  doc.moveTo(curX + bw, curY).lineTo(curX + bw, curY + bh).stroke(); }
           }
 
           let text = '';
