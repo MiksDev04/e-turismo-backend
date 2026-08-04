@@ -1895,10 +1895,10 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
 
 // ─── PDF Layout & Page-Break Config ─────────────────────────────────────────
 const SHEET_PDF_CONFIG = {
-  daily:   { layout: 'landscape', size: 'A3', margin: 30, breakRows: [64, 124] },
-  monthly: { layout: 'landscape', size: 'A3', margin: 40, breakRows: [64, 124] },
-  sum:     { layout: 'portrait',  size: 'A3', margin: 30, breakRows: [66, 128] },
-  var:     { layout: 'portrait', size: 'A3', margin: 30, breakRows: [] },
+  daily:   { layout: 'landscape', size: 'A4', margin: 30, breakRows: [64, 124] },
+  monthly: { layout: 'landscape', size: 'A4', margin: 40, breakRows: [64, 124] },
+  sum:     { layout: 'portrait',  size: 'A4', margin: 30, breakRows: [66, 128] },
+  var:     { layout: 'portrait', size: 'A4', margin: 30, breakRows: [] },
 };
 
 function _getSheetPdfConfig(sheetName, reportType) {
@@ -1932,7 +1932,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   // each column adds, so column edges match Excel's rendered width exactly.
   const CHAR_WIDTH_PT = reportType === 'var' ? 6.0 : 5.25;
   const CELL_PAD_PT = 3.75;
-  const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 } };
+  const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 }, A4: { w: 595.28, h: 841.89 } };
   const BORDER_WIDTH = {
     hairline: 0.25,
     dotted: 0.5, dashed: 0.5, dashDot: 0.5, dashDotDot: 0.5,
@@ -1948,7 +1948,6 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   };
 
   const effectiveMargin = Math.max(pdfConfig.margin, 30);
-  const useCustomPage = !(pageWidth != null && pageHeight != null);
 
   // ── Per-sheet layout: sections + natural content width/height ─────────────
   const layouts = sheets.map(sheet => {
@@ -1992,25 +1991,18 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   });
 
   // ── Page geometry per sheet ───────────────────────────────────────────────
-  // Download path (no page size from caller): size each page to the content and
-  // render at 100% scale so the table is pixel-identical to Excel's natural
-  // size.  Print path: uniform fit to the caller's page — the height/width ratio
-  // is fixed, so both dimensions scale by the same factor, never distorted.
+  // Every sheet is placed on a fixed standard page (A4 in the configured
+  // orientation, or the caller's page on print) and scaled down by a single
+  // uniform factor so it fits inside the margins.  A single scale factor for
+  // width and height keeps the table's aspect ratio intact — never distorted —
+  // and centers it on the page, so nothing ever overflows the page.
+  const ps  = _pageSize(pdfConfig.size);
+  const pgW = pdfConfig.layout === 'landscape' ? ps.h : ps.w;
+  const pgH = pdfConfig.layout === 'landscape' ? ps.w : ps.h;
+  const aw2 = pgW - 2 * effectiveMargin;
+  const ah2 = pgH - 2 * effectiveMargin;
+
   const geometries = layouts.map(L => {
-    if (useCustomPage) {
-      return {
-        pageSize: [L.contentWidthPt + 2 * effectiveMargin, L.maxHeightInAnySection + 2 * effectiveMargin],
-        layout: 'portrait',
-        scale: 1,
-        originX: effectiveMargin,
-        originY: effectiveMargin,
-      };
-    }
-    const ps  = _pageSize(pdfConfig.size);
-    const pgW = pdfConfig.layout === 'landscape' ? ps.h : ps.w;
-    const pgH = pdfConfig.layout === 'landscape' ? ps.w : ps.h;
-    const aw2 = pgW - 2 * effectiveMargin;
-    const ah2 = pgH - 2 * effectiveMargin;
     const scale = Math.min(aw2 / L.contentWidthPt, ah2 / L.maxHeightInAnySection);
     return {
       pageSize: pdfConfig.size,
