@@ -1925,20 +1925,13 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     pdfConfig.layout = 'portrait';
   }
 
-  const doc = new PDFDocument({
-    layout: pdfConfig.layout,
-    size:   pdfConfig.size,
-    margin: pdfConfig.margin,
-  });
-
-  // Collect PDF output into a buffer
-  const chunks = [];
-  doc.on('data', chunk => chunks.push(chunk));
-  const pdfPromise = new Promise(resolve => {
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-  });
-
-  const CHAR_WIDTH_PT = 5.25;
+  // Font metrics that convert Excel's stored column widths ("characters of the
+  // default font") into physical points.  CHAR_WIDTH_PT = max digit width of the
+  // template's default font at 96dpi: Arial 10 → 7px = 5.25pt; MS PGothic 11
+  // (VAR, half-width digits) → 8px = 6.0pt.  CELL_PAD_PT = Excel's 5px padding
+  // each column adds, so column edges match Excel's rendered width exactly.
+  const CHAR_WIDTH_PT = reportType === 'var' ? 6.0 : 5.25;
+  const CELL_PAD_PT = 3.75;
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 } };
   const BORDER_WIDTH = {
     hairline: 0.25,
@@ -1954,26 +1947,23 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     return PAGE_DIMS[size] || PAGE_DIMS.A3;
   };
 
-  let isFirstSheet = true;
+  const effectiveMargin = Math.max(pdfConfig.margin, 30);
+  const useCustomPage = !(pageWidth != null && pageHeight != null);
 
-  for (const sheet of sheets) {
-    const cfg  = pdfConfig;
-    const ps   = _pageSize(cfg.size);
-    const pgW  = cfg.layout === 'landscape' ? ps.h : ps.w;
-    const pgH  = cfg.layout === 'landscape' ? ps.w : ps.h;
-
-    if (!isFirstSheet) {
-      doc.addPage({ layout: cfg.layout, size: cfg.size, margin: cfg.margin });
-    }
-    isFirstSheet = false;
+  // ── Per-sheet layout: sections + natural content width/height ─────────────
+  const layouts = sheets.map(sheet => {
+    const maxCol = reportType === 'var' ? 18 : 33;
+    const maxRow = (reportType === 'dae' && variant === 'daily')
+      ? 181
+      : (sheet.rowCount || 197);
 
     const rows = [];
     sheet.eachRow({ includeEmpty: true }, (row, rn) => {
-      if (rn > 197) return;
+      if (rn > maxRow) return;
       rows.push({ row, rn });
     });
 
-    const breaks = [1, ...cfg.breakRows, Infinity];
+    const breaks = [1, ...pdfConfig.breakRows, Infinity];
     const sheetSections = [];
     for (let s = 0; s < breaks.length - 1; s++) {
       const lo = breaks[s];
@@ -1982,13 +1972,13 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       if (section.length > 0) sheetSections.push(section);
     }
 
-    const maxCol = reportType === 'var' ? 18 : 33;
+    // Excel's real column width = units × max-digit-width + 5px padding.
     let contentWidthPt = 0;
     for (let c = 1; c <= maxCol; c++) {
       const w = sheet.getColumn(c).width;
-      if (w != null && w > 0) contentWidthPt += w * CHAR_WIDTH_PT;
+      if (w != null && w > 0) contentWidthPt += w * CHAR_WIDTH_PT + CELL_PAD_PT;
     }
-    if (contentWidthPt === 0) contentWidthPt = 40 * CHAR_WIDTH_PT;
+    if (contentWidthPt === 0) contentWidthPt = 40 * (CHAR_WIDTH_PT + CELL_PAD_PT);
 
     let maxHeightInAnySection = 0;
     for (const sec of sheetSections) {
@@ -1998,19 +1988,68 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     }
     if (maxHeightInAnySection === 0) maxHeightInAnySection = 300;
 
-    const effectiveMargin = Math.max(cfg.margin, 30);
+    return { sheet, maxCol, sheetSections, contentWidthPt, maxHeightInAnySection };
+  });
+
+  // ── Page geometry per sheet ───────────────────────────────────────────────
+  // Download path (no page size from caller): size each page to the content and
+  // render at 100% scale so the table is pixel-identical to Excel's natural
+  // size.  Print path: uniform fit to the caller's page — the height/width ratio
+  // is fixed, so both dimensions scale by the same factor, never distorted.
+  const geometries = layouts.map(L => {
+    if (useCustomPage) {
+      return {
+        pageSize: [L.contentWidthPt + 2 * effectiveMargin, L.maxHeightInAnySection + 2 * effectiveMargin],
+        layout: 'portrait',
+        scale: 1,
+        originX: effectiveMargin,
+        originY: effectiveMargin,
+      };
+    }
+    const ps  = _pageSize(pdfConfig.size);
+    const pgW = pdfConfig.layout === 'landscape' ? ps.h : ps.w;
+    const pgH = pdfConfig.layout === 'landscape' ? ps.w : ps.h;
     const aw2 = pgW - 2 * effectiveMargin;
     const ah2 = pgH - 2 * effectiveMargin;
-    const scale = Math.min(aw2 / contentWidthPt, ah2 / maxHeightInAnySection);
-    const ox = (aw2 - contentWidthPt * scale) / 2;
-    const oy = (ah2 - maxHeightInAnySection * scale) / 2;
-    const originX = effectiveMargin + ox;
-    const originY = effectiveMargin + oy;
+    const scale = Math.min(aw2 / L.contentWidthPt, ah2 / L.maxHeightInAnySection);
+    return {
+      pageSize: pdfConfig.size,
+      layout: pdfConfig.layout,
+      scale,
+      originX: effectiveMargin + (aw2 - L.contentWidthPt * scale) / 2,
+      originY: effectiveMargin + (ah2 - L.maxHeightInAnySection * scale) / 2,
+    };
+  });
+
+  const doc = new PDFDocument({
+    layout: geometries[0].layout,
+    size:   geometries[0].pageSize,
+    margin: effectiveMargin,
+  });
+
+  // Collect PDF output into a buffer
+  const chunks = [];
+  doc.on('data', chunk => chunks.push(chunk));
+  const pdfPromise = new Promise(resolve => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+
+  let isFirstSheet = true;
+
+  for (let si = 0; si < layouts.length; si++) {
+    const { sheet, maxCol, sheetSections } = layouts[si];
+    const geo = geometries[si];
+    const { originX, originY, scale } = geo;
+
+    if (!isFirstSheet) {
+      doc.addPage({ layout: geo.layout, size: geo.pageSize, margin: effectiveMargin });
+    }
+    isFirstSheet = false;
 
     for (let s = 0; s < sheetSections.length; s++) {
       const section = sheetSections[s];
       if (s > 0) {
-        doc.addPage({ layout: cfg.layout, size: cfg.size, margin: cfg.margin });
+        doc.addPage({ layout: geo.layout, size: geo.pageSize, margin: effectiveMargin });
       }
 
       let curY = originY;
@@ -2029,7 +2068,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
         row.eachCell({ includeEmpty: true }, (cell, cn) => {
           if (cn > maxCol) return;
 
-          const cw = (sheet.getColumn(cn).width || 10) * CHAR_WIDTH_PT * scale;
+          const cw = (sheet.getColumn(cn).width || 10) * CHAR_WIDTH_PT * scale + CELL_PAD_PT * scale;
 
           if (cell.isMerged && cell.address !== cell.master.address) {
             curX += cw;
@@ -2042,7 +2081,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
             const mr = _findMergeRange(sheet, cell.address);
             if (mr) {
               bw = 0;
-              for (let c = mr.left; c <= mr.right; c++) bw += (sheet.getColumn(c).width || 10) * CHAR_WIDTH_PT * scale;
+              for (let c = mr.left; c <= mr.right; c++) bw += (sheet.getColumn(c).width || 10) * CHAR_WIDTH_PT * scale + CELL_PAD_PT * scale;
               bh = 0;
               for (let r = mr.top; r <= mr.bottom; r++) bh += (sheet.getRow(r).height || 15) * scale;
             }
@@ -2223,7 +2262,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       // Draw the tourism office logo over the VAR header block (B1, rows 1-4)
       // on the first page, using the same origin/scale math as the cell grid.
       if (reportType === 'var' && s === 0 && varLogoBuffer) {
-        const colAW = (sheet.getColumn(1).width || 10) * CHAR_WIDTH_PT * scale;
+        const colAW = (sheet.getColumn(1).width || 10) * CHAR_WIDTH_PT * scale + CELL_PAD_PT * scale;
         const logoX = originX + colAW + (1038225 / 914400) * 72 * scale;
         const logoY = originY + (57150 / 914400) * 72 * scale;
         const logoPx = 64 * 0.75 * scale;
