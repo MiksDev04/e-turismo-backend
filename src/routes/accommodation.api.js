@@ -171,10 +171,10 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
       // as a same-day stay on the check-in date.
       const effectiveCheckOut = parseDbDate(row.actual_check_out || row.check_out) || new Date(checkIn);
 
-      // The check-out day is not a presence day, so the last presence day is
-      // the day before check-out (same-day stays count their single day).
+      // The check-out day IS a presence day (check-in Aug 6, check-out Aug 8
+      // counts 3 days / 2 nights), so the last presence day is the check-out
+      // day itself (same-day stays count their single day).
       const lastPresenceDay = new Date(effectiveCheckOut);
-      lastPresenceDay.setDate(lastPresenceDay.getDate() - 1);
       if (lastPresenceDay < checkIn) lastPresenceDay.setTime(checkIn.getTime());
 
       let daysInPeriod;

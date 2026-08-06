@@ -170,8 +170,9 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
          WHERE business_id IN (${placeholders}) AND is_deleted = FALSE AND check_in <= CURDATE()`,
         businessIds
       );
-      // For open stays (no actual_check_out yet), count nights to today — the
-      // current date stands in for the checkout day and is not itself counted.
+      // For open stays (no actual_check_out yet), count days to today — the
+      // current date stands in for the checkout day and is itself counted as a
+      // presence day (check-in Aug 6, check-out Aug 8 counts 3 days / 2 nights).
       const today = new Date();
       const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
       for (const gr of guestRows) {
@@ -179,8 +180,8 @@ router.get('/activity-summary', auth.authenticate, auth.requireRole('admin'), as
         const effectiveCheckOutRaw = gr.actual_check_out ? new Date(gr.actual_check_out) : todayMidnight;
         const checkIn = new Date(checkInRaw.getFullYear(), checkInRaw.getMonth(), checkInRaw.getDate());
         const effectiveCheckOut = new Date(effectiveCheckOutRaw.getFullYear(), effectiveCheckOutRaw.getMonth(), effectiveCheckOutRaw.getDate());
-        const nights = Math.max(1, Math.floor((effectiveCheckOut - checkIn) / 86400000));
-        const guestDays = Number(gr.total_guests) * nights;
+        const days = Math.floor((effectiveCheckOut - checkIn) / 86400000) + 1;
+        const guestDays = Number(gr.total_guests) * days;
         guestDaysMap.set(gr.business_id, (guestDaysMap.get(gr.business_id) || 0) + guestDays);
       }
     }
@@ -319,7 +320,8 @@ router.get('/daily-stats/:businessId', auth.authenticate, auth.requireRole('admi
 
       if (stayEnd < stayStart) continue;
 
-      // Determine last PRESENCE day (checkout day is NOT a presence day)
+      // Determine last PRESENCE day (checkout day IS a presence day — a
+      // check-in Aug 6 / check-out Aug 8 stay spans Aug 6, 7 and 8)
       const isSameDay = effectiveCheckOut.getTime() <= checkIn.getTime();
       let lastPresenceDay;
       if (isClamped) {
@@ -328,7 +330,6 @@ router.get('/daily-stats/:businessId', auth.authenticate, auth.requireRole('admi
         lastPresenceDay = checkIn;
       } else {
         lastPresenceDay = new Date(effectiveCheckOut);
-        lastPresenceDay.setDate(lastPresenceDay.getDate() - 1);
       }
 
       // Add 1 guest-day for each day the guest was present

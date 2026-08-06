@@ -1002,9 +1002,9 @@ async function _fetchMonthData(businessId, month, year) {
 
   // ── Spread all tallies across each day of stay ───────────────────────────
   // Tourist counts (country, residency, sex) are spread across every day the
-  // guest is present — not just the check-in day.  For overnight stays the
-  // check-out day is excluded ("Check-out data is not counted if tourist are
-  // overnight").  Same-day check-in/check-out counts on the single day.
+  // guest is present — not just the check-in day.  The check-out day counts
+  // too (check-in Aug 6, check-out Aug 8 is 3 days / 2 nights).  Same-day
+  // check-in/check-out counts on the single day (1 day / 0 nights).
   records.forEach(r => {
     const checkIn = _parseLocalDate(r.check_in);
     if (!checkIn) return;
@@ -1026,7 +1026,7 @@ async function _fetchMonthData(businessId, month, year) {
       bucket = listedSet.has(country) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
     }
 
-    const spreadDays = Math.max(1, nights);
+    const spreadDays = nights + 1;
     const arrivalDay = checkIn.getDate();
 
     for (let n = 0; n < spreadDays; n++) {
@@ -1049,8 +1049,10 @@ async function _fetchMonthData(businessId, month, year) {
       // Rooms occupied per day
       roomsOccupiedByDay[stayDay] = (roomsOccupiedByDay[stayDay] || 0) + rooms;
 
-      // Guest nights per day (only for overnight stays)
-      if (nights > 0) {
+      // Guest nights per day — only the actual overnight days.  A check-in
+      // Aug 6 / check-out Aug 8 stay spreads tourist counts over 3 days but
+      // contributes only 2 guest nights; same-day stays contribute 0.
+      if (nights > 0 && n < nights) {
         guestNightsByDay[stayDay] = (guestNightsByDay[stayDay] || 0) + guestCount;
 
         // Guest nights attributed to the arrival day (for ALOS calculation)
@@ -1129,7 +1131,9 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
     const effectiveCheckOut = r.actual_check_out || r.check_out;
     const checkOut = _parseLocalDate(effectiveCheckOut);
     const nights   = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    const spreadDays = Math.max(1, nights);
+    // VAR spread (tourist presence day count): the check-out day counts too
+    // (check-in Aug 6, check-out Aug 8 is 3 days; same-day stays are 1 day).
+    const spreadDays = nights + 1;
     const sex      = (r.lead_sex || '').toLowerCase();
     const gCountry = (r.lead_country || '').toUpperCase();
     const isForeign = !!r.lead_is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
