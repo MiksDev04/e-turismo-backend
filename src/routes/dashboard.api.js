@@ -122,7 +122,6 @@ router.get('/breakdowns', auth.authenticate, auth.requireRole('admin', 'business
     const placeholders = idsArray.map(() => '?').join(',');
     const [rows] = await connection.execute(
       `SELECT id AS guest_record_id, lead_country AS country,
-              lead_philippines_region AS philippines_region,
               lead_sex AS sex,
               CASE
                 WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
@@ -219,7 +218,6 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
       const placeholders = recordIds.map(() => '?').join(',');
       const [rows] = await connection.execute(
         `SELECT id AS guest_record_id, lead_country AS country,
-                lead_philippines_region AS philippines_region,
                 lead_sex AS sex,
                 CASE
                   WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'

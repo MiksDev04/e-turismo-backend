@@ -54,16 +54,16 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       totalGuests,
       roomIds,
       purposeOfVisit,
-      transportationMode,
       leadCountry,
       leadMunicipality,
       leadProvince,
       leadNationality,
-      leadPhilippinesRegion,
       leadIsOverseas,
       leadBirthdate,
       leadSex,
       status,
+      maleCount,
+      femaleCount,
     } = req.body;
 
     if (!businessId || !checkIn || !checkOut || !totalGuests || !leadSex) {
@@ -71,6 +71,20 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
     }
     if (!['male', 'female'].includes(leadSex?.toLowerCase())) {
       return res.status(400).json({ message: 'leadSex must be "male" or "female"' });
+    }
+
+    // Male/female counts: optional. If one is missing it is derived from the
+    // other; if both are blank, fall back to the PSA 47.1%/52.9% split.
+    const totalGuestsInt = parseInt(totalGuests, 10) || 1;
+    let maleCountInt = parseInt(maleCount, 10) || 0;
+    let femaleCountInt = parseInt(femaleCount, 10) || 0;
+    if (!maleCountInt && !femaleCountInt) {
+      maleCountInt = Math.round(totalGuestsInt * 0.471);
+      femaleCountInt = totalGuestsInt - maleCountInt;
+    } else if (!maleCountInt) {
+      maleCountInt = totalGuestsInt - femaleCountInt;
+    } else if (!femaleCountInt) {
+      femaleCountInt = totalGuestsInt - maleCountInt;
     }
 
     const guestRecordId = id || uuidv4();
@@ -105,9 +119,9 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
     await connection.execute(
       `INSERT INTO guest_records (
         id, business_id, check_in, check_out, actual_check_out, length_of_stay, total_guests,
-        purpose_of_visit, transportation_mode,
+        male_count, female_count, purpose_of_visit,
         lead_country, lead_city_municipality, lead_province,
-        lead_nationality, lead_philippines_region, lead_is_overseas,
+        lead_nationality, lead_is_overseas,
         lead_birthdate, lead_sex,
         status, is_deleted
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)`,
@@ -119,13 +133,13 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
         actualCheckOut || null,
         lengthOfStay,
         totalGuests,
+        maleCountInt,
+        femaleCountInt,
         purposeOfVisit,
-        transportationMode,
         leadCountry || null,
         leadMunicipality || null,
         leadProvince || null,
         leadIsOverseas ? null : (leadNationality || 'Foreign'),
-        leadPhilippinesRegion || null,
         leadIsOverseas ? 1 : 0,
         leadBirthdate || null,
         leadSex || null,

@@ -6,9 +6,11 @@
 -- Includes the updated guest-capture model:
 --   - `rooms` (new): individual rooms per business
 --   - `guest_records` (rebuilt): stay details + the lead guest's
---     demographics merged in directly (country, nationality, region,
---     birthdate, sex). The remaining guests in the party are implied
---     by total_guests - 1 and are not itemized.
+--     demographics merged in directly (country, nationality, birthdate,
+--     sex). Male/female counts are captured (or auto-split via the PSA
+--     47.1%/52.9% distribution when left blank). The remaining guests in
+--     the party are implied by total_guests - male_count - female_count
+--     and are not itemized.
 --   - `guest_record_rooms` (new): junction table -- a stay can span
 --     more than one room (a party of 5 might get split across two)
 --   - `guest_breakdowns` / `guest_breakdowns_synced` are retired.
@@ -152,15 +154,15 @@ CREATE TABLE `guest_records` (
   `actual_check_out` datetime DEFAULT NULL COMMENT 'Actual datetime when guest checked out',
   `length_of_stay` int NOT NULL COMMENT 'Nights; app computes as DATEDIFF(check_out, check_in), min 1',
   `total_guests` int NOT NULL,
+  `male_count` int NOT NULL DEFAULT 0 COMMENT 'Male guests; auto-filled via PSA 47.1/52.9 split when blank',
+  `female_count` int NOT NULL DEFAULT 0 COMMENT 'Female guests; female = total_guests - male_count',
   `purpose_of_visit` varchar(255) NOT NULL,
-  `transportation_mode` varchar(255) NOT NULL,
 
   -- Lead guest: the one whose valid ID was checked
   `lead_country` varchar(255) DEFAULT NULL,
   `lead_city_municipality` varchar(255) DEFAULT NULL,
   `lead_province` varchar(255) DEFAULT NULL,
   `lead_nationality` enum('Filipino','Foreign') DEFAULT NULL,
-  `lead_philippines_region` varchar(255) DEFAULT NULL COMMENT 'Only set when lead_nationality = Filipino',
   `lead_is_overseas` tinyint(1) NOT NULL DEFAULT '0' COMMENT 'True if a Filipino lead guest resides abroad (balikbayan/OFW)',
   `lead_birthdate` date NOT NULL COMMENT 'Age at time of stay is derived from this + check_in, not stored',
   `lead_sex` enum('male','female') NOT NULL,
@@ -178,6 +180,7 @@ CREATE TABLE `guest_records` (
   KEY `idx_gr_lead_nationality` (`lead_nationality`),
   CONSTRAINT `guest_records_business_id_fkey` FOREIGN KEY (`business_id`) REFERENCES `businesses` (`id`) ON DELETE RESTRICT,
   CONSTRAINT `chk_gr_total_guests` CHECK (`total_guests` >= 1),
+  CONSTRAINT `chk_gr_sex_sum` CHECK (`male_count` + `female_count` = `total_guests`),
   CONSTRAINT `chk_gr_dates` CHECK (`check_out` >= `check_in`),
   CONSTRAINT `chk_gr_lead_birthdate` CHECK (`lead_birthdate` <= `check_in`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
