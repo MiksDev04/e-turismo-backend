@@ -963,7 +963,8 @@ async function _fetchMonthData(businessId, month, year) {
   // or check_in within the month but check_out after it ends.
   const [records] = await db.pool.execute(
     `SELECT id, check_in, check_out, actual_check_out, total_guests,
-            lead_country, lead_sex, lead_nationality, lead_is_overseas
+            lead_country, lead_sex, lead_nationality, lead_is_overseas,
+            male_count, female_count
      FROM guest_records
      WHERE business_id = ? AND is_deleted = false
        AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ? ${statusFilter}`,
@@ -1073,12 +1074,24 @@ async function _fetchMonthData(businessId, month, year) {
       residentsByDay[stayDay][bucket] = (residentsByDay[stayDay][bucket] || 0) + count;
       residentsByDay[0][bucket]       = (residentsByDay[0][bucket]       || 0) + count;
 
-      // Sex × residency breakdown (1 per record — lead guest only)
+      // Sex × residency breakdown — counts all guests in the party via the
+      // record's male_count / female_count, not just the lead guest's sex.
+      // Residence is a party-level attribute, so the bucket is resolved once.
+      let maleCount   = _asInt(r.male_count);
+      let femaleCount = _asInt(r.female_count);
+      if (maleCount + femaleCount === 0) {
+        // Defensive fallback for legacy/anomalous rows: count the lead guest only.
+        if (sex === 'female') femaleCount = 1; else maleCount = 1;
+      }
       sexByDay[stayDay] = sexByDay[stayDay] || { male: {}, female: {} };
-      if (!sexByDay[stayDay][sex]) sexByDay[stayDay][sex] = {};
-      if (!sexByDay[0][sex])       sexByDay[0][sex]       = {};
-      sexByDay[stayDay][sex][bucket] = (sexByDay[stayDay][sex][bucket] || 0) + 1;
-      sexByDay[0][sex][bucket]       = (sexByDay[0][sex][bucket]       || 0) + 1;
+      if (!sexByDay[stayDay].male)   sexByDay[stayDay].male   = {};
+      if (!sexByDay[stayDay].female) sexByDay[stayDay].female = {};
+      if (!sexByDay[0].male)         sexByDay[0].male         = {};
+      if (!sexByDay[0].female)       sexByDay[0].female       = {};
+      sexByDay[stayDay].male[bucket]   = (sexByDay[stayDay].male[bucket]   || 0) + maleCount;
+      sexByDay[stayDay].female[bucket] = (sexByDay[stayDay].female[bucket] || 0) + femaleCount;
+      sexByDay[0].male[bucket]         = (sexByDay[0].male[bucket]         || 0) + maleCount;
+      sexByDay[0].female[bucket]       = (sexByDay[0].female[bucket]       || 0) + femaleCount;
     }
   });
 
