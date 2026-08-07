@@ -1106,7 +1106,8 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
   const [records] = await db.pool.execute(
     `SELECT id, check_in, check_out, actual_check_out, total_guests,
             lead_country, lead_sex, lead_nationality, lead_is_overseas,
-            lead_city_municipality, lead_province
+            lead_city_municipality, lead_province,
+            male_count, female_count
      FROM guest_records
      WHERE business_id = ? AND is_deleted = false
        AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?
@@ -1134,22 +1135,38 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
     // VAR spread (tourist presence day count): the check-out day counts too
     // (check-in Aug 6, check-out Aug 8 is 3 days; same-day stays are 1 day).
     const spreadDays = nights + 1;
-    const sex      = (r.lead_sex || '').toLowerCase();
+
+    // Sex distribution uses the record's male_count / female_count (all guests
+    // in the party), not just the lead guest's sex.  Residence is a party-level
+    // attribute, so the bucket is resolved once from the lead guest's address.
+    let maleCount   = _asInt(r.male_count);
+    let femaleCount = _asInt(r.female_count);
+    if (maleCount + femaleCount === 0) {
+      // Defensive fallback for legacy/anomalous rows: count the lead guest only.
+      const sex = (r.lead_sex || '').toLowerCase();
+      if (sex === 'female') femaleCount = 1; else maleCount = 1;
+    }
+
     const gCountry = (r.lead_country || '').toUpperCase();
     const isForeign = !!r.lead_is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
 
-    let bucket;
+    let maleBucket;
+    let femaleBucket;
     if (isForeign) {
-      bucket = sex === 'female' ? 'femaleForeign' : 'maleForeign';
+      maleBucket   = 'maleForeign';
+      femaleBucket = 'femaleForeign';
     } else {
       const gCity = _normalizeCityName(r.lead_city_municipality);
       const gProv = (r.lead_province || '').toUpperCase();
       if (gCity && gCity === bCity) {
-        bucket = sex === 'female' ? 'femaleThisCity' : 'maleThisCity';
+        maleBucket   = 'maleThisCity';
+        femaleBucket = 'femaleThisCity';
       } else if (gProv && gProv === bProv) {
-        bucket = sex === 'female' ? 'femaleOtherCity' : 'maleOtherCity';
+        maleBucket   = 'maleOtherCity';
+        femaleBucket = 'femaleOtherCity';
       } else {
-        bucket = sex === 'female' ? 'femaleOtherProvince' : 'maleOtherProvince';
+        maleBucket   = 'maleOtherProvince';
+        femaleBucket = 'femaleOtherProvince';
       }
     }
 
@@ -1157,7 +1174,8 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
       const stayDate = new Date(checkIn);
       stayDate.setDate(checkIn.getDate() + n);
       if (stayDate.getFullYear() !== year || (stayDate.getMonth() + 1) !== month) continue;
-      data[bucket] += 1;
+      data[maleBucket]   += maleCount;
+      data[femaleBucket] += femaleCount;
     }
   });
 
