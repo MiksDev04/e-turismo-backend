@@ -112,7 +112,8 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
       const placeholders = recordIds.map(() => '?').join(',');
       const [roomLinks] = await connection.execute(
         `SELECT grr.guest_record_id, r.id AS room_id, r.room_number, r.capacity,
-                grr.status AS link_status, grr.deleted_at AS deleted_at
+                grr.status AS link_status, grr.deleted_at AS deleted_at,
+                grr.created_at AS created_at, grr.updated_at AS updated_at
          FROM guest_record_rooms grr
          JOIN rooms r ON r.id = grr.room_id
          JOIN guest_records gr ON gr.id = grr.guest_record_id
@@ -131,6 +132,8 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
           capacity: rl.capacity,
           status: rl.link_status,
           deletedAt: rl.deleted_at,
+          createdAt: rl.created_at,
+          updatedAt: rl.updated_at,
         });
       }
     }
