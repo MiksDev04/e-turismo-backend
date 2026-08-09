@@ -69,7 +69,8 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('admin', 'busin
       return res.status(400).json({ message: 'Missing date parameters' });
     }
 
-    let query = `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests, purpose_of_visit
+    let query = `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
+                        male_count, female_count, lead_sex, purpose_of_visit
                  FROM guest_records 
                  WHERE is_deleted = FALSE 
                    AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`;
@@ -195,7 +196,8 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     );
 
     const [periodRecords] = await connection.execute(
-      `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests, purpose_of_visit
+      `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
+              male_count, female_count, lead_sex, purpose_of_visit
        FROM guest_records WHERE is_deleted = FALSE AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`,
       [startDate, endDate]
     );
@@ -205,7 +207,8 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
       yearRecords = periodRecords;
     } else {
       const [rows] = await connection.execute(
-        `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests, purpose_of_visit
+        `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
+                male_count, female_count, lead_sex, purpose_of_visit
          FROM guest_records WHERE is_deleted = FALSE AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`,
         [yearStart, yearEnd]
       );
