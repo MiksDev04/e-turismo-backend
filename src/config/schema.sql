@@ -152,7 +152,6 @@ CREATE TABLE `guest_records` (
   `check_in` date NOT NULL,
   `check_out` date NOT NULL,
   `actual_check_out` datetime DEFAULT NULL COMMENT 'Actual datetime when guest checked out',
-  `length_of_stay` int NOT NULL COMMENT 'Nights; app computes as DATEDIFF(check_out, check_in), min 1',
   `total_guests` int NOT NULL,
   `male_count` int NOT NULL DEFAULT 0 COMMENT 'Male guests; auto-filled via PSA 47.1/52.9 split when blank',
   `female_count` int NOT NULL DEFAULT 0 COMMENT 'Female guests; female = total_guests - male_count',

@@ -126,7 +126,6 @@ CREATE TABLE `guest_records` (
   `check_in` date NOT NULL,
   `check_out` date NOT NULL,
   `actual_check_out` datetime DEFAULT NULL,
-  `length_of_stay` int NOT NULL COMMENT 'Nights; app computes as DATEDIFF(check_out, check_in), min 1',
   `total_guests` int NOT NULL,
   `purpose_of_visit` varchar(255) NOT NULL,
   `transportation_mode` varchar(255) NOT NULL,

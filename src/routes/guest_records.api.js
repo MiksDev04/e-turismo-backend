@@ -2,7 +2,6 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
-import { parseDbDate } from '../utils/date.js';
 
 const router = express.Router();
 
@@ -88,7 +87,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     // ── Fetch guest records with lead guest fields ───────────────────────
     let query = `SELECT gr.id, gr.business_id, gr.check_in, gr.check_out,
                         gr.actual_check_out,
-                        gr.length_of_stay, gr.total_guests,
+                        gr.total_guests,
                         gr.male_count, gr.female_count, gr.purpose_of_visit,
                         gr.lead_country, gr.lead_city_municipality, gr.lead_province,
                         gr.lead_nationality, gr.lead_is_overseas,
@@ -204,9 +203,6 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
 
     await connection.beginTransaction();
 
-    const effectiveCheckOut = actualCheckOut ? String(actualCheckOut).slice(0, 10) : checkOut;
-    const lengthOfStay = Math.max(1, Math.round((parseDbDate(effectiveCheckOut) - parseDbDate(checkIn)) / (1000 * 60 * 60 * 24)));
-
     // Check if record exists
     const [existing] = await connection.execute(
       `SELECT id FROM guest_records WHERE id = ?`,
@@ -222,20 +218,19 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       }
       await connection.execute(
         `INSERT INTO guest_records (
-          id, business_id, check_in, check_out, actual_check_out, length_of_stay, total_guests,
+          id, business_id, check_in, check_out, actual_check_out, total_guests,
           male_count, female_count, purpose_of_visit,
           lead_country, lead_city_municipality, lead_province,
           lead_nationality, lead_is_overseas,
           lead_birthdate, lead_sex,
           status, is_deleted, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
         [
           recordId,
           businessId,
           checkIn,
           checkOut,
           actualCheckOut || null,
-          lengthOfStay,
           totalGuests,
           maleCountInt,
           femaleCountInt,
@@ -277,7 +272,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
     } else {
       // Update existing
       const updateFields = [
-        `check_in = ?`, `check_out = ?`, `length_of_stay = ?`, `total_guests = ?`,
+        `check_in = ?`, `check_out = ?`, `total_guests = ?`,
         `male_count = ?`, `female_count = ?`, `purpose_of_visit = ?`,
         `lead_country = ?`, `lead_city_municipality = ?`, `lead_province = ?`,
         `lead_nationality = ?`, `lead_is_overseas = ?`,
@@ -287,7 +282,6 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       const updateParams = [
         checkIn,
         checkOut,
-        lengthOfStay,
         totalGuests,
         maleCountInt,
         femaleCountInt,

@@ -2,7 +2,6 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
-import { parseDbDate } from '../utils/date.js';
 
 const router = express.Router();
 
@@ -88,8 +87,6 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
     }
 
     const guestRecordId = id || uuidv4();
-    const effectiveCheckOut = actualCheckOut ? String(actualCheckOut).slice(0, 10) : checkOut;
-    const lengthOfStay = Math.max(1, Math.round((parseDbDate(effectiveCheckOut) - parseDbDate(checkIn)) / (1000 * 60 * 60 * 24)));
 
     await connection.beginTransaction();
 
@@ -116,23 +113,21 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       }
     }
 
-    // Compute length_of_stay from dates
     await connection.execute(
       `INSERT INTO guest_records (
-        id, business_id, check_in, check_out, actual_check_out, length_of_stay, total_guests,
+        id, business_id, check_in, check_out, actual_check_out, total_guests,
         male_count, female_count, purpose_of_visit,
         lead_country, lead_city_municipality, lead_province,
         lead_nationality, lead_is_overseas,
         lead_birthdate, lead_sex,
         status, is_deleted
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)`,
       [
         guestRecordId,
         businessId,
         checkIn,
         checkOut,
         actualCheckOut || null,
-        lengthOfStay,
         totalGuests,
         maleCountInt,
         femaleCountInt,
