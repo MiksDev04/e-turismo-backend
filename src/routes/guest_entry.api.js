@@ -88,7 +88,8 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
     }
 
     const guestRecordId = id || uuidv4();
-    const lengthOfStay = Math.max(1, Math.round((parseDbDate(checkOut) - parseDbDate(checkIn)) / (1000 * 60 * 60 * 24)));
+    const effectiveCheckOut = actualCheckOut ? String(actualCheckOut).slice(0, 10) : checkOut;
+    const lengthOfStay = Math.max(1, Math.round((parseDbDate(effectiveCheckOut) - parseDbDate(checkIn)) / (1000 * 60 * 60 * 24)));
 
     await connection.beginTransaction();
 
