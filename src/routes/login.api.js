@@ -103,6 +103,46 @@ router.post('/login', async (req, res, next) => {
       };
     }
 
+    // 4b. If attraction role, fetch attraction details
+    if (user.role === 'attraction') {
+      const [attractions] = await db.pool.execute(
+        'SELECT * FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+        [user.id]
+      );
+
+      if (attractions.length === 0) {
+        return res.status(404).json({ message: 'Attraction profile not found. Please contact support.' });
+      }
+
+      const attraction = attractions[0];
+
+      // Check status
+      if (attraction.status === 'pending') {
+        return res.status(403).json({ message: 'Your account is still pending approval.' });
+      }
+      if (attraction.status === 'suspended') {
+        return res.status(403).json({ message: 'Your account is suspended because of violations.' });
+      }
+      if (attraction.status === 'rejected') {
+        return res.status(403).json({ message: 'Your account application was not approved.' });
+      }
+
+      responseData.attraction = {
+        id: attraction.id,
+        attraction_name: attraction.attraction_name,
+        attraction_type: typeof attraction.attraction_type === 'string'
+          ? JSON.parse(attraction.attraction_type)
+          : attraction.attraction_type,
+        valid_id_url: attraction.valid_id_url,
+        street: attraction.street,
+        barangay: attraction.barangay,
+        status: attraction.status,
+        remarks: attraction.remarks,
+        created_at: attraction.created_at,
+        updated_at: attraction.updated_at
+      };
+    }
+
     // 5. Generate JWT
     const token = jwt.sign(
       { id: user.id, role: user.role },

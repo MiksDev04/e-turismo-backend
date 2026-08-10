@@ -15,8 +15,23 @@
 --     more than one room (a party of 5 might get split across two)
 --   - `guest_breakdowns` / `guest_breakdowns_synced` are retired.
 --
+-- Includes the tourist-attraction model:
+--   - `tourist_attractions` (new): public attractions (parks, plazas,
+--     LGU-managed sites) tied to a user account, same pending/approved
+--     workflow as businesses. One account = exactly one attraction.
+--   - `attraction_visit_logs` (new): batch visit entries per attraction
+--     per day (guest_count + origin classification) — no PII, like a
+--     gate logbook.
+--   - `message_recipients` now links to either a business OR an
+--     attraction (exactly one per row).
+--   - `report_batches.report_type` widened to 'attraction' (reuses the
+--     DAE 'daily' grid, one sheet per attraction).
+--   - `users.role` widened to 'attraction'; `pending_email_confirmations
+--     .purpose` widened to 'attraction_registration'.
+--
 -- Table creation order respects foreign key dependencies:
---   users -> businesses -> rooms -> guest_records -> guest_record_rooms
+--   users -> businesses -> tourist_attractions -> attraction_visit_logs
+--         -> rooms -> guest_records -> guest_record_rooms
 --         -> messages -> message_recipients
 --         -> report_batches
 -- =====================================================================
@@ -38,6 +53,8 @@ DROP TABLE IF EXISTS `guest_records`;
 DROP TABLE IF EXISTS `guest_breakdowns`;
 DROP TABLE IF EXISTS `rooms`;
 DROP TABLE IF EXISTS `businesses`;
+DROP TABLE IF EXISTS `attraction_visit_logs`;
+DROP TABLE IF EXISTS `tourist_attractions`;
 DROP TABLE IF EXISTS `pending_email_confirmations`;
 DROP TABLE IF EXISTS `users`;
 
@@ -51,7 +68,7 @@ CREATE TABLE `users` (
   `email` varchar(255) DEFAULT NULL,
   `username` varchar(100) NOT NULL,
   `password` text NOT NULL,
-  `role` enum('business','admin') NOT NULL DEFAULT 'business',
+  `role` enum('business','admin','attraction') NOT NULL DEFAULT 'business',
   `reset_otp` varchar(6) DEFAULT NULL,
   `reset_otp_expiry` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -71,7 +88,7 @@ CREATE TABLE `users` (
 -- ---------------------------------------------------------------
 CREATE TABLE `pending_email_confirmations` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
-  `purpose` enum('admin_setup','business_registration') NOT NULL,
+  `purpose` enum('admin_setup','business_registration','attraction_registration') NOT NULL,
   `full_name` varchar(255) NOT NULL,
   `username` varchar(100) NOT NULL,
   `email` varchar(255) NOT NULL,
@@ -121,6 +138,55 @@ CREATE TABLE `businesses` (
   KEY `idx_businesses_status` (`status`),
   KEY `idx_businesses_deleted_at` (`deleted_at`),
   CONSTRAINT `businesses_user_id_fkey` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ---------------------------------------------------------------
+-- Table: tourist_attractions (new)
+-- ---------------------------------------------------------------
+CREATE TABLE `tourist_attractions` (
+  `id` char(36) NOT NULL DEFAULT (uuid()),
+  `user_id` char(36) NOT NULL,
+  `attraction_name` varchar(255) NOT NULL,
+  `attraction_type` json DEFAULT NULL COMMENT 'Array of one or more: Ecotourism, Natural Attractions, Cultural, Religious, Historical Heritage Sites, Agri-Tourism, Farm Tourism Sites',
+  `valid_id_url` varchar(1000) DEFAULT NULL,
+  `barangay` varchar(255) DEFAULT NULL,
+  `street` text,
+  `status` enum('pending','approved','rejected','warning') NOT NULL DEFAULT 'pending',
+  `remarks` text,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `deleted_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_ta_user_id` (`user_id`),
+  KEY `idx_ta_status` (`status`),
+  KEY `idx_ta_deleted_at` (`deleted_at`),
+  CONSTRAINT `tourist_attractions_user_id_fkey` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ---------------------------------------------------------------
+-- Table: attraction_visit_logs (new)
+-- ---------------------------------------------------------------
+CREATE TABLE `attraction_visit_logs` (
+  `id` char(36) NOT NULL DEFAULT (uuid()),
+  `attraction_id` char(36) NOT NULL,
+  `visit_date` date NOT NULL,
+  `guest_count` int NOT NULL,
+  `male_count` int DEFAULT NULL COMMENT 'Optional',
+  `female_count` int DEFAULT NULL COMMENT 'Optional',
+  `nationality` enum('Filipino','Foreign') NOT NULL,
+  `country` varchar(255) DEFAULT NULL COMMENT 'Only set when nationality = Foreign',
+  `province` varchar(255) DEFAULT NULL COMMENT 'Only set when nationality = Filipino',
+  `city_municipality` varchar(255) DEFAULT NULL COMMENT 'Only set when nationality = Filipino',
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `deleted_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_avl_attraction_id` (`attraction_id`),
+  KEY `idx_avl_visit_date` (`visit_date`),
+  KEY `idx_avl_deleted_at` (`deleted_at`),
+  CONSTRAINT `attraction_visit_logs_attraction_id_fkey` FOREIGN KEY (`attraction_id`) REFERENCES `tourist_attractions` (`id`) ON DELETE RESTRICT,
+  CONSTRAINT `chk_avl_guest_count` CHECK (`guest_count` >= 1),
+  CONSTRAINT `chk_avl_sex_sum` CHECK (`male_count` IS NULL OR `female_count` IS NULL OR `male_count` + `female_count` = `guest_count`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- ---------------------------------------------------------------
@@ -229,7 +295,8 @@ CREATE TABLE `messages` (
 CREATE TABLE `message_recipients` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
   `message_id` char(36) NOT NULL,
-  `business_id` char(36) NOT NULL,
+  `business_id` char(36) DEFAULT NULL,
+  `attraction_id` char(36) DEFAULT NULL,
   `status` enum('unread','read','archived') NOT NULL DEFAULT 'unread',
   `is_read` tinyint(1) NOT NULL DEFAULT '0',
   `read_at` datetime DEFAULT NULL,
@@ -237,10 +304,16 @@ CREATE TABLE `message_recipients` (
   PRIMARY KEY (`id`),
   KEY `idx_mr_message_id` (`message_id`),
   KEY `idx_mr_business_id` (`business_id`),
+  KEY `idx_mr_attraction_id` (`attraction_id`),
   KEY `idx_mr_is_read` (`is_read`),
   KEY `idx_mr_status` (`status`),
   CONSTRAINT `message_recipients_business_id_fkey` FOREIGN KEY (`business_id`) REFERENCES `businesses` (`id`),
-  CONSTRAINT `message_recipients_message_id_fkey` FOREIGN KEY (`message_id`) REFERENCES `messages` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
+  CONSTRAINT `message_recipients_attraction_id_fkey` FOREIGN KEY (`attraction_id`) REFERENCES `tourist_attractions` (`id`),
+  CONSTRAINT `message_recipients_message_id_fkey` FOREIGN KEY (`message_id`) REFERENCES `messages` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `chk_mr_recipient_exclusive` CHECK (
+    (`business_id` IS NOT NULL AND `attraction_id` IS NULL)
+    OR (`business_id` IS NULL AND `attraction_id` IS NOT NULL)
+  )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- ---------------------------------------------------------------
@@ -248,7 +321,7 @@ CREATE TABLE `message_recipients` (
 -- ---------------------------------------------------------------
 CREATE TABLE `report_batches` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
-  `report_type` enum('dae','var') NOT NULL,
+  `report_type` enum('dae','var','attraction') NOT NULL,
   `report_variant` enum('daily','summary','series','total') NOT NULL
     COMMENT 'DAE: daily/summary/series. VAR always uses total (single sheet).',
   `period_year` smallint NOT NULL,
@@ -272,7 +345,8 @@ CREATE TABLE `report_batches` (
   CONSTRAINT `chk_batch_period_months_array` CHECK (JSON_TYPE(`period_months`) = 'ARRAY'),
   CONSTRAINT `chk_batch_variant_matches_type` CHECK (
     (`report_type` = 'dae' AND `report_variant` IN ('daily','summary','series')) OR
-    (`report_type` = 'var' AND `report_variant` = 'total')
+    (`report_type` = 'var' AND `report_variant` = 'total') OR
+    (`report_type` = 'attraction' AND `report_variant` = 'daily')
   ),
   CONSTRAINT `chk_batch_single_month_variants` CHECK (
     `report_variant` NOT IN ('daily','summary') OR JSON_LENGTH(`period_months`) = 1
@@ -309,4 +383,30 @@ SET FOREIGN_KEY_CHECKS = 1;
 -- JOIN guest_record_rooms grr ON grr.guest_record_id = gr.id
 -- JOIN rooms r ON r.id = grr.room_id
 -- GROUP BY gr.id;
+--
+-- VAR total now combines both sources (accommodations + attractions).
+-- Per classification bucket, sum the two groupings:
+--
+-- SELECT nationality, country, province, city_municipality,
+--        SUM(guest_count) AS guest_count
+-- FROM (
+--   SELECT
+--     gr.lead_nationality AS nationality,
+--     gr.lead_country     AS country,
+--     gr.lead_province    AS province,
+--     gr.lead_city_municipality AS city_municipality,
+--     gr.total_guests     AS guest_count
+--   FROM guest_records gr
+--   WHERE gr.is_deleted = 0
+--   UNION ALL
+--   SELECT
+--     avl.nationality,
+--     avl.country,
+--     avl.province,
+--     avl.city_municipality,
+--     avl.guest_count
+--   FROM attraction_visit_logs avl
+--   WHERE avl.deleted_at IS NULL
+-- ) combined
+-- GROUP BY nationality, country, province, city_municipality;
 -- =====================================================================
