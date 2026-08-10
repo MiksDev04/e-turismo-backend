@@ -43,6 +43,14 @@ router.get('/profile', auth.authenticate, async (req, res, next) => {
       responseData.business = business;
     }
 
+    if (user.role === 'attraction') {
+      const [attractions] = await db.pool.execute(
+        'SELECT * FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+        [user.id]
+      );
+      responseData.attraction = attractions[0] || null;
+    }
+
     res.json(responseData);
   } catch (err) {
     next(err);
