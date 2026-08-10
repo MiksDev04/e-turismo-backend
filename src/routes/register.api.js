@@ -13,6 +13,26 @@ const usernameRe = /^[a-zA-Z0-9_]{3,20}$/;
 const emailRe = /^[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}$/;
 const phoneRe = /^(09|\+639)\d{9}$/;
 const specialCharacterRe = /[!@#$%^&*()\-_=+\[\]{};:',.<>?\/\\|`~@]/;
+const registrationPurposes = ['business_registration', 'attraction_registration'];
+const allowedBusinessLines = [
+  'hotel',
+  'resort',
+  'motel',
+  'pension_inn',
+  'youth_hostel',
+  'apartment',
+  'others',
+];
+const allowedBusinessTypes = ['sole_proprietorship', 'corporation', 'partnership'];
+const allowedAttractionTypes = [
+  'ecotourism',
+  'natural_attractions',
+  'cultural',
+  'religious',
+  'historical_heritage_sites',
+  'agri_tourism',
+  'farm_tourism_sites',
+];
 
 function normalizeEmail(email) {
   return String(email || '').trim().toLowerCase();
@@ -45,10 +65,221 @@ function validateBusinessAccount(body) {
   return null;
 }
 
-function validateBusinessDetails(body) {
-  const aeId = String(body.aeId || '').trim();
-  if (!aeId) return 'AE ID is required.';
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch (e) {
+      return value.split(',').map((s) => s.trim());
+    }
+  }
   return null;
+}
+
+function validateBusinessRegistration(body) {
+  const accountValidationError = validateBusinessAccount(body);
+  if (accountValidationError) return accountValidationError;
+
+  const businessName = String(body.businessName || '').trim();
+  const businessType = String(body.businessType || 'sole_proprietorship').trim();
+  const businessLine = parseJsonArray(body.businessLine);
+  const ownerFirstName = String(body.ownerFirstName || '').trim();
+  const ownerLastName = String(body.ownerLastName || '').trim();
+  const permitNumber = String(body.permitNumber || '').trim();
+  const registrationNumber = String(body.registrationNumber || '').trim();
+  const aeId = String(body.aeId || '').trim();
+  const street = String(body.street || '').trim();
+  const barangay = String(body.barangay || '').trim();
+  const cityMunicipality = String(body.cityMunicipality || '').trim();
+  const province = String(body.province || '').trim();
+  const region = String(body.region || '').trim();
+
+  if (!businessName) return 'Business name is required.';
+  if (!allowedBusinessTypes.includes(businessType)) {
+    return 'Invalid business type selected.';
+  }
+  if (!Array.isArray(businessLine) || businessLine.length === 0) {
+    return 'Select at least one business line.';
+  }
+  if (businessLine.some((line) => !allowedBusinessLines.includes(line))) {
+    return 'Invalid business line selected.';
+  }
+  if (!ownerFirstName) return 'Owner first name is required.';
+  if (!ownerLastName) return 'Owner last name is required.';
+  if (!permitNumber) return 'Permit number is required.';
+  if (!registrationNumber) return 'Registration number is required.';
+  if (!aeId) return 'AE ID is required.';
+  if (!street) return 'Street is required.';
+  if (!barangay) return 'Barangay is required.';
+  if (!cityMunicipality) return 'City / Municipality is required.';
+  if (!province) return 'Province is required.';
+  if (!region) return 'Region is required.';
+
+  const rooms = parseJsonArray(body.rooms);
+  if (Array.isArray(rooms)) {
+    for (const room of rooms) {
+      if (room && typeof room === 'object') {
+        if (!String(room.name || '').trim()) return 'Room name is required.';
+        const capacity = parseInt(room.capacity, 10);
+        if (!Number.isInteger(capacity) || capacity < 1) {
+          return 'Room capacity must be at least 1.';
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function validateAttractionRegistration(body) {
+  const accountValidationError = validateBusinessAccount(body);
+  if (accountValidationError) return accountValidationError;
+
+  const attractionName = String(body.attractionName || '').trim();
+  const attractionTypes = parseJsonArray(body.attractionTypes);
+  const street = String(body.street || '').trim();
+  const barangay = String(body.barangay || '').trim();
+
+  if (!attractionName) return 'Attraction name is required.';
+  if (!Array.isArray(attractionTypes) || attractionTypes.length === 0) {
+    return 'Select at least one attraction type.';
+  }
+  if (attractionTypes.some((type) => !allowedAttractionTypes.includes(type))) {
+    return 'Invalid attraction type selected.';
+  }
+  if (!street) return 'Street is required.';
+  if (!barangay) return 'Barangay is required.';
+  return null;
+}
+
+async function handleAttractionRegistration(req, res, next, connection) {
+  try {
+    const {
+      fullName,
+      username,
+      email,
+      phoneNumber,
+      attractionName,
+      attractionTypes,
+      street,
+      barangay,
+    } = req.body;
+
+    const attractionValidationError = validateAttractionRegistration(req.body);
+    if (attractionValidationError) {
+      return res.status(400).json({ message: attractionValidationError });
+    }
+
+    const files = req.files;
+    if (!files || !files.valid_id || !files.valid_id[0]) {
+      return res.status(400).json({ message: 'Valid ID is required.' });
+    }
+
+    const normalizedUsername = String(username || '').trim().toLowerCase();
+    const normalizedEmail = normalizeEmail(email);
+
+    if (await hasUserConflict({
+      username: normalizedUsername,
+      email: normalizedEmail,
+      connection,
+    })) {
+      return res.status(409).json({ message: 'Username or email is already taken.' });
+    }
+
+    const [pendingRows] = await connection.execute(
+      `SELECT id, password_hash, confirmed_at,
+              expires_at < NOW() AS is_expired
+       FROM pending_email_confirmations
+       WHERE purpose = 'attraction_registration'
+         AND email = ?
+       LIMIT 1`,
+      [normalizedEmail]
+    );
+
+    const pending = pendingRows[0];
+
+    if (!pending) {
+      return res.status(400).json({ message: 'Please confirm your email before submitting.' });
+    }
+
+    if (!pending.confirmed_at) {
+      return res.status(400).json({ message: 'Please confirm your email before submitting.' });
+    }
+
+    if (pending.is_expired) {
+      return res.status(400).json({
+        message: 'Your email confirmation has expired. Please send a new confirmation email and try again.',
+      });
+    }
+
+    await connection.beginTransaction();
+
+    const userId = uuidv4();
+
+    await connection.execute(
+      `INSERT INTO users (id, full_name, phone, email, username, password, role)
+       VALUES (?, ?, ?, ?, ?, ?, 'attraction')`,
+      [
+        userId,
+        String(fullName || '').trim(),
+        normalizePhone(phoneNumber),
+        normalizedEmail,
+        normalizedUsername,
+        pending.password_hash
+      ]
+    );
+
+    const attractionId = uuidv4();
+
+    const validIdFile = files.valid_id[0];
+
+    const validIdUpload = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { resource_type: 'raw', folder: 'tourism/valid_ids', public_id: attractionId, overwrite: true },
+        (err, result) => { if (err) reject(err); else resolve(result); }
+      );
+      stream.end(validIdFile.buffer);
+    });
+
+    let parsedAttractionTypes = attractionTypes;
+    if (typeof attractionTypes === 'string') {
+      try {
+        parsedAttractionTypes = JSON.parse(attractionTypes);
+      } catch (e) {
+        parsedAttractionTypes = attractionTypes.split(',').map((s) => s.trim());
+      }
+    }
+
+    await connection.execute(
+      `INSERT INTO tourist_attractions (
+         id, user_id, attraction_name, attraction_type, valid_id_url, barangay, street, status
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [
+        attractionId,
+        userId,
+        String(attractionName || '').trim(),
+        JSON.stringify(parsedAttractionTypes || []),
+        validIdUpload.secure_url,
+        String(barangay || '').trim(),
+        String(street || '').trim()
+      ]
+    );
+
+    await connection.execute('DELETE FROM pending_email_confirmations WHERE id = ?', [pending.id]);
+
+    await connection.commit();
+
+    res.status(201).json({
+      message: 'Registration successful. Your account is pending approval.',
+      userId,
+      attractionId
+    });
+  } catch (err) {
+    await connection.rollback();
+    next(err);
+  }
 }
 
 async function hasUserConflict({ username, email, connection = db.pool }) {
@@ -64,6 +295,11 @@ async function hasUserConflict({ username, email, connection = db.pool }) {
 
 router.post('/register/send-confirmation', async (req, res, next) => {
   try {
+    const purpose = String(req.body.purpose || 'business_registration').trim();
+    if (!registrationPurposes.includes(purpose)) {
+      return res.status(400).json({ message: 'Invalid registration purpose.' });
+    }
+
     const validationError = validateBusinessAccount(req.body);
     if (validationError) {
       return res.status(400).json({ message: validationError });
@@ -86,15 +322,15 @@ router.post('/register/send-confirmation', async (req, res, next) => {
     const id = uuidv4();
 
     await db.pool.execute(
-      `DELETE FROM pending_email_confirmations WHERE purpose = 'business_registration' AND email = ?`,
-      [email]
+      `DELETE FROM pending_email_confirmations WHERE purpose = ? AND email = ?`,
+      [purpose, email]
     );
 
     await db.pool.execute(
       `INSERT INTO pending_email_confirmations
          (id, purpose, full_name, username, email, phone, password_hash, confirmation_token, expires_at)
-       VALUES (?, 'business_registration', ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
-      [id, fullName, username, email, phoneNumber, hashedPassword, token]
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
+      [id, purpose, fullName, username, email, phoneNumber, hashedPassword, token]
     );
 
     const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
@@ -126,7 +362,7 @@ router.get('/register/confirm', async (req, res, next) => {
       `SELECT id, email, expires_at, confirmed_at,
               expires_at < NOW() AS is_expired
        FROM pending_email_confirmations
-       WHERE purpose = 'business_registration' AND confirmation_token = ?
+       WHERE confirmation_token = ?
        LIMIT 1`,
       [token]
     );
@@ -163,20 +399,27 @@ router.get('/register/confirm', async (req, res, next) => {
 router.get('/register/confirmation-status', async (req, res, next) => {
   try {
     const email = normalizeEmail(req.query.email);
+    const purpose = String(req.query.purpose || 'business_registration').trim();
 
     if (!email) {
       return res.status(400).json({ message: 'Email is required.' });
     }
 
+    if (!registrationPurposes.includes(purpose)) {
+      return res.status(400).json({ message: 'Invalid registration purpose.' });
+    }
+
     const [rows] = await db.pool.execute(
       `SELECT confirmed_at
        FROM pending_email_confirmations
-       WHERE purpose = 'business_registration' AND email = ?
+       WHERE purpose = ? AND email = ?
+         AND confirmed_at IS NOT NULL
+         AND expires_at > NOW()
        LIMIT 1`,
-      [email]
+      [purpose, email]
     );
 
-    const confirmed = rows.length > 0 && rows[0].confirmed_at !== null;
+    const confirmed = rows.length > 0;
     res.json({ confirmed });
   } catch (err) {
     next(err);
@@ -212,18 +455,18 @@ router.post('/register', upload.fields([
       region
     } = req.body;
 
-    const accountValidationError = validateBusinessAccount(req.body);
-    if (accountValidationError) {
-      return res.status(400).json({ message: accountValidationError });
+    const purpose = String(req.body.purpose || 'business_registration').trim();
+    if (!registrationPurposes.includes(purpose)) {
+      return res.status(400).json({ message: 'Invalid registration purpose.' });
     }
 
-    if (!businessName) {
-      return res.status(400).json({ message: 'Business name is required.' });
+    if (purpose === 'attraction_registration') {
+      return await handleAttractionRegistration(req, res, next, connection);
     }
 
-    const businessDetailError = validateBusinessDetails(req.body);
-    if (businessDetailError) {
-      return res.status(400).json({ message: businessDetailError });
+    const businessValidationError = validateBusinessRegistration(req.body);
+    if (businessValidationError) {
+      return res.status(400).json({ message: businessValidationError });
     }
 
     const files = req.files;
@@ -244,21 +487,30 @@ router.post('/register', upload.fields([
     }
 
     const [pendingRows] = await connection.execute(
-      `SELECT id, password_hash
+      `SELECT id, password_hash, confirmed_at,
+              expires_at < NOW() AS is_expired
        FROM pending_email_confirmations
        WHERE purpose = 'business_registration'
          AND email = ?
-         AND confirmed_at IS NOT NULL
-         AND expires_at > NOW()
        LIMIT 1`,
       [normalizedEmail]
     );
 
-    if (pendingRows.length === 0) {
+    const pending = pendingRows[0];
+
+    if (!pending) {
       return res.status(400).json({ message: 'Please confirm your email before submitting.' });
     }
 
-    const pending = pendingRows[0];
+    if (!pending.confirmed_at) {
+      return res.status(400).json({ message: 'Please confirm your email before submitting.' });
+    }
+
+    if (pending.is_expired) {
+      return res.status(400).json({
+        message: 'Your email confirmation has expired. Please send a new confirmation email and try again.',
+      });
+    }
 
     await connection.beginTransaction();
 
