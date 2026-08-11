@@ -55,6 +55,11 @@ router.post('/send-selected', auth.authenticate, auth.requireRole('admin'), asyn
     const { businessIds, attractionIds, messageType, subject, content } = req.body;
     const businesses = Array.isArray(businessIds) ? businessIds : [];
     const attractions = Array.isArray(attractionIds) ? attractionIds : [];
+    if (businesses.length > 0 && attractions.length > 0) {
+      return res.status(400).json({
+        message: 'A message cannot target both businesses and attractions in one send; the letter text is audience-specific.',
+      });
+    }
     if ((businesses.length + attractions.length) === 0 || !messageType || !subject || !content) {
       return res.status(400).json({ message: 'Missing required fields' });
     }

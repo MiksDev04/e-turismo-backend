@@ -127,6 +127,123 @@ router.put('/business', auth.authenticate, auth.requireRole('business'), async (
 });
 
 /**
+ * PUT /api/attraction
+ * Updates attraction details (for attraction users)
+ */
+router.put('/attraction', auth.authenticate, auth.requireRole('attraction'), async (req, res, next) => {
+  try {
+    const { attraction_name, attraction_type, street, barangay } = req.body;
+
+    if (!attraction_name || !String(attraction_name).trim()) {
+      return res.status(400).json({ message: 'Attraction name is required.' });
+    }
+
+    let parsedTypes = attraction_type;
+    if (typeof parsedTypes === 'string') {
+      try {
+        parsedTypes = JSON.parse(parsedTypes);
+      } catch (e) {
+        parsedTypes = parsedTypes.split(',').map((s) => s.trim());
+      }
+    }
+
+    if (!Array.isArray(parsedTypes) || parsedTypes.length === 0) {
+      return res.status(400).json({ message: 'Select at least one attraction type.' });
+    }
+
+    const allowedAttractionTypes = [
+      'ecotourism',
+      'natural_attractions',
+      'cultural',
+      'religious',
+      'historical_heritage_sites',
+      'agri_tourism',
+      'farm_tourism_sites',
+    ];
+
+    const invalidTypes = parsedTypes.filter(
+      (type) => !allowedAttractionTypes.includes(String(type).trim())
+    );
+    if (invalidTypes.length > 0) {
+      return res.status(400).json({ message: 'Invalid attraction type selected.' });
+    }
+
+    const [attractions] = await db.pool.execute(
+      'SELECT id FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+      [req.user.id]
+    );
+    if (attractions.length === 0) {
+      return res.status(404).json({ message: 'No attraction associated with this account.' });
+    }
+
+    await db.pool.execute(
+      `UPDATE tourist_attractions SET
+        attraction_name = ?, attraction_type = ?, street = ?, barangay = ?
+      WHERE user_id = ? AND deleted_at IS NULL`,
+      [
+        String(attraction_name).trim(),
+        JSON.stringify(parsedTypes.map((type) => String(type).trim())),
+        String(street || '').trim(),
+        String(barangay || '').trim(),
+        req.user.id
+      ]
+    );
+
+    res.json({ message: 'Attraction information updated.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/attraction/upload
+ * Updates the representative's valid ID for the authenticated attraction
+ */
+router.post('/attraction/upload',
+  auth.authenticate,
+  auth.requireRole('attraction'),
+  upload.fields([
+    { name: 'valid_id', maxCount: 1 }
+  ]),
+  async (req, res, next) => {
+    try {
+      const [attractions] = await db.pool.execute(
+        'SELECT id FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+        [req.user.id]
+      );
+      if (attractions.length === 0) {
+        return res.status(404).json({ message: 'Attraction not found.' });
+      }
+      const attractionId = attractions[0].id;
+      const files = req.files;
+
+      if (!files?.valid_id?.[0]) {
+        return res.status(400).json({ message: 'No files provided.' });
+      }
+
+      const uploadResult = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { resource_type: 'raw', folder: 'tourism/valid_ids', public_id: attractionId, overwrite: true },
+          (err, result) => { if (err) reject(err); else resolve(result); }
+        );
+        stream.end(files.valid_id[0].buffer);
+      });
+
+      const validIdUrl = uploadResult.secure_url;
+
+      await db.pool.execute(
+        'UPDATE tourist_attractions SET valid_id_url = ? WHERE user_id = ? AND deleted_at IS NULL',
+        [validIdUrl, req.user.id]
+      );
+
+      res.json({ message: 'Valid ID updated successfully.', valid_id_url: validIdUrl });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
  * POST /api/business/upload
  * Updates permit file and/or valid ID for the authenticated business
  */
