@@ -53,7 +53,7 @@ router.get('/visit-logs', auth.authenticate, auth.requireRole('attraction'), asy
 
     const [rows] = await connection.execute(
       `SELECT id, attraction_id, visit_date, guest_count,
-              male_count, female_count, nationality,
+              male_count, female_count,
               country, province, city_municipality
        FROM attraction_visit_logs
        WHERE attraction_id = ? AND deleted_at IS NULL

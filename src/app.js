@@ -15,6 +15,8 @@ import guestRecordsRoutes from './routes/guest_records.api.js';
 import roomRoutes from './routes/rooms.api.js';
 import dashboardRoutes from './routes/dashboard.api.js';
 import attractionDashboardRoutes from './routes/attraction_dashboard.api.js';
+import visitEntryRoutes from './routes/visit_entry.api.js';
+import visitRecordRoutes from './routes/visit_record.api.js';
 import messageRoutes from './routes/messages.api.js';
 import complianceRoutes from './routes/compliance.api.js';
 import reportRoutes from './routes/reports.api.js';
@@ -70,6 +72,8 @@ app.use('/api/business', guestRecordsRoutes);
 app.use('/api/business', roomRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/attraction-dashboard', attractionDashboardRoutes);
+app.use('/api/attraction/visit-entry', visitEntryRoutes);
+app.use('/api/attraction', visitRecordRoutes);
 app.use('/api/messages', messageRoutes);
 
 // ── Error handler (must be last) ──────────────────────────────

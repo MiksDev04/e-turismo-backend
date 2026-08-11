@@ -21,7 +21,10 @@
 --     workflow as businesses. One account = exactly one attraction.
 --   - `attraction_visit_logs` (new): batch visit entries per attraction
 --     per day (guest_count + origin classification) — no PII, like a
---     gate logbook.
+--     gate logbook. Nationality is NOT stored: it is derived from the
+--     country column (country = 'Philippines' => Filipino, otherwise
+--     Foreign). Male/female counts are captured (or auto-split via the
+--     PSA 47.1%/52.9% distribution when left blank).
 --   - `message_recipients` now links to either a business OR an
 --     attraction (exactly one per row).
 --   - `report_batches.report_type` widened to 'attraction' (reuses the
@@ -171,12 +174,11 @@ CREATE TABLE `attraction_visit_logs` (
   `attraction_id` char(36) NOT NULL,
   `visit_date` date NOT NULL,
   `guest_count` int NOT NULL,
-  `male_count` int DEFAULT NULL COMMENT 'Optional',
-  `female_count` int DEFAULT NULL COMMENT 'Optional',
-  `nationality` enum('Filipino','Foreign') NOT NULL,
-  `country` varchar(255) DEFAULT NULL COMMENT 'Only set when nationality = Foreign',
-  `province` varchar(255) DEFAULT NULL COMMENT 'Only set when nationality = Filipino',
-  `city_municipality` varchar(255) DEFAULT NULL COMMENT 'Only set when nationality = Filipino',
+  `male_count` int DEFAULT NULL COMMENT 'Optional; auto-filled via PSA 47.1/52.9 split when blank',
+  `female_count` int DEFAULT NULL COMMENT 'Optional; female = guest_count - male_count',
+  `country` varchar(255) NOT NULL DEFAULT 'Philippines' COMMENT 'Philippines = Filipino tourist; otherwise Foreign. Nationality is derived from this value, never stored',
+  `province` varchar(255) DEFAULT NULL COMMENT 'Only set for domestic (Filipino) tourists',
+  `city_municipality` varchar(255) DEFAULT NULL COMMENT 'Only set for domestic (Filipino) tourists',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   `deleted_at` datetime DEFAULT NULL,
@@ -385,7 +387,8 @@ SET FOREIGN_KEY_CHECKS = 1;
 -- GROUP BY gr.id;
 --
 -- VAR total now combines both sources (accommodations + attractions).
--- Per classification bucket, sum the two groupings:
+-- Per classification bucket, sum the two groupings. Attraction nationality
+-- is derived from country (country = 'Philippines' => Filipino, else Foreign):
 --
 -- SELECT nationality, country, province, city_municipality,
 --        SUM(guest_count) AS guest_count
@@ -400,7 +403,7 @@ SET FOREIGN_KEY_CHECKS = 1;
 --   WHERE gr.is_deleted = 0
 --   UNION ALL
 --   SELECT
---     avl.nationality,
+--     CASE WHEN avl.country = 'Philippines' THEN 'Filipino' ELSE 'Foreign' END AS nationality,
 --     avl.country,
 --     avl.province,
 --     avl.city_municipality,
