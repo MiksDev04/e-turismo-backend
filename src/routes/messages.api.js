@@ -25,6 +25,24 @@ router.get('/eligible-businesses', auth.authenticate, auth.requireRole('admin'),
 });
 
 /**
+ * GET /api/messages/eligible-attractions
+ * Admin only: Fetches all approved + warning attractions for the compose dropdown.
+ */
+router.get('/eligible-attractions', auth.authenticate, auth.requireRole('admin'), async (req, res, next) => {
+  const connection = await db.pool.getConnection();
+  try {
+    const [rows] = await connection.execute(
+      `SELECT id, attraction_name, status FROM tourist_attractions WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name ASC`
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  } finally {
+    connection.release();
+  }
+});
+
+/**
  * GET /api/messages/receiver-name/:businessId
  * Admin only: Fetches a single business name.
  */
@@ -121,9 +139,51 @@ router.post('/send-all', auth.authenticate, auth.requireRole('admin'), async (re
   const connection = await db.pool.getConnection();
   await connection.beginTransaction();
   try {
-    const { messageType, subject, content } = req.body;
+    const { recipientKind, messageType, subject, content } = req.body;
     if (!messageType || !subject || !content) {
       return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    const kind = recipientKind === 'attraction' ? 'attraction' : 'business';
+
+    if (kind === 'attraction') {
+      const [attractions] = await connection.execute(
+        "SELECT id FROM tourist_attractions WHERE status IN ('approved', 'warning') AND deleted_at IS NULL"
+      );
+
+      if (attractions.length === 0) {
+        return res.json({ messageId: '', recipientCount: 0 });
+      }
+
+      const messageId = crypto.randomUUID();
+      await connection.execute(
+        'INSERT INTO messages (id, sender_id, message_type, subject, content, is_broadcast) VALUES (?, ?, ?, ?, ?, ?)',
+        [messageId, req.user.id, messageType, subject.trim(), content.trim(), true]
+      );
+
+      for (const att of attractions) {
+        await connection.execute(
+          'INSERT INTO message_recipients (message_id, attraction_id) VALUES (?, ?)',
+          [messageId, att.id]
+        );
+      }
+
+      // Fetch emails to send notifications
+      const [recipients] = await connection.execute(
+        `SELECT u.email 
+         FROM tourist_attractions ta 
+         JOIN users u ON ta.user_id = u.id 
+         WHERE ta.status IN ('approved', 'warning') AND ta.deleted_at IS NULL AND u.email IS NOT NULL`
+      );
+
+      await connection.commit();
+
+      // Send emails asynchronously after commit
+      recipients.forEach(r => {
+        mailer.sendSystemMessage(r.email, subject.trim(), content.trim(), messageType).catch(console.error);
+      });
+
+      return res.status(201).json({ messageId, recipientCount: attractions.length });
     }
 
     const [businesses] = await connection.execute(
@@ -185,6 +245,7 @@ router.get('/admin/outbox', auth.authenticate, auth.requireRole('admin'), async 
       searchQuery,
       type,
       scope,
+      audience,
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
@@ -212,6 +273,16 @@ router.get('/admin/outbox', auth.authenticate, auth.requireRole('admin'), async 
       conditions.push('m.is_broadcast = FALSE');
     }
 
+    if (audience === 'Attraction') {
+      conditions.push(
+        'EXISTS (SELECT 1 FROM message_recipients rk WHERE rk.message_id = m.id AND rk.attraction_id IS NOT NULL)'
+      );
+    } else if (audience === 'Business') {
+      conditions.push(
+        'EXISTS (SELECT 1 FROM message_recipients rk WHERE rk.message_id = m.id AND rk.business_id IS NOT NULL)'
+      );
+    }
+
     const whereClause = conditions.join(' AND ');
 
     // ── Count total ───────────────────────────────────────────────────────
@@ -229,7 +300,9 @@ router.get('/admin/outbox', auth.authenticate, auth.requireRole('admin'), async 
 
     // ── Fetch paginated rows ──────────────────────────────────────────────
     const [rows] = await connection.query(
-      `SELECT m.*, u.full_name as sender_name 
+      `SELECT m.*, u.full_name as sender_name,
+              CASE WHEN EXISTS (SELECT 1 FROM message_recipients rk WHERE rk.message_id = m.id AND rk.attraction_id IS NOT NULL)
+                   THEN 'attraction' ELSE 'business' END AS recipient_kind
        FROM messages m 
        JOIN users u ON m.sender_id = u.id 
        WHERE ${whereClause}
@@ -274,6 +347,7 @@ router.get('/admin/report/:messageId', auth.authenticate, auth.requireRole('admi
       const status = r.business_status || r.attraction_status || 'unknown';
       return {
         ...r,
+        recipient_kind: r.business_id ? 'business' : 'attraction',
         business: { business_name: name, status },
       };
     });
