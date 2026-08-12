@@ -31,7 +31,7 @@ async function _readTemplateDefaultFont(filePath) {
 }
 
 // ─── Load template workbook for styled Excel exports ─────────────────────────
-const defaultFontXml = { var: null, dae: null };
+const defaultFontXml = { var: null, dae: null, attraction: null };
 
 let templateWb = null;
 try {
@@ -62,6 +62,18 @@ try {
   console.log('[report] VAR logo loaded');
 } catch (err) {
   console.warn('[report] VAR logo not found, VAR exports will have no logo:', err.message);
+}
+
+// ─── VAR 1 (Tourist Attraction) template ─────────────────────────────────────
+let attractionTemplateWb = null;
+try {
+  attractionTemplateWb = new ExcelJS.Workbook();
+  await attractionTemplateWb.xlsx.readFile(path.join(__dirname, '..', '..', 'sample', 'VAR-REPORT-ATTRACTION_DAILY.xlsx'));
+  defaultFontXml.attraction = await _readTemplateDefaultFont(path.join(__dirname, '..', '..', 'sample', 'VAR-REPORT-ATTRACTION_DAILY.xlsx'));
+  console.log('[report] VAR 1 (Attraction) Template loaded successfully');
+} catch (err) {
+  console.warn('[report] VAR 1 Template not found, attraction exports will be unformatted:', err.message);
+  attractionTemplateWb = null;
 }
 
 // ─── Country / Region Definitions ────────────────────────────────────────────
@@ -535,21 +547,25 @@ router.post('/reports', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.body;
 
-    if (!['dae', 'var'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
+    if (!['dae', 'var', 'attraction'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var", or "attraction"' });
     }
 
     if (reportType === 'dae') {
       if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
         return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series" (DAE)' });
       }
-    } else {
+    } else if (reportType === 'var') {
       if (reportVariant && reportVariant !== 'total') {
         return res.status(400).json({ message: 'VAR reportVariant must be "total"' });
       }
+    } else {
+      if (reportVariant && reportVariant !== 'daily') {
+        return res.status(400).json({ message: 'VAR 1 reportVariant must be "daily"' });
+      }
     }
 
-    const effectiveVariant = reportType === 'var' ? 'total' : reportVariant;
+    const effectiveVariant = reportType === 'var' ? 'total' : reportType === 'attraction' ? 'daily' : reportVariant;
 
     if (!periodYear || parseInt(periodYear, 10) < 2000) {
       return res.status(400).json({ message: 'periodYear must be >= 2000' });
@@ -588,8 +604,8 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.query;
 
-    if (!['dae', 'var'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
+    if (!['dae', 'var', 'attraction'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var", or "attraction"' });
     }
 
     let effectiveVariant;
@@ -598,8 +614,10 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
         return res.status(400).json({ message: 'reportVariant is required (daily|summary|series)' });
       }
       effectiveVariant = reportVariant;
-    } else {
+    } else if (reportType === 'var') {
       effectiveVariant = 'total';
+    } else {
+      effectiveVariant = 'daily';
     }
 
     if (!periodYear) {
@@ -696,6 +714,51 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
         establishments,
         totals: totalsVar,
       });
+    } else if (reportType === 'attraction') {
+      // VAR 1: one daily sex × residence grid per approved tourist attraction
+      const [attractions] = await db.pool.execute(
+        `SELECT id, attraction_name, attraction_type, barangay
+         FROM tourist_attractions
+         WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
+      );
+
+      const totalsVar = {
+        maleThisCity: 0, femaleThisCity: 0,
+        maleOtherCity: 0, femaleOtherCity: 0,
+        maleOtherProvince: 0, femaleOtherProvince: 0,
+        maleForeign: 0, femaleForeign: 0,
+      };
+      const establishments = [];
+
+      for (const att of attractions) {
+        const md = await _fetchAttractionMonthData(att.id, sortedMonths[0], year);
+        establishments.push({
+          businessId: String(att.id),
+          businessName: att.attraction_name,
+          totalRooms: 0,
+          aeId: null,
+          region: null,
+          cityMunicipality: 'San Pablo City',
+          province: 'Laguna',
+          businessLine: [],
+          attractionType: typeof att.attraction_type === 'string'
+            ? JSON.parse(att.attraction_type || '[]')
+            : (att.attraction_type || []),
+          barangay: att.barangay,
+          monthData: null,
+          seriesData: null,
+          varData: null,
+          attractionDaily: md.daily,
+          attractionTotals: md.totals,
+        });
+        for (const k of Object.keys(md.totals)) totalsVar[k] += md.totals[k];
+      }
+
+      res.json({
+        batch: { id: batchId, reportType, reportVariant: effectiveVariant, periodYear: year, periodMonths: sortedMonths },
+        establishments,
+        totals: totalsVar,
+      });
     } else {
       // DAE: existing logic
       for (const biz of businesses) {
@@ -749,8 +812,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx', pageWidth, pageHeight } = req.body;
 
-    if (!['dae', 'var'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
+    if (!['dae', 'var', 'attraction'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var", or "attraction"' });
     }
 
     let effectiveVariant;
@@ -759,8 +822,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series"' });
       }
       effectiveVariant = reportVariant;
-    } else {
+    } else if (reportType === 'var') {
       effectiveVariant = 'total';
+    } else {
+      effectiveVariant = 'daily';
     }
 
     if (!periodYear) {
@@ -865,6 +930,41 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
           console.warn('[report] Could not embed VAR logo:', err.message);
         }
       }
+    } else if (reportType === 'attraction') {
+      // ── VAR 1: Per-attraction worksheets (daily sex × residence grid) ──────
+      const [attractions] = await db.pool.execute(
+        `SELECT id, attraction_name, attraction_type
+         FROM tourist_attractions
+         WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
+      );
+
+      const attractionTmpl = attractionTemplateWb?.getWorksheet('VAR 2M LGU Month Report');
+
+      for (const att of attractions) {
+        const md = await _fetchAttractionMonthData(att.id, sortedMonths[0], year);
+        const sheetName = att.attraction_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
+        const sheet = attractionTmpl
+          ? _cloneSheetFromTemplate(attractionTmpl, sheetName, wb)
+          : wb.addWorksheet(sheetName);
+
+        const attractionType = typeof att.attraction_type === 'string'
+          ? JSON.parse(att.attraction_type || '[]')
+          : (att.attraction_type || []);
+        _buildVar1ExcelSheet(sheet, att.attraction_name, attractionType, md.daily, md.totals,
+          sortedMonths[0], year);
+
+        if (varLogoBuffer) {
+          try {
+            const logoId = wb.addImage({ buffer: varLogoBuffer, extension: 'jpeg' });
+            sheet.addImage(logoId, {
+              tl: { nativeCol: 1, nativeColOff: 1038225, nativeRow: 0, nativeRowOff: 57150 },
+              ext: { width: 64, height: 64 },
+            });
+          } catch (err) {
+            console.warn('[report] Could not embed VAR 1 logo:', err.message);
+          }
+        }
+      }
     } else {
       // ── DAE: Per-establishment worksheets ──────────────────────────────────
       for (const biz of businesses) {
@@ -927,7 +1027,9 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
       wb.calcProperties.fullCalcOnLoad = true;
       const buffer = await wb.xlsx.writeBuffer();
-      const fontXml = reportType === 'var' ? defaultFontXml.var : defaultFontXml.dae;
+      const fontXml = reportType === 'var' ? defaultFontXml.var
+        : reportType === 'attraction' ? defaultFontXml.attraction
+        : defaultFontXml.dae;
       const outBuffer = fontXml ? await _patchDefaultFont(buffer, fontXml) : buffer;
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
       res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1193,6 +1295,83 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
   });
 
   return data;
+}
+
+// ─── VAR 1 (Tourist Attraction) month aggregation ────────────────────────────
+// Daily sex × residence grid from attraction_visit_logs for a single month.
+// The VAR 1 form classifies Philippine visitors against the attraction's
+// location; attractions are San Pablo City-only, so This City/Municipality is
+// SAN PABLO CITY and same-province residents are Other City/Municipality.
+async function _fetchAttractionMonthData(attractionId, month, year) {
+  const firstDay = `${year}-${String(month).padStart(2, '0')}-01`;
+  const lastDay  = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
+
+  const [records] = await db.pool.execute(
+    `SELECT visit_date, guest_count, male_count, female_count,
+            country, province, city_municipality
+     FROM attraction_visit_logs
+     WHERE attraction_id = ? AND visit_date BETWEEN ? AND ? AND deleted_at IS NULL`,
+    [attractionId, firstDay, lastDay]
+  );
+
+  const kCity = _normalizeCityName('San Pablo City');
+  const kProv = 'LAGUNA';
+
+  const emptyBucket = () => ({
+    maleThisCity: 0, femaleThisCity: 0,
+    maleOtherCity: 0, femaleOtherCity: 0,
+    maleOtherProvince: 0, femaleOtherProvince: 0,
+    maleForeign: 0, femaleForeign: 0,
+  });
+
+  const daily = {};
+  const totals = emptyBucket();
+
+  records.forEach(r => {
+    const visitDate = _parseLocalDate(r.visit_date);
+    if (!visitDate) return;
+    const dayKey = String(visitDate.getDate());
+
+    let maleCount   = _asInt(r.male_count);
+    let femaleCount = _asInt(r.female_count);
+    if (maleCount + femaleCount === 0) {
+      // Defensive fallback: split guest_count using the PSA national ratio.
+      const guest = _asInt(r.guest_count);
+      maleCount = Math.round(guest * 0.471);
+      femaleCount = guest - maleCount;
+    }
+
+    const gCountry = (r.country || '').toUpperCase();
+    const isForeign = gCountry !== '' && gCountry !== 'PHILIPPINES';
+
+    let maleBucket;
+    let femaleBucket;
+    if (isForeign) {
+      maleBucket   = 'maleForeign';
+      femaleBucket = 'femaleForeign';
+    } else {
+      const gCity = _normalizeCityName(r.city_municipality);
+      const gProv = (r.province || '').toUpperCase();
+      if (gCity && gCity === kCity) {
+        maleBucket   = 'maleThisCity';
+        femaleBucket = 'femaleThisCity';
+      } else if (gProv && gProv === kProv) {
+        maleBucket   = 'maleOtherCity';
+        femaleBucket = 'femaleOtherCity';
+      } else {
+        maleBucket   = 'maleOtherProvince';
+        femaleBucket = 'femaleOtherProvince';
+      }
+    }
+
+    const entry = (daily[dayKey] ??= emptyBucket());
+    entry[maleBucket]   += maleCount;
+    entry[femaleBucket] += femaleCount;
+    totals[maleBucket]   += maleCount;
+    totals[femaleBucket] += femaleCount;
+  });
+
+  return { month, year, daily, totals };
 }
 
 // ─── Merge helpers ────────────────────────────────────────────────────────────
@@ -1928,6 +2107,153 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
 
 }
 
+// ─── VAR 1 (Tourist Attraction) sheet builder ────────────────────────────────
+// Column positions in VAR-REPORT-ATTRACTION_DAILY.xlsx (1-indexed, A=1).
+const kVar1Cols = {
+  day: 2,             // B
+  maleThisCity: 4,    // D
+  femaleThisCity: 5,  // E
+  totalThisCity: 6,   // F
+  maleOtherCity: 7,   // G
+  femaleOtherCity: 8, // H
+  totalOtherCity: 9,  // I
+  maleOtherProv: 10,  // J
+  femaleOtherProv: 11,// K
+  totalOtherProv: 12, // L
+  maleForeign: 13,    // M
+  femaleForeign: 14,  // N
+  totalForeign: 15,   // O
+  grandMale: 16,      // P
+  grandFemale: 17,    // Q
+  grandTotal: 18,     // R
+};
+
+const kVar1DayRowStart = 20; // day 1 lives at row 20 (template rows 20-50 = days 1-31)
+const kVar1TotalRow = 51;
+
+// Attraction type values as stored in tourist_attractions.attraction_type →
+// the display labels used on the VAR 1 form.  Unknown values fall back to a
+// title-cased version of the stored key.
+const kAttractionTypeLabels = {
+  ecotourism: 'Ecotourism',
+  natural_attractions: 'Natural Attractions',
+  cultural: 'Cultural',
+  religious: 'Religious',
+  historical_heritage_sites: 'Historical Heritage Sites',
+  agri_tourism: 'Agri-Tourism',
+  farm_tourism_sites: 'Farm Tourism Sites',
+};
+
+function _attractionTypeLabel(value) {
+  const key = String(value || '').trim();
+  if (!key) return '';
+  if (kAttractionTypeLabels[key]) return kAttractionTypeLabels[key];
+  return key
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+}
+
+function _buildVar1ExcelSheet(sheet, attractionName, attractionType, daily, totals, month, year) {
+  const c = kVar1Cols;
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const kWeekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  // ── Header variable fields (rows 1-15 come from the template clone) ───────
+  sheet.getCell('G10').value = `${kMonthNames[month]} ${year}`;          // Month/Year value
+  sheet.getCell('G12').value = attractionName;                            // Name of attraction/ Spot
+  // Type of Tourism Attraction — display labels go in the merged box E14:I14
+  // (the template's bordered "fill-in" cell), not the narrow D14 column.
+  sheet.getCell('E14').value = (attractionType || []).map(_attractionTypeLabel).filter(Boolean).join(', ');
+
+  // ── Day rows 20-50 ────────────────────────────────────────────────────────
+  // Raw input columns D,E,G,H,J,K,M,N — the only cells filled from data.
+  const rawInputCols = [
+    c.maleThisCity, c.femaleThisCity,
+    c.maleOtherCity, c.femaleOtherCity,
+    c.maleOtherProv, c.femaleOtherProv,
+    c.maleForeign, c.femaleForeign,
+  ];
+
+  // Computed columns F,I,L,O,P,Q,R — the template's per-row formulas, restored
+  // in EVERY day row so Excel totals the counts itself (the clone resolves the
+  // template's formulas to plain cached 0s, so they must be re-injected).
+  const injectDayFormulas = (rowNum) => {
+    sheet.getRow(rowNum).getCell(c.totalThisCity).value   = { formula: `D${rowNum}+E${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalOtherCity).value  = { formula: `G${rowNum}+H${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalOtherProv).value  = { formula: `J${rowNum}+K${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalForeign).value    = { formula: `M${rowNum}+N${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandMale).value       = { formula: `D${rowNum}+G${rowNum}+J${rowNum}+M${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandFemale).value     = { formula: `E${rowNum}+H${rowNum}+K${rowNum}+N${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandTotal).value      = { formula: `F${rowNum}+I${rowNum}+L${rowNum}+O${rowNum}` };
+  };
+
+  for (let day = 1; day <= 31; day++) {
+    const rowNum = kVar1DayRowStart + day - 1;
+    const d = daily[String(day)];
+
+    // Keep the computed-column formulas in every row, data or not.
+    injectDayFormulas(rowNum);
+
+    if (day > daysInMonth) {
+      // Days past month-end: blank the weekday + raw inputs (formulas kept)
+      sheet.getRow(rowNum).getCell(3).value = null;
+      rawInputCols.forEach(col => { sheet.getRow(rowNum).getCell(col).value = null; });
+      continue;
+    }
+
+    // Week Day (Mon-Sun) — the actual calendar weekday for this date
+    sheet.getRow(rowNum).getCell(3).value = kWeekdayNames[new Date(year, month - 1, day).getDay()];
+
+    if (!d) {
+      // In-month day with no recorded visits: clear the raw inputs but keep
+      // the day number (template), weekday label and computed-column formulas.
+      rawInputCols.forEach(col => { sheet.getRow(rowNum).getCell(col).value = null; });
+      continue;
+    }
+
+    const maleThisCity    = d.maleThisCity || 0;
+    const femaleThisCity  = d.femaleThisCity || 0;
+    const maleOtherCity   = d.maleOtherCity || 0;
+    const femaleOtherCity = d.femaleOtherCity || 0;
+    const maleOtherProv   = d.maleOtherProvince || 0;
+    const femaleOtherProv = d.femaleOtherProvince || 0;
+    const maleForeign     = d.maleForeign || 0;
+    const femaleForeign   = d.femaleForeign || 0;
+
+    // Raw input columns D,E,G,H,J,K,M,N
+    sheet.getRow(rowNum).getCell(c.maleThisCity).value    = maleThisCity || null;
+    sheet.getRow(rowNum).getCell(c.femaleThisCity).value  = femaleThisCity || null;
+    sheet.getRow(rowNum).getCell(c.maleOtherCity).value   = maleOtherCity || null;
+    sheet.getRow(rowNum).getCell(c.femaleOtherCity).value = femaleOtherCity || null;
+    sheet.getRow(rowNum).getCell(c.maleOtherProv).value   = maleOtherProv || null;
+    sheet.getRow(rowNum).getCell(c.femaleOtherProv).value = femaleOtherProv || null;
+    sheet.getRow(rowNum).getCell(c.maleForeign).value     = maleForeign || null;
+    sheet.getRow(rowNum).getCell(c.femaleForeign).value   = femaleForeign || null;
+  }
+
+  // ── Total row (row 51) — mirrors the template's D51:Q51 SUM formulas ──────
+  const lastDataRow = kVar1DayRowStart + 30; // 50
+  const totalRow = sheet.getRow(kVar1TotalRow);
+  totalRow.getCell(c.maleThisCity).value     = { formula: `SUM(D${kVar1DayRowStart}:D${lastDataRow})` };
+  totalRow.getCell(c.femaleThisCity).value   = { formula: `SUM(E${kVar1DayRowStart}:E${lastDataRow})` };
+  totalRow.getCell(c.totalThisCity).value    = { formula: `SUM(F${kVar1DayRowStart}:F${lastDataRow})` };
+  totalRow.getCell(c.maleOtherCity).value    = { formula: `SUM(G${kVar1DayRowStart}:G${lastDataRow})` };
+  totalRow.getCell(c.femaleOtherCity).value  = { formula: `SUM(H${kVar1DayRowStart}:H${lastDataRow})` };
+  totalRow.getCell(c.totalOtherCity).value   = { formula: `SUM(I${kVar1DayRowStart}:I${lastDataRow})` };
+  totalRow.getCell(c.maleOtherProv).value    = { formula: `SUM(J${kVar1DayRowStart}:J${lastDataRow})` };
+  totalRow.getCell(c.femaleOtherProv).value  = { formula: `SUM(K${kVar1DayRowStart}:K${lastDataRow})` };
+  totalRow.getCell(c.totalOtherProv).value   = { formula: `SUM(L${kVar1DayRowStart}:L${lastDataRow})` };
+  totalRow.getCell(c.maleForeign).value      = { formula: `SUM(M${kVar1DayRowStart}:M${lastDataRow})` };
+  totalRow.getCell(c.femaleForeign).value    = { formula: `SUM(N${kVar1DayRowStart}:N${lastDataRow})` };
+  totalRow.getCell(c.totalForeign).value     = { formula: `SUM(O${kVar1DayRowStart}:O${lastDataRow})` };
+  totalRow.getCell(c.grandMale).value        = { formula: `SUM(P${kVar1DayRowStart}:P${lastDataRow})` };
+  totalRow.getCell(c.grandFemale).value      = { formula: `SUM(Q${kVar1DayRowStart}:Q${lastDataRow})` };
+  // Column R grand total — mirrors the template's R51 formula (=F51+I51+L51+O51)
+  totalRow.getCell(c.grandTotal).value       = { formula: `F${kVar1TotalRow}+I${kVar1TotalRow}+L${kVar1TotalRow}+O${kVar1TotalRow}` };
+}
+
 // ─── PDF Layout & Page-Break Config ─────────────────────────────────────────
 const SHEET_PDF_CONFIG = {
   daily:   { layout: 'landscape', size: 'A4', margin: 30, breakRows: [64, 124] },
@@ -1937,7 +2263,7 @@ const SHEET_PDF_CONFIG = {
 };
 
 function _getSheetPdfConfig(sheetName, reportType) {
-  if (reportType === 'var') return SHEET_PDF_CONFIG.var;
+  if (reportType === 'var' || reportType === 'attraction') return SHEET_PDF_CONFIG.var;
   if (sheetName === 'AE DAE-1B by Country (Sum)') return SHEET_PDF_CONFIG.sum;
   if (sheetName.includes('Monthly'))              return SHEET_PDF_CONFIG.monthly;
   return SHEET_PDF_CONFIG.daily;
@@ -1949,7 +2275,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   const sheets = [];
   workbook.eachSheet(sheet => sheets.push(sheet));
 
-  const pdfConfig = { ...(reportType === 'var' ? SHEET_PDF_CONFIG.var
+  const pdfConfig = { ...(reportType === 'var' || reportType === 'attraction' ? SHEET_PDF_CONFIG.var
     : variant === 'summary' ? SHEET_PDF_CONFIG.sum
     : variant === 'series' ? SHEET_PDF_CONFIG.monthly
     : SHEET_PDF_CONFIG.daily) };
@@ -1965,7 +2291,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   // template's default font at 96dpi: Arial 10 → 7px = 5.25pt; MS PGothic 11
   // (VAR, half-width digits) → 8px = 6.0pt.  CELL_PAD_PT = Excel's 5px padding
   // each column adds, so column edges match Excel's rendered width exactly.
-  const CHAR_WIDTH_PT = reportType === 'var' ? 6.0 : 5.25;
+  const CHAR_WIDTH_PT = reportType === 'var' || reportType === 'attraction' ? 6.0 : 5.25;
   const CELL_PAD_PT = 3.75;
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 }, A4: { w: 595.28, h: 841.89 } };
   const BORDER_WIDTH = {
@@ -1987,7 +2313,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
   // ── Per-sheet layout: sections + natural content width/height ─────────────
   const layouts = sheets.map(sheet => {
-    const maxCol = reportType === 'var' ? 18 : 33;
+    const maxCol = reportType === 'var' || reportType === 'attraction' ? 18 : 33;
     const maxRow = (reportType === 'dae' && variant === 'daily')
       ? 181
       : (sheet.rowCount || 197);
@@ -2289,7 +2615,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
       // Draw the tourism office logo over the VAR header block (B1, rows 1-4)
       // on the first page, using the same origin/scale math as the cell grid.
-      if (reportType === 'var' && s === 0 && varLogoBuffer) {
+      if ((reportType === 'var' || reportType === 'attraction') && s === 0 && varLogoBuffer) {
         const colAW = (sheet.getColumn(1).width || 10) * CHAR_WIDTH_PT * scale + CELL_PAD_PT * scale;
         const logoX = originX + colAW + (1038225 / 914400) * 72 * scale;
         const logoY = originY + (57150 / 914400) * 72 * scale;
