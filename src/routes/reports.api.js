@@ -609,17 +609,17 @@ router.post('/reports', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.body;
 
-    if (!['dae', 'var', 'attraction'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae", "var", or "attraction"' });
+    if (!['dae', 'var1', 'var2'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var1", or "var2"' });
     }
 
     if (reportType === 'dae') {
       if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
         return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series" (DAE)' });
       }
-    } else if (reportType === 'var') {
+    } else if (reportType === 'var2') {
       if (reportVariant && reportVariant !== 'total') {
-        return res.status(400).json({ message: 'VAR reportVariant must be "total"' });
+        return res.status(400).json({ message: 'VAR 2 reportVariant must be "total"' });
       }
     } else {
       if (reportVariant && reportVariant !== 'daily') {
@@ -627,7 +627,7 @@ router.post('/reports', adminGuard, async (req, res, next) => {
       }
     }
 
-    const effectiveVariant = reportType === 'var' ? 'total' : reportType === 'attraction' ? 'daily' : reportVariant;
+    const effectiveVariant = reportType === 'var2' ? 'total' : reportType === 'var1' ? 'daily' : reportVariant;
 
     if (!periodYear || parseInt(periodYear, 10) < 2000) {
       return res.status(400).json({ message: 'periodYear must be >= 2000' });
@@ -666,8 +666,8 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.query;
 
-    if (!['dae', 'var', 'attraction'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae", "var", or "attraction"' });
+    if (!['dae', 'var1', 'var2'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var1", or "var2"' });
     }
 
     let effectiveVariant;
@@ -676,7 +676,7 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
         return res.status(400).json({ message: 'reportVariant is required (daily|summary|series)' });
       }
       effectiveVariant = reportVariant;
-    } else if (reportType === 'var') {
+    } else if (reportType === 'var2') {
       effectiveVariant = 'total';
     } else {
       effectiveVariant = 'daily';
@@ -728,13 +728,19 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
     const establishments = [];
     const allMonthData = [];
 
-    if (reportType === 'var') {
-      // VAR: fetch per-establishment sex × residence aggregates
+    if (reportType === 'var2') {
+      // VAR 2: combined tourist-attraction + accommodation aggregate, one row each.
+      // Fetch per-establishment sex × residence aggregates, then append one row
+      // per approved tourist attraction using its month totals.
       let totalsVar = {
         maleThisCity: 0, femaleThisCity: 0,
         maleOtherCity: 0, femaleOtherCity: 0,
         maleOtherProvince: 0, femaleOtherProvince: 0,
         maleForeign: 0, femaleForeign: 0,
+      };
+
+      const accumulate = (vd) => {
+        for (const k of Object.keys(totalsVar)) totalsVar[k] += vd[k] || 0;
       };
 
       for (const biz of businesses) {
@@ -749,10 +755,10 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
           maleForeign: 0, femaleForeign: 0,
         };
         for (const vd of varDataList) {
-          for (const k of Object.keys(vd)) varData[k] += vd[k];
+          for (const k of Object.keys(varData)) varData[k] += vd[k];
         }
 
-        for (const k of Object.keys(varData)) totalsVar[k] += varData[k];
+        accumulate(varData);
 
         establishments.push({
           businessId: biz.id,
@@ -771,12 +777,54 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
         });
       }
 
+      // Append approved tourist attractions as one row per attraction.
+      const [attractions] = await db.pool.execute(
+        `SELECT id, attraction_name, attraction_type, barangay
+         FROM tourist_attractions
+         WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
+      );
+
+      for (const att of attractions) {
+        const attDataList = await Promise.all(
+          sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
+        );
+        const varData = {
+          maleThisCity: 0, femaleThisCity: 0,
+          maleOtherCity: 0, femaleOtherCity: 0,
+          maleOtherProvince: 0, femaleOtherProvince: 0,
+          maleForeign: 0, femaleForeign: 0,
+        };
+        for (const ad of attDataList) {
+          for (const k of Object.keys(varData)) varData[k] += ad.totals[k] || 0;
+        }
+
+        accumulate(varData);
+
+        establishments.push({
+          businessId: String(att.id),
+          businessName: att.attraction_name,
+          totalRooms: 0,
+          aeId: null,
+          region: null,
+          cityMunicipality: 'San Pablo City',
+          province: 'Laguna',
+          businessLine: [],
+          attractionType: typeof att.attraction_type === 'string'
+            ? JSON.parse(att.attraction_type || '[]')
+            : (att.attraction_type || []),
+          barangay: att.barangay,
+          monthData: null,
+          seriesData: null,
+          varData,
+        });
+      }
+
       res.json({
         batch: { id: batchId, reportType, reportVariant: effectiveVariant, periodYear: year, periodMonths: sortedMonths },
         establishments,
         totals: totalsVar,
       });
-    } else if (reportType === 'attraction') {
+    } else if (reportType === 'var1') {
       // VAR 1: one daily sex × residence grid per approved tourist attraction
       const [attractions] = await db.pool.execute(
         `SELECT id, attraction_name, attraction_type, barangay
@@ -874,8 +922,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx', pageWidth, pageHeight } = req.body;
 
-    if (!['dae', 'var', 'attraction'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae", "var", or "attraction"' });
+    if (!['dae', 'var1', 'var2'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var1", or "var2"' });
     }
 
     let effectiveVariant;
@@ -884,7 +932,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series"' });
       }
       effectiveVariant = reportVariant;
-    } else if (reportType === 'var') {
+    } else if (reportType === 'var2') {
       effectiveVariant = 'total';
     } else {
       effectiveVariant = 'daily';
@@ -950,8 +998,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     // ── Build workbooks ───────────────────────────────────────────────────────
     const wb = new ExcelJS.Workbook();
 
-    if (reportType === 'var') {
-      // ── VAR: Single worksheet with all establishments ──────────────────────
+    if (reportType === 'var2') {
+      // ── VAR 2: Single worksheet with all accommodations + attractions ─────
       const varTmpl = varTemplateWb?.getWorksheet('VAR 2M LGU Month Report');
       const sheetName = 'VAR Report';
       const sheet = varTmpl
@@ -959,6 +1007,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         : wb.addWorksheet(sheetName);
 
       // Fetch var data for each business across all requested months
+      const varRows = [];
       const varDataList = [];
       for (const biz of businesses) {
         const monthlyData = await Promise.all(
@@ -974,10 +1023,47 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         for (const md of monthlyData) {
           for (const k of Object.keys(aggregated)) aggregated[k] += md[k] || 0;
         }
+        varRows.push({
+          business_name: biz.business_name,
+          city_municipality: biz.city_municipality,
+          attrCode: '9-902',
+        });
         varDataList.push(aggregated);
       }
 
-      _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year);
+      // Append approved tourist attractions as one row each (attr code 1-103)
+      const [attractions] = await db.pool.execute(
+        `SELECT id, attraction_name
+         FROM tourist_attractions
+         WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
+      );
+
+      for (const att of attractions) {
+        const monthlyData = await Promise.all(
+          sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
+        );
+        const aggregated = {
+          maleThisCity: 0, femaleThisCity: 0,
+          maleOtherCity: 0, femaleOtherCity: 0,
+          maleOtherProvince: 0, femaleOtherProvince: 0,
+          maleForeign: 0, femaleForeign: 0,
+        };
+        for (const md of monthlyData) {
+          for (const k of Object.keys(aggregated)) aggregated[k] += md.totals[k] || 0;
+        }
+        varRows.push({
+          business_name: att.attraction_name,
+          city_municipality: 'San Pablo City',
+          attrCode: '1-103',
+        });
+        varDataList.push(aggregated);
+      }
+
+      if (varRows.length > kVarTotalRow - kVarDataRowStart) {
+        console.warn(`[report] VAR 2 combined rows (${varRows.length}) exceed the template's data rows (${kVarTotalRow - kVarDataRowStart}); trailing rows will be dropped.`);
+      }
+
+      _buildVarExcelSheet(sheet, varRows, varDataList, sortedMonths, year);
 
       // Embed the tourism office logo in the header (mirrors the template's
       // B1 anchor spanning rows 1-4).
@@ -992,7 +1078,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
           console.warn('[report] Could not embed VAR logo:', err.message);
         }
       }
-    } else if (reportType === 'attraction') {
+    } else if (reportType === 'var1') {
       // ── VAR 1: Per-attraction worksheets (daily sex × residence grid) ──────
       const [attractions] = await db.pool.execute(
         `SELECT id, attraction_name, attraction_type
@@ -1089,8 +1175,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
       wb.calcProperties.fullCalcOnLoad = true;
       const buffer = await wb.xlsx.writeBuffer();
-      const fontXml = reportType === 'var' ? defaultFontXml.var
-        : reportType === 'attraction' ? defaultFontXml.attraction
+      const fontXml = reportType === 'var2' ? defaultFontXml.var
+        : reportType === 'var1' ? defaultFontXml.attraction
         : defaultFontXml.dae;
       const outBuffer = fontXml ? await _patchDefaultFont(buffer, fontXml) : buffer;
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
@@ -2098,7 +2184,7 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
     const grandTotal      = totalThisCity + totalOtherCity + totalOtherProv + totalForeign;
 
     sheet.getRow(rowNum).getCell(c.name).value           = biz.business_name;
-    sheet.getRow(rowNum).getCell(c.attrCode).value       = '9-902';
+    sheet.getRow(rowNum).getCell(c.attrCode).value       = biz.attrCode || '9-902';
     sheet.getRow(rowNum).getCell(c.maleThisCity).value    = maleThisCity || null;
     sheet.getRow(rowNum).getCell(c.femaleThisCity).value   = femaleThisCity || null;
     sheet.getRow(rowNum).getCell(c.maleOtherCity).value    = maleOtherCity || null;
@@ -2325,7 +2411,7 @@ const SHEET_PDF_CONFIG = {
 };
 
 function _getSheetPdfConfig(sheetName, reportType) {
-  if (reportType === 'var' || reportType === 'attraction') return SHEET_PDF_CONFIG.var;
+  if (reportType === 'var2' || reportType === 'var1') return SHEET_PDF_CONFIG.var;
   if (sheetName === 'AE DAE-1B by Country (Sum)') return SHEET_PDF_CONFIG.sum;
   if (sheetName.includes('Monthly'))              return SHEET_PDF_CONFIG.monthly;
   return SHEET_PDF_CONFIG.daily;
@@ -2337,7 +2423,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   const sheets = [];
   workbook.eachSheet(sheet => sheets.push(sheet));
 
-  const pdfConfig = { ...(reportType === 'var' || reportType === 'attraction' ? SHEET_PDF_CONFIG.var
+  const pdfConfig = { ...(reportType === 'var2' || reportType === 'var1' ? SHEET_PDF_CONFIG.var
     : variant === 'summary' ? SHEET_PDF_CONFIG.sum
     : variant === 'series' ? SHEET_PDF_CONFIG.monthly
     : SHEET_PDF_CONFIG.daily) };
@@ -2353,7 +2439,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   // template's default font at 96dpi: Arial/Calibri 11 → 7px = 5.25pt; MS PGothic 11
   // (VAR, half-width digits) → 8px = 6.0pt.  CELL_PAD_PT = Excel's 5px padding
   // each column adds, so column edges match Excel's rendered width exactly.
-  const CHAR_WIDTH_PT = reportType === 'var' ? 6.0 : 5.25;
+  const CHAR_WIDTH_PT = reportType === 'var2' ? 6.0 : 5.25;
   const CELL_PAD_PT = 3.75;
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 }, A4: { w: 595.28, h: 841.89 } };
   const BORDER_WIDTH = {
@@ -2375,7 +2461,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
   // ── Per-sheet layout: sections + natural content width/height ─────────────
   const layouts = sheets.map(sheet => {
-    const maxCol = reportType === 'var' || reportType === 'attraction' ? 18 : 33;
+    const maxCol = reportType === 'var2' || reportType === 'var1' ? 18 : 33;
     const maxRow = (reportType === 'dae' && variant === 'daily')
       ? 181
       : (sheet.rowCount || 197);
@@ -2706,7 +2792,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       // and footer graphic — at their original anchor boxes, using the same
       // origin/scale math as the cell grid.  The VAR 2 report keeps drawing the
       // tourism office logo over its header (B1, rows 1-4).
-      if (reportType === 'attraction') {
+      if (reportType === 'var1') {
         for (const img of attractionTemplateImages) {
           try {
             const { x, y, boxW, boxH } = _pdfImageBox(sheet, img.tl, img.br, scale);
@@ -2718,7 +2804,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
             console.warn('[report] Could not draw VAR 1 template image:', err.message);
           }
         }
-      } else if (reportType === 'var' && s === 0 && varLogoBuffer) {
+      } else if (reportType === 'var2' && s === 0 && varLogoBuffer) {
         const colAW = (sheet.getColumn(1).width || 10) * CHAR_WIDTH_PT * scale + CELL_PAD_PT * scale;
         const logoX = originX + colAW + (1038225 / 914400) * 72 * scale;
         const logoY = originY + (57150 / 914400) * 72 * scale;

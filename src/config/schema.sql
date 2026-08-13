@@ -27,8 +27,10 @@
 --     PSA 47.1%/52.9% distribution when left blank).
 --   - `message_recipients` now links to either a business OR an
 --     attraction (exactly one per row).
---   - `report_batches.report_type` widened to 'attraction' (reuses the
---     DAE 'daily' grid, one sheet per attraction).
+--   - `report_batches.report_type` is one of 'dae' | 'var1' | 'var2':
+--     'dae'   = accommodation establishments (daily/summary/series)
+--     'var1'  = tourist attractions, one daily grid per attraction (always 'daily')
+--     'var2'  = combined accommodations + attractions, one row each (always 'total')
 --   - `users.role` widened to 'attraction'; `pending_email_confirmations
 --     .purpose` widened to 'attraction_registration'.
 --
@@ -323,9 +325,9 @@ CREATE TABLE `message_recipients` (
 -- ---------------------------------------------------------------
 CREATE TABLE `report_batches` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
-  `report_type` enum('dae','var','attraction') NOT NULL,
+  `report_type` enum('dae','var1','var2') NOT NULL,
   `report_variant` enum('daily','summary','series','total') NOT NULL
-    COMMENT 'DAE: daily/summary/series. VAR always uses total (single sheet).',
+    COMMENT 'DAE: daily/summary/series. VAR 1 (attractions): always daily. VAR 2 (combined): always total.',
   `period_year` smallint NOT NULL,
   `period_months` JSON NOT NULL
     COMMENT 'Sorted array of ints 1-12, e.g. [1,2,3]. App must sort before insert.',
@@ -346,9 +348,9 @@ CREATE TABLE `report_batches` (
   CONSTRAINT `chk_batch_period_year` CHECK (`period_year` >= 2000),
   CONSTRAINT `chk_batch_period_months_array` CHECK (JSON_TYPE(`period_months`) = 'ARRAY'),
   CONSTRAINT `chk_batch_variant_matches_type` CHECK (
-    (`report_type` = 'dae' AND `report_variant` IN ('daily','summary','series')) OR
-    (`report_type` = 'var' AND `report_variant` = 'total') OR
-    (`report_type` = 'attraction' AND `report_variant` = 'daily')
+    (`report_type` = 'dae'  AND `report_variant` IN ('daily','summary','series')) OR
+    (`report_type` = 'var1' AND `report_variant` = 'daily') OR
+    (`report_type` = 'var2' AND `report_variant` = 'total')
   ),
   CONSTRAINT `chk_batch_single_month_variants` CHECK (
     `report_variant` NOT IN ('daily','summary') OR JSON_LENGTH(`period_months`) = 1
