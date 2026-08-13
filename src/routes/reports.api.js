@@ -79,8 +79,30 @@ try {
 // ─── VAR 1 template images (top logo + footer graphic) ───────────────────────
 // The blank already carries its own artwork, so exports must reproduce it
 // rather than re-injecting a separate logo.  The anchors (twoCell) are parsed
-// from the template's drawing XML; media bytes are read straight from the zip.
+// from the template's drawing XML; the media bytes come from the canonical
+// sample files (tourism office logo on top, QR graphic at the bottom) so both
+// the Excel and PDF exports render the official artwork at the exact spots
+// where the blank template places its images.
 const attractionTemplateImages = [];
+
+// Two-cell anchor offsets lifted from "same day blank.xlsx" drawing1.xml.
+// ExcelJS zeroes out colOff/rowOff when it serializes image anchors, so the
+// exported drawing XML must be patched back to these exact EMU offsets to put
+// the logo + QR on the same spot as the blank template.
+const kVar1ImageAnchors = [
+  {
+    name: 'logo',
+    fromCol: 2, fromRow: 2, toCol: 4, toRow: 6,
+    fromColOff: 470148, fromRowOff: 149413,
+    toColOff: 562783, toRowOff: 186853,
+  },
+  {
+    name: 'qr',
+    fromCol: 1, fromRow: 61, toCol: 5, toRow: 63,
+    fromColOff: 449482, fromRowOff: 237814,
+    toColOff: 90894, toRowOff: 255295,
+  },
+];
 
 async function _loadAttractionTemplateImages() {
   try {
@@ -88,24 +110,16 @@ async function _loadAttractionTemplateImages() {
     const zip = await JSZip.loadAsync(await fsp.readFile(filePath));
 
     const drawingXml = await zip.file('xl/drawings/drawing1.xml').async('string');
-    const relsXml = await zip.file('xl/drawings/_rels/drawing1.xml.rels').async('string');
 
-    // rId → media filename (e.g. rId1 → xl/media/image1.png).  Targets are
-    // relative to xl/drawings/, so "../media/…" resolves under xl/.
-    const relMap = {};
-    for (const m of relsXml.matchAll(/<Relationship[^>]*Id="([^"]+)"[^>]*Target="([^"]+)"/g)) {
-      relMap[m[1]] = m[2].replace('../', 'xl/');
-    }
+    // Split the drawing XML into per-anchor blocks, keeping only the ones that
+    // actually embed a picture.
+    const anchorBlocks = drawingXml
+      .split(/<xdr:twoCellAnchor>|<xdr:oneCellAnchor>/)
+      .slice(1)
+      .filter(block => /r:embed="/.test(block));
 
-    // Split the drawing XML into per-anchor blocks.
-    const anchorBlocks = drawingXml.split(/<xdr:twoCellAnchor>|<xdr:oneCellAnchor>/).slice(1);
-    for (const block of anchorBlocks) {
-      const embedMatch = block.match(/r:embed="([^"]+)"/);
-      if (!embedMatch) continue;
-
-      const mediaFile = relMap[embedMatch[1]];
-      if (!mediaFile) continue;
-
+    // Parse each block's two-cell anchor (top-left + bottom-right corners).
+    const anchors = anchorBlocks.map(block => {
       const getVal = (tag, nth) => {
         const all = [...block.matchAll(new RegExp(`<xdr:${tag}>\\s*(\\d+)\\s*</xdr:${tag}>`, 'g'))];
         const m = all[nth];
@@ -116,20 +130,31 @@ async function _loadAttractionTemplateImages() {
         const m = all[nth];
         return m ? parseInt(m[1], 10) : 0;
       };
+      return {
+        tl: { col: getVal('col', 0), colOff: getOff('colOff', 0), row: getVal('row', 0), rowOff: getOff('rowOff', 0) },
+        br: { col: getVal('col', 1), colOff: getOff('colOff', 1), row: getVal('row', 1), rowOff: getOff('rowOff', 1) },
+      };
+    });
 
-      const tl = { col: getVal('col', 0), colOff: getOff('colOff', 0), row: getVal('row', 0), rowOff: getOff('rowOff', 0) };
-      const br = { col: getVal('col', 1), colOff: getOff('colOff', 1), row: getVal('row', 1), rowOff: getOff('rowOff', 1) };
+    if (anchors.length === 0) return;
 
-      const media = zip.file(mediaFile);
-      if (!media) continue;
-      const extMatch = mediaFile.match(/\.([a-zA-Z0-9]+)$/);
-      attractionTemplateImages.push({
-        buffer: await media.async('nodebuffer'),
-        extension: extMatch ? extMatch[1].toLowerCase() : 'png',
-        tl,
-        br,
-      });
-    }
+    // Sort by starting row so [0] = top (logo) and [last] = bottom (QR).
+    anchors.sort((a, b) => a.tl.row - b.tl.row);
+    const logo = anchors[0];
+    const qr = anchors[anchors.length - 1];
+
+    const logoPath = path.join(__dirname, '..', '..', 'sample', 'tourism_office_logo.jpg');
+    const qrPath = path.join(__dirname, '..', '..', 'sample', 'qr-pic.png');
+
+    const [logoBuffer, qrBuffer] = await Promise.all([
+      fsp.readFile(logoPath),
+      fsp.readFile(qrPath),
+    ]);
+
+    attractionTemplateImages.push(
+      { buffer: logoBuffer, extension: 'jpeg', tl: logo.tl, br: logo.br },
+      { buffer: qrBuffer, extension: 'png', tl: qr.tl, br: qr.br },
+    );
     console.log(`[report] VAR 1 template images loaded (${attractionTemplateImages.length})`);
   } catch (err) {
     console.warn('[report] VAR 1 template images not found:', err.message);
@@ -1178,7 +1203,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       const fontXml = reportType === 'var2' ? defaultFontXml.var
         : reportType === 'var1' ? defaultFontXml.attraction
         : defaultFontXml.dae;
-      const outBuffer = fontXml ? await _patchDefaultFont(buffer, fontXml) : buffer;
+      let outBuffer = fontXml ? await _patchDefaultFont(buffer, fontXml) : buffer;
+      if (reportType === 'var1') {
+        outBuffer = await _patchVar1ImageOffsets(outBuffer);
+      }
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
       res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.set('Content-Disposition', `attachment; filename="${baseFilename}.xlsx"`);
@@ -1606,6 +1634,64 @@ async function _patchDefaultFont(buffer, fontXml) {
     return await zip.generateAsync({ type: 'nodebuffer' });
   } catch (err) {
     console.warn('[report] Default font patch skipped:', err.message);
+    return buffer;
+  }
+}
+
+// ExcelJS writes every image anchor with colOff/rowOff zeroed and editAs
+// "oneCell".  Restore the template's exact EMU offsets (and the default
+// two-cell edit behavior) so the VAR 1 logo + QR sit precisely where the
+// blank template places them.
+async function _patchVar1ImageOffsets(buffer) {
+  const _matchSpec = (inner) => {
+    const m = inner.match(/<xdr:from><xdr:col>(\d+)<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row><xdr:rowOff>\d+<\/xdr:rowOff><\/xdr:from><xdr:to><xdr:col>(\d+)<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row>/);
+    if (!m) return null;
+    return kVar1ImageAnchors.find(s =>
+      s.fromCol === +m[1] && s.fromRow === +m[2] &&
+      s.toCol === +m[3] && s.toRow === +m[4]) || null;
+  };
+
+  const _applyOffsets = (inner, spec) => {
+    let out = inner;
+    out = out.replace(/<xdr:from>([\s\S]*?)<\/xdr:from>/, (block, f) =>
+      `<xdr:from>${f
+        .replace(/<xdr:colOff>\d+<\/xdr:colOff>/, `<xdr:colOff>${spec.fromColOff}</xdr:colOff>`)
+        .replace(/<xdr:rowOff>\d+<\/xdr:rowOff>/, `<xdr:rowOff>${spec.fromRowOff}</xdr:rowOff>`)}</xdr:from>`);
+    out = out.replace(/<xdr:to>([\s\S]*?)<\/xdr:to>/, (block, t) =>
+      `<xdr:to>${t
+        .replace(/<xdr:colOff>\d+<\/xdr:colOff>/, `<xdr:colOff>${spec.toColOff}</xdr:colOff>`)
+        .replace(/<xdr:rowOff>\d+<\/xdr:rowOff>/, `<xdr:rowOff>${spec.toRowOff}</xdr:rowOff>`)}</xdr:to>`);
+    return out;
+  };
+
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+    const drawings = Object.keys(zip.files)
+      .filter(name => /^xl\/drawings\/drawing\d+\.xml$/.test(name));
+
+    let anyChanged = false;
+    for (const name of drawings) {
+      let xml = await zip.file(name).async('string');
+      let changed = false;
+      xml = xml.replace(/<xdr:twoCellAnchor([^>]*)>([\s\S]*?)<\/xdr:twoCellAnchor>/g, (block, attrs, inner) => {
+        const spec = _matchSpec(inner);
+        if (!spec) return block;
+        changed = true;
+        return `<xdr:twoCellAnchor>${_applyOffsets(inner, spec)}</xdr:twoCellAnchor>`;
+      });
+      if (changed) {
+        zip.file(name, xml);
+        anyChanged = true;
+      }
+    }
+
+    if (!anyChanged) {
+      console.warn('[report] VAR 1 image offset patch: no matching anchors found, export unchanged');
+      return buffer;
+    }
+    return await zip.generateAsync({ type: 'nodebuffer' });
+  } catch (err) {
+    console.warn('[report] VAR 1 image offset patch skipped:', err.message);
     return buffer;
   }
 }
@@ -2540,7 +2626,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
   // Convert a two-cell image anchor into PDF-space box coordinates using the
   // same column-width/row-height math as the cell grid (EMU → pt × scale).
-  const _pdfImageBox = (sheet, tl, br, scale) => {
+  const _pdfImageBox = (sheet, tl, br, scale, originX, originY) => {
     const px = (emu) => (emu / 914400) * 72;
     let x = originX;
     for (let c = 1; c <= tl.col; c++) {
@@ -2795,7 +2881,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       if (reportType === 'var1') {
         for (const img of attractionTemplateImages) {
           try {
-            const { x, y, boxW, boxH } = _pdfImageBox(sheet, img.tl, img.br, scale);
+            const { x, y, boxW, boxH } = _pdfImageBox(sheet, img.tl, img.br, scale, geo.originX, geo.originY);
             if (boxW <= 0 || boxH <= 0) continue;
             const imgMeta = doc.openImage(img.buffer);
             const ratio = Math.min(boxW / imgMeta.width, boxH / imgMeta.height);
