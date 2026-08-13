@@ -195,6 +195,9 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     const [pending] = await connection.execute(
       `SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL`
     );
+    const [activeAttractions] = await connection.execute(
+      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'approved' AND deleted_at IS NULL`
+    );
 
     const [periodRecords] = await connection.execute(
       `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
@@ -253,15 +256,36 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
       businessLines = rows;
     }
 
+    let attractionVisitLogs = [];
+    {
+      const [rows] = await connection.execute(
+        `SELECT avl.attraction_id, ta.attraction_type, avl.guest_count
+         FROM attraction_visit_logs avl
+         JOIN tourist_attractions ta ON ta.id = avl.attraction_id
+         WHERE avl.deleted_at IS NULL
+           AND ta.deleted_at IS NULL
+           AND ta.status = 'approved'
+           AND avl.visit_date >= ? AND avl.visit_date <= ?`,
+        [startDate, endDate]
+      );
+      attractionVisitLogs = rows.map((r) => ({
+        attraction_id: r.attraction_id,
+        attraction_type: typeof r.attraction_type === 'string' ? JSON.parse(r.attraction_type) : r.attraction_type,
+        guest_count: r.guest_count,
+      }));
+    }
+
     res.json({
       stats: {
         activeAccommodations: active[0].count,
         pendingRegistrations: pending[0].count,
+        activeAttractions: activeAttractions[0].count,
       },
       periodRecords,
       yearRecords,
       breakdowns,
       businessLines,
+      attractionVisitLogs,
     });
   } catch (err) {
     next(err);

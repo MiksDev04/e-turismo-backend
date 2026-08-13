@@ -68,13 +68,75 @@ try {
 let attractionTemplateWb = null;
 try {
   attractionTemplateWb = new ExcelJS.Workbook();
-  await attractionTemplateWb.xlsx.readFile(path.join(__dirname, '..', '..', 'sample', 'VAR-REPORT-ATTRACTION_DAILY.xlsx'));
-  defaultFontXml.attraction = await _readTemplateDefaultFont(path.join(__dirname, '..', '..', 'sample', 'VAR-REPORT-ATTRACTION_DAILY.xlsx'));
+  await attractionTemplateWb.xlsx.readFile(path.join(__dirname, '..', '..', 'sample', 'same day blank.xlsx'));
+  defaultFontXml.attraction = await _readTemplateDefaultFont(path.join(__dirname, '..', '..', 'sample', 'same day blank.xlsx'));
   console.log('[report] VAR 1 (Attraction) Template loaded successfully');
 } catch (err) {
   console.warn('[report] VAR 1 Template not found, attraction exports will be unformatted:', err.message);
   attractionTemplateWb = null;
 }
+
+// ─── VAR 1 template images (top logo + footer graphic) ───────────────────────
+// The blank already carries its own artwork, so exports must reproduce it
+// rather than re-injecting a separate logo.  The anchors (twoCell) are parsed
+// from the template's drawing XML; media bytes are read straight from the zip.
+const attractionTemplateImages = [];
+
+async function _loadAttractionTemplateImages() {
+  try {
+    const filePath = path.join(__dirname, '..', '..', 'sample', 'same day blank.xlsx');
+    const zip = await JSZip.loadAsync(await fsp.readFile(filePath));
+
+    const drawingXml = await zip.file('xl/drawings/drawing1.xml').async('string');
+    const relsXml = await zip.file('xl/drawings/_rels/drawing1.xml.rels').async('string');
+
+    // rId → media filename (e.g. rId1 → xl/media/image1.png).  Targets are
+    // relative to xl/drawings/, so "../media/…" resolves under xl/.
+    const relMap = {};
+    for (const m of relsXml.matchAll(/<Relationship[^>]*Id="([^"]+)"[^>]*Target="([^"]+)"/g)) {
+      relMap[m[1]] = m[2].replace('../', 'xl/');
+    }
+
+    // Split the drawing XML into per-anchor blocks.
+    const anchorBlocks = drawingXml.split(/<xdr:twoCellAnchor>|<xdr:oneCellAnchor>/).slice(1);
+    for (const block of anchorBlocks) {
+      const embedMatch = block.match(/r:embed="([^"]+)"/);
+      if (!embedMatch) continue;
+
+      const mediaFile = relMap[embedMatch[1]];
+      if (!mediaFile) continue;
+
+      const getVal = (tag, nth) => {
+        const all = [...block.matchAll(new RegExp(`<xdr:${tag}>\\s*(\\d+)\\s*</xdr:${tag}>`, 'g'))];
+        const m = all[nth];
+        return m ? parseInt(m[1], 10) : 0;
+      };
+      const getOff = (tag, nth) => {
+        const all = [...block.matchAll(new RegExp(`<xdr:${tag}>\\s*(\\d+)\\s*</xdr:${tag}>`, 'g'))];
+        const m = all[nth];
+        return m ? parseInt(m[1], 10) : 0;
+      };
+
+      const tl = { col: getVal('col', 0), colOff: getOff('colOff', 0), row: getVal('row', 0), rowOff: getOff('rowOff', 0) };
+      const br = { col: getVal('col', 1), colOff: getOff('colOff', 1), row: getVal('row', 1), rowOff: getOff('rowOff', 1) };
+
+      const media = zip.file(mediaFile);
+      if (!media) continue;
+      const extMatch = mediaFile.match(/\.([a-zA-Z0-9]+)$/);
+      attractionTemplateImages.push({
+        buffer: await media.async('nodebuffer'),
+        extension: extMatch ? extMatch[1].toLowerCase() : 'png',
+        tl,
+        br,
+      });
+    }
+    console.log(`[report] VAR 1 template images loaded (${attractionTemplateImages.length})`);
+  } catch (err) {
+    console.warn('[report] VAR 1 template images not found:', err.message);
+  }
+}
+
+await _loadAttractionTemplateImages();
 
 // ─── Country / Region Definitions ────────────────────────────────────────────
 const kCountryRows = [
@@ -938,7 +1000,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
          WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
       );
 
-      const attractionTmpl = attractionTemplateWb?.getWorksheet('VAR 2M LGU Month Report');
+      const attractionTmpl = attractionTemplateWb?.getWorksheet('Sheet1');
 
       for (const att of attractions) {
         const md = await _fetchAttractionMonthData(att.id, sortedMonths[0], year);
@@ -953,15 +1015,15 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         _buildVar1ExcelSheet(sheet, att.attraction_name, attractionType, md.daily, md.totals,
           sortedMonths[0], year);
 
-        if (varLogoBuffer) {
+        // Restore the template's own artwork (top logo + footer graphic) into
+        // the cloned sheet — the clone strips images, so they must be re-added
+        // with their original two-cell anchors.
+        for (const img of attractionTemplateImages) {
           try {
-            const logoId = wb.addImage({ buffer: varLogoBuffer, extension: 'jpeg' });
-            sheet.addImage(logoId, {
-              tl: { nativeCol: 1, nativeColOff: 1038225, nativeRow: 0, nativeRowOff: 57150 },
-              ext: { width: 64, height: 64 },
-            });
+            const imageId = wb.addImage({ buffer: img.buffer, extension: img.extension });
+            sheet.addImage(imageId, { tl: img.tl, br: img.br });
           } catch (err) {
-            console.warn('[report] Could not embed VAR 1 logo:', err.message);
+            console.warn('[report] Could not restore VAR 1 template image:', err.message);
           }
         }
       }
@@ -2108,7 +2170,7 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
 }
 
 // ─── VAR 1 (Tourist Attraction) sheet builder ────────────────────────────────
-// Column positions in VAR-REPORT-ATTRACTION_DAILY.xlsx (1-indexed, A=1).
+// Column positions in same day blank.xlsx (1-indexed, A=1).
 const kVar1Cols = {
   day: 2,             // B
   maleThisCity: 4,    // D
@@ -2128,8 +2190,8 @@ const kVar1Cols = {
   grandTotal: 18,     // R
 };
 
-const kVar1DayRowStart = 20; // day 1 lives at row 20 (template rows 20-50 = days 1-31)
-const kVar1TotalRow = 51;
+const kVar1DayRowStart = 24; // day 1 lives at row 24 (template rows 24-54 = days 1-31)
+const kVar1TotalRow = 55;
 
 // Attraction type values as stored in tourist_attractions.attraction_type →
 // the display labels used on the VAR 1 form.  Unknown values fall back to a
@@ -2161,13 +2223,13 @@ function _buildVar1ExcelSheet(sheet, attractionName, attractionType, daily, tota
   const kWeekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
   // ── Header variable fields (rows 1-15 come from the template clone) ───────
-  sheet.getCell('G10').value = `${kMonthNames[month]} ${year}`;          // Month/Year value
-  sheet.getCell('G12').value = attractionName;                            // Name of attraction/ Spot
-  // Type of Tourism Attraction — display labels go in the merged box E14:I14
-  // (the template's bordered "fill-in" cell), not the narrow D14 column.
-  sheet.getCell('E14').value = (attractionType || []).map(_attractionTypeLabel).filter(Boolean).join(', ');
+  sheet.getCell('G14').value = `${kMonthNames[month]} ${year}`;          // Month/Year value (label at E14)
+  sheet.getCell('G16').value = attractionName;                            // Name of attraction/ Spot (label at E16)
+  // Type of Tourism Attraction — display labels go in the merged fill-in box
+  // E18:G18 (label at D18).
+  sheet.getCell('E18').value = (attractionType || []).map(_attractionTypeLabel).filter(Boolean).join(', ');
 
-  // ── Day rows 20-50 ────────────────────────────────────────────────────────
+  // ── Day rows 24-54 ────────────────────────────────────────────────────────
   // Raw input columns D,E,G,H,J,K,M,N — the only cells filled from data.
   const rawInputCols = [
     c.maleThisCity, c.femaleThisCity,
@@ -2233,8 +2295,8 @@ function _buildVar1ExcelSheet(sheet, attractionName, attractionType, daily, tota
     sheet.getRow(rowNum).getCell(c.femaleForeign).value   = femaleForeign || null;
   }
 
-  // ── Total row (row 51) — mirrors the template's D51:Q51 SUM formulas ──────
-  const lastDataRow = kVar1DayRowStart + 30; // 50
+  // ── Total row (row 55) — mirrors the template's D55:Q55 SUM formulas ──────
+  const lastDataRow = kVar1DayRowStart + 30; // 54
   const totalRow = sheet.getRow(kVar1TotalRow);
   totalRow.getCell(c.maleThisCity).value     = { formula: `SUM(D${kVar1DayRowStart}:D${lastDataRow})` };
   totalRow.getCell(c.femaleThisCity).value   = { formula: `SUM(E${kVar1DayRowStart}:E${lastDataRow})` };
@@ -2288,10 +2350,10 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
   // Font metrics that convert Excel's stored column widths ("characters of the
   // default font") into physical points.  CHAR_WIDTH_PT = max digit width of the
-  // template's default font at 96dpi: Arial 10 → 7px = 5.25pt; MS PGothic 11
+  // template's default font at 96dpi: Arial/Calibri 11 → 7px = 5.25pt; MS PGothic 11
   // (VAR, half-width digits) → 8px = 6.0pt.  CELL_PAD_PT = Excel's 5px padding
   // each column adds, so column edges match Excel's rendered width exactly.
-  const CHAR_WIDTH_PT = reportType === 'var' || reportType === 'attraction' ? 6.0 : 5.25;
+  const CHAR_WIDTH_PT = reportType === 'var' ? 6.0 : 5.25;
   const CELL_PAD_PT = 3.75;
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 }, A4: { w: 595.28, h: 841.89 } };
   const BORDER_WIDTH = {
@@ -2389,6 +2451,33 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   });
 
   let isFirstSheet = true;
+
+  // Convert a two-cell image anchor into PDF-space box coordinates using the
+  // same column-width/row-height math as the cell grid (EMU → pt × scale).
+  const _pdfImageBox = (sheet, tl, br, scale) => {
+    const px = (emu) => (emu / 914400) * 72;
+    let x = originX;
+    for (let c = 1; c <= tl.col; c++) {
+      x += ((sheet.getColumn(c).width || 10) * CHAR_WIDTH_PT + CELL_PAD_PT) * scale;
+    }
+    x += px(tl.colOff) * scale;
+    let y = originY;
+    for (let r = 1; r <= tl.row; r++) {
+      y += (sheet.getRow(r).height || 15) * scale;
+    }
+    y += px(tl.rowOff) * scale;
+    let boxW = 0;
+    for (let c = tl.col + 1; c <= br.col; c++) {
+      boxW += ((sheet.getColumn(c).width || 10) * CHAR_WIDTH_PT + CELL_PAD_PT) * scale;
+    }
+    boxW += px(br.colOff - tl.colOff) * scale;
+    let boxH = 0;
+    for (let r = tl.row + 1; r <= br.row; r++) {
+      boxH += (sheet.getRow(r).height || 15) * scale;
+    }
+    boxH += px(br.rowOff - tl.rowOff) * scale;
+    return { x, y, boxW, boxH };
+  };
 
   for (let si = 0; si < layouts.length; si++) {
     const { sheet, maxCol, sheetSections } = layouts[si];
@@ -2613,9 +2702,23 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
         curY += rh;
       }
 
-      // Draw the tourism office logo over the VAR header block (B1, rows 1-4)
-      // on the first page, using the same origin/scale math as the cell grid.
-      if ((reportType === 'var' || reportType === 'attraction') && s === 0 && varLogoBuffer) {
+      // Draw the template's own artwork for VAR 1 (attraction) — the top logo
+      // and footer graphic — at their original anchor boxes, using the same
+      // origin/scale math as the cell grid.  The VAR 2 report keeps drawing the
+      // tourism office logo over its header (B1, rows 1-4).
+      if (reportType === 'attraction') {
+        for (const img of attractionTemplateImages) {
+          try {
+            const { x, y, boxW, boxH } = _pdfImageBox(sheet, img.tl, img.br, scale);
+            if (boxW <= 0 || boxH <= 0) continue;
+            const imgMeta = doc.openImage(img.buffer);
+            const ratio = Math.min(boxW / imgMeta.width, boxH / imgMeta.height);
+            doc.image(img.buffer, x, y, { width: imgMeta.width * ratio, height: imgMeta.height * ratio });
+          } catch (err) {
+            console.warn('[report] Could not draw VAR 1 template image:', err.message);
+          }
+        }
+      } else if (reportType === 'var' && s === 0 && varLogoBuffer) {
         const colAW = (sheet.getColumn(1).width || 10) * CHAR_WIDTH_PT * scale + CELL_PAD_PT * scale;
         const logoX = originX + colAW + (1038225 / 914400) * 72 * scale;
         const logoY = originY + (57150 / 914400) * 72 * scale;
