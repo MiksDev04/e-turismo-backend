@@ -124,6 +124,7 @@ router.get('/breakdowns', auth.authenticate, auth.requireRole('admin', 'business
     const [rows] = await connection.execute(
       `SELECT id AS guest_record_id, lead_country AS country,
               lead_province AS province,
+              lead_city_municipality AS city_municipality,
               lead_sex AS sex,
               CASE
                 WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
@@ -169,6 +170,46 @@ router.get('/business-lines', auth.authenticate, auth.requireRole('admin'), asyn
     );
 
     res.json(rows);
+  } catch (err) {
+    next(err);
+  } finally {
+    connection.release();
+  }
+});
+
+/**
+ * GET /api/dashboard/attraction-visit-logs
+ * Admin only: Returns approved tourist-attraction visit logs within a date
+ * range (inclusive). Used by the admin dashboard trend + donut charts.
+ */
+router.get('/attraction-visit-logs', auth.authenticate, auth.requireRole('admin'), async (req, res, next) => {
+  const { startDate, endDate } = req.query;
+  if (!startDate || !endDate) {
+    return res.status(400).json({ message: 'Missing date parameters' });
+  }
+
+  const connection = await db.pool.getConnection();
+  try {
+    const [rows] = await connection.execute(
+      `SELECT avl.id, avl.attraction_id, ta.attraction_type, avl.visit_date,
+              avl.guest_count, avl.male_count, avl.female_count,
+              avl.country, avl.province, avl.city_municipality
+       FROM attraction_visit_logs avl
+       JOIN tourist_attractions ta ON ta.id = avl.attraction_id
+       WHERE avl.deleted_at IS NULL
+         AND ta.deleted_at IS NULL
+         AND ta.status = 'approved'
+         AND avl.visit_date >= ? AND avl.visit_date <= ?
+       ORDER BY avl.visit_date ASC`,
+      [startDate, endDate]
+    );
+
+    res.json(
+      rows.map((r) => ({
+        ...r,
+        attraction_type: typeof r.attraction_type === 'string' ? JSON.parse(r.attraction_type) : r.attraction_type,
+      }))
+    );
   } catch (err) {
     next(err);
   } finally {
@@ -226,6 +267,7 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
       const [rows] = await connection.execute(
         `SELECT id AS guest_record_id, lead_country AS country,
                 lead_province AS province,
+                lead_city_municipality AS city_municipality,
                 lead_sex AS sex,
                 CASE
                   WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
@@ -259,7 +301,9 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     let attractionVisitLogs = [];
     {
       const [rows] = await connection.execute(
-        `SELECT avl.attraction_id, ta.attraction_type, avl.guest_count
+        `SELECT avl.id, avl.attraction_id, ta.attraction_type, avl.visit_date,
+                avl.guest_count, avl.male_count, avl.female_count,
+                avl.country, avl.province, avl.city_municipality
          FROM attraction_visit_logs avl
          JOIN tourist_attractions ta ON ta.id = avl.attraction_id
          WHERE avl.deleted_at IS NULL
@@ -269,9 +313,30 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
         [startDate, endDate]
       );
       attractionVisitLogs = rows.map((r) => ({
-        attraction_id: r.attraction_id,
+        ...r,
         attraction_type: typeof r.attraction_type === 'string' ? JSON.parse(r.attraction_type) : r.attraction_type,
-        guest_count: r.guest_count,
+      }));
+    }
+
+    let yearAttractionVisitLogs;
+    if (startDate === yearStart && endDate === yearEnd) {
+      yearAttractionVisitLogs = attractionVisitLogs;
+    } else {
+      const [rows] = await connection.execute(
+        `SELECT avl.id, avl.attraction_id, ta.attraction_type, avl.visit_date,
+                avl.guest_count, avl.male_count, avl.female_count,
+                avl.country, avl.province, avl.city_municipality
+         FROM attraction_visit_logs avl
+         JOIN tourist_attractions ta ON ta.id = avl.attraction_id
+         WHERE avl.deleted_at IS NULL
+           AND ta.deleted_at IS NULL
+           AND ta.status = 'approved'
+           AND avl.visit_date >= ? AND avl.visit_date <= ?`,
+        [yearStart, yearEnd]
+      );
+      yearAttractionVisitLogs = rows.map((r) => ({
+        ...r,
+        attraction_type: typeof r.attraction_type === 'string' ? JSON.parse(r.attraction_type) : r.attraction_type,
       }));
     }
 
@@ -286,6 +351,7 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
       breakdowns,
       businessLines,
       attractionVisitLogs,
+      yearAttractionVisitLogs,
     });
   } catch (err) {
     next(err);
