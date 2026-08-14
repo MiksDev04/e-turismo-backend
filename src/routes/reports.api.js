@@ -2490,10 +2490,10 @@ function _buildVar1ExcelSheet(sheet, attractionName, attractionType, daily, tota
 
 // ─── PDF Layout & Page-Break Config ─────────────────────────────────────────
 const SHEET_PDF_CONFIG = {
-  daily:   { layout: 'landscape', size: 'A4', margin: 30, breakRows: [64, 124] },
-  monthly: { layout: 'landscape', size: 'A4', margin: 40, breakRows: [64, 124] },
-  sum:     { layout: 'portrait',  size: 'A4', margin: 30, breakRows: [66, 128] },
-  var:     { layout: 'portrait', size: 'A4', margin: 30, breakRows: [] },
+  daily:   { layout: 'landscape', size: 'A4', margin: 28.35, breakRows: [64, 124] },
+  monthly: { layout: 'landscape', size: 'A4', margin: 28.35, breakRows: [64, 124] },
+  sum:     { layout: 'portrait',  size: 'A4', margin: 28.35, breakRows: [66, 128] },
+  var:     { layout: 'portrait', size: 'A4', margin: 28.35, breakRows: [] },
 };
 
 function _getSheetPdfConfig(sheetName, reportType) {
@@ -2543,14 +2543,44 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     return PAGE_DIMS[size] || PAGE_DIMS.A3;
   };
 
-  const effectiveMargin = Math.max(pdfConfig.margin, 30);
+  const effectiveMargin = Math.max(pdfConfig.margin, 28.35);
 
-  // ── Per-sheet layout: sections + natural content width/height ─────────────
+    // ── Per-sheet layout: sections + natural content width/height ─────────────
+  // Last row that actually carries content (a value, border, fill, or template
+  // image) — the VAR sheets keep ~26 phantom empty trailing rows past their
+  // real content, which inflate the fit-height and shrink the whole grid.
+  const _lastUsedRow = (sheet, maxRow) => {
+    let used = 0;
+    sheet.eachRow({ includeEmpty: true }, (row, rn) => {
+      if (rn > maxRow) return;
+      let rowUsed = false;
+      row.eachCell({ includeEmpty: true }, (cell, cn) => {
+        if (cn > 33) return;
+        const hasValue = cell.value !== null && cell.value !== undefined && cell.value !== '';
+        const hasBorder = !!(cell.border && (cell.border.top || cell.border.bottom
+          || cell.border.left || cell.border.right));
+        const hasFill = !!(cell.fill && cell.fill.type && cell.fill.fgColor
+          && cell.fill.fgColor.argb);
+        if (hasValue || hasBorder || hasFill) rowUsed = true;
+      });
+      if (rowUsed) used = rn;
+    });
+    // VAR 1 restores its template artwork (top logo rows 2-6, QR graphic rows
+    // 61-63), so rows spanned by those anchors count as used too.
+    if (reportType === 'var1') {
+      for (const img of attractionTemplateImages) used = Math.max(used, img.br.row);
+    }
+    return used;
+  };
+
   const layouts = sheets.map(sheet => {
     const maxCol = reportType === 'var2' || reportType === 'var1' ? 18 : 33;
     const maxRow = (reportType === 'dae' && variant === 'daily')
       ? 181
       : (sheet.rowCount || 197);
+    const usedRow = (reportType === 'var2' || reportType === 'var1')
+      ? Math.min(maxRow, _lastUsedRow(sheet, maxRow))
+      : maxRow;
 
     const rows = [];
     sheet.eachRow({ includeEmpty: true }, (row, rn) => {
@@ -2578,12 +2608,15 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     let maxHeightInAnySection = 0;
     for (const sec of sheetSections) {
       let h = 0;
-      for (const { row } of sec) h += (row.height || 15);
+      for (const { row, rn } of sec) {
+        if (rn > usedRow) break;
+        h += (row.height || 15);
+      }
       if (h > maxHeightInAnySection) maxHeightInAnySection = h;
     }
     if (maxHeightInAnySection === 0) maxHeightInAnySection = 300;
 
-    return { sheet, maxCol, sheetSections, contentWidthPt, maxHeightInAnySection };
+    return { sheet, maxCol, sheetSections, contentWidthPt, maxHeightInAnySection, usedRow };
   });
 
   // ── Page geometry per sheet ───────────────────────────────────────────────
@@ -2605,7 +2638,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       layout: pdfConfig.layout,
       scale,
       originX: effectiveMargin + (aw2 - L.contentWidthPt * scale) / 2,
-      originY: effectiveMargin + (ah2 - L.maxHeightInAnySection * scale) / 2,
+      originY: effectiveMargin,
     };
   });
 
@@ -2652,7 +2685,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   };
 
   for (let si = 0; si < layouts.length; si++) {
-    const { sheet, maxCol, sheetSections } = layouts[si];
+    const { sheet, maxCol, sheetSections, usedRow } = layouts[si];
     const geo = geometries[si];
     const { originX, originY, scale } = geo;
 
@@ -2670,6 +2703,8 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       let curY = originY;
 
       for (const { row, rn } of section) {
+        // Skip phantom empty trailing rows beyond the sheet's real content.
+        if (rn > usedRow) continue;
         const rh = (row.height || 15) * scale;
         let curX = originX;
 
