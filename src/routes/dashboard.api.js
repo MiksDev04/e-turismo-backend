@@ -6,7 +6,7 @@ const router = express.Router();
 
 /**
  * GET /api/dashboard/stats
- * Admin only: returns counts of active and pending businesses
+ * Admin only: returns counts of active and pending businesses/attractions
  */
 router.get('/stats', auth.authenticate, auth.requireRole('admin'), async (req, res, next) => {
   const connection = await db.pool.getConnection();
@@ -17,9 +17,42 @@ router.get('/stats', auth.authenticate, auth.requireRole('admin'), async (req, r
     const [pending] = await connection.execute(
       `SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL`
     );
+    const [activeAttractions] = await connection.execute(
+      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'approved' AND deleted_at IS NULL`
+    );
+    const [pendingAttractions] = await connection.execute(
+      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'pending' AND deleted_at IS NULL`
+    );
     res.json({
       activeAccommodations: active[0].count,
-      pendingRegistrations: pending[0].count
+      pendingAccommodations: pending[0].count,
+      activeAttractions: activeAttractions[0].count,
+      pendingAttractions: pendingAttractions[0].count
+    });
+  } catch (err) {
+    next(err);
+  } finally {
+    connection.release();
+  }
+});
+
+/**
+ * GET /api/dashboard/pending-counts
+ * Admin only: lightweight counts of pending registrations used for
+ * navigation badges in the admin sidebar / bottom nav.
+ */
+router.get('/pending-counts', auth.authenticate, auth.requireRole('admin'), async (req, res, next) => {
+  const connection = await db.pool.getConnection();
+  try {
+    const [pending] = await connection.execute(
+      `SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL`
+    );
+    const [pendingAttractions] = await connection.execute(
+      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'pending' AND deleted_at IS NULL`
+    );
+    res.json({
+      pendingAccommodations: pending[0].count,
+      pendingAttractions: pendingAttractions[0].count
     });
   } catch (err) {
     next(err);
@@ -305,6 +338,9 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     const [activeAttractions] = await connection.execute(
       `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'approved' AND deleted_at IS NULL`
     );
+    const [pendingAttractions] = await connection.execute(
+      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'pending' AND deleted_at IS NULL`
+    );
 
     const [periodRecords] = await connection.execute(
       `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
@@ -409,8 +445,9 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     res.json({
       stats: {
         activeAccommodations: active[0].count,
-        pendingRegistrations: pending[0].count,
+        pendingAccommodations: pending[0].count,
         activeAttractions: activeAttractions[0].count,
+        pendingAttractions: pendingAttractions[0].count,
       },
       periodRecords,
       yearRecords,
