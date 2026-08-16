@@ -2,6 +2,7 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
+import { parseOriginGroups } from '../utils/originGroups.js';
 
 const router = express.Router();
 
@@ -63,6 +64,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       status,
       maleCount,
       femaleCount,
+      originGroups,
     } = req.body;
 
     if (!businessId || !checkIn || !checkOut || !totalGuests || !leadSex) {
@@ -72,19 +74,40 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       return res.status(400).json({ message: 'leadSex must be "male" or "female"' });
     }
 
-    // Male/female counts: optional. If one is missing it is derived from the
-    // other; if both are blank, fall back to the PSA 47.1%/52.9% split.
+    const hasGroups = Array.isArray(originGroups) && originGroups.length > 0;
+    let parsedGroups = [];
+
     const totalGuestsInt = parseInt(totalGuests, 10) || 1;
-    let maleCountInt = parseInt(maleCount, 10) || 0;
-    let femaleCountInt = parseInt(femaleCount, 10) || 0;
-    if (!maleCountInt && !femaleCountInt) {
-      maleCountInt = Math.round(totalGuestsInt * 0.471);
-      femaleCountInt = totalGuestsInt - maleCountInt;
-    } else if (!maleCountInt) {
-      maleCountInt = totalGuestsInt - femaleCountInt;
-    } else if (!femaleCountInt) {
-      femaleCountInt = totalGuestsInt - maleCountInt;
+    let maleCountInt;
+    let femaleCountInt;
+
+    if (hasGroups) {
+      // When origin groups exist, the parent counts are DERIVED from the
+      // group sums and the client-sent values are overwritten (auto-derive
+      // wins — internal consistency, not accuracy).
+      const parsed = parseOriginGroups(originGroups);
+      if (!parsed.ok) {
+        return res.status(400).json({ message: parsed.message });
+      }
+      parsedGroups = parsed.groups;
+      maleCountInt = parsedGroups.reduce((sum, g) => sum + g.maleCount, 0);
+      femaleCountInt = parsedGroups.reduce((sum, g) => sum + g.femaleCount, 0);
+    } else {
+      // Male/female counts: optional. If one is missing it is derived from the
+      // other; if both are blank, fall back to the PSA 47.1%/52.9% split.
+      maleCountInt = parseInt(maleCount, 10) || 0;
+      femaleCountInt = parseInt(femaleCount, 10) || 0;
+      if (!maleCountInt && !femaleCountInt) {
+        maleCountInt = Math.round(totalGuestsInt * 0.471);
+        femaleCountInt = totalGuestsInt - maleCountInt;
+      } else if (!maleCountInt) {
+        maleCountInt = totalGuestsInt - femaleCountInt;
+      } else if (!femaleCountInt) {
+        femaleCountInt = totalGuestsInt - maleCountInt;
+      }
     }
+
+    const totalGuestsSaved = hasGroups ? maleCountInt + femaleCountInt : totalGuestsInt;
 
     const guestRecordId = id || uuidv4();
 
@@ -128,7 +151,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
         checkIn,
         checkOut,
         actualCheckOut || null,
-        totalGuests,
+        totalGuestsSaved,
         maleCountInt,
         femaleCountInt,
         purposeOfVisit,
@@ -160,6 +183,28 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
         await connection.execute(
           `UPDATE rooms SET room_status = 'occupied' WHERE id IN (${placeholders})`,
           roomIds
+        );
+      }
+    }
+
+    // Insert origin group breakdown rows (derived counts live on the parent).
+    if (hasGroups) {
+      for (const group of parsedGroups) {
+        await connection.execute(
+          `INSERT INTO guest_origin_breakdowns (
+            id, guest_record_id, country, is_overseas,
+            province, city_municipality, male_count, female_count
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            uuidv4(),
+            guestRecordId,
+            group.country,
+            group.isOverseas ? 1 : 0,
+            group.province,
+            group.cityMunicipality,
+            group.maleCount,
+            group.femaleCount,
+          ]
         );
       }
     }

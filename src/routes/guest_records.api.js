@@ -2,6 +2,7 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
+import { parseOriginGroups, breakdownToJson } from '../utils/originGroups.js';
 
 const router = express.Router();
 
@@ -137,11 +138,33 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
       }
     }
 
+    // ── Fetch origin groups for these records via guest_origin_breakdowns ─
+    let breakdownsByRecord = {};
+
+    if (recordIds.length > 0) {
+      const placeholders = recordIds.map(() => '?').join(',');
+      const [breakdowns] = await connection.execute(
+        `SELECT guest_record_id, id, country, is_overseas, province,
+                city_municipality, male_count, female_count
+         FROM guest_origin_breakdowns
+         WHERE guest_record_id IN (${placeholders}) AND deleted_at IS NULL`,
+        recordIds
+      );
+
+      for (const b of breakdowns) {
+        if (!breakdownsByRecord[b.guest_record_id]) {
+          breakdownsByRecord[b.guest_record_id] = [];
+        }
+        breakdownsByRecord[b.guest_record_id].push(breakdownToJson(b));
+      }
+    }
+
     const data = records.map(r => ({
       ...r,
       leadIsOverseas: r.lead_is_overseas === 1,
       isDeleted: r.is_deleted === 1 || r.is_deleted === true,
       rooms: roomsByRecord[r.id] || [],
+      guest_breakdowns: breakdownsByRecord[r.id] || [],
     }));
 
     if (fetchAll === 'true') {
@@ -181,25 +204,47 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       leadSex,
       maleCount,
       femaleCount,
+      originGroups,
     } = req.body;
 
     if (!leadSex || !['male', 'female'].includes(leadSex?.toLowerCase())) {
       return res.status(400).json({ message: 'leadSex must be "male" or "female"' });
     }
 
-    // Male/female counts: optional. If one is missing it is derived from the
-    // other; if both are blank, fall back to the PSA 47.1%/52.9% split.
+    const hasGroups = Array.isArray(originGroups) && originGroups.length > 0;
+    let parsedGroups = [];
+
     const totalGuestsInt = parseInt(totalGuests, 10) || 1;
-    let maleCountInt = parseInt(maleCount, 10) || 0;
-    let femaleCountInt = parseInt(femaleCount, 10) || 0;
-    if (!maleCountInt && !femaleCountInt) {
-      maleCountInt = Math.round(totalGuestsInt * 0.471);
-      femaleCountInt = totalGuestsInt - maleCountInt;
-    } else if (!maleCountInt) {
-      maleCountInt = totalGuestsInt - femaleCountInt;
-    } else if (!femaleCountInt) {
-      femaleCountInt = totalGuestsInt - maleCountInt;
+    let maleCountInt;
+    let femaleCountInt;
+
+    if (hasGroups) {
+      // When origin groups exist, the parent counts are DERIVED from the
+      // group sums and the client-sent values are overwritten (auto-derive
+      // wins — internal consistency, not accuracy).
+      const parsed = parseOriginGroups(originGroups);
+      if (!parsed.ok) {
+        return res.status(400).json({ message: parsed.message });
+      }
+      parsedGroups = parsed.groups;
+      maleCountInt = parsedGroups.reduce((sum, g) => sum + g.maleCount, 0);
+      femaleCountInt = parsedGroups.reduce((sum, g) => sum + g.femaleCount, 0);
+    } else {
+      // Male/female counts: optional. If one is missing it is derived from the
+      // other; if both are blank, fall back to the PSA 47.1%/52.9% split.
+      maleCountInt = parseInt(maleCount, 10) || 0;
+      femaleCountInt = parseInt(femaleCount, 10) || 0;
+      if (!maleCountInt && !femaleCountInt) {
+        maleCountInt = Math.round(totalGuestsInt * 0.471);
+        femaleCountInt = totalGuestsInt - maleCountInt;
+      } else if (!maleCountInt) {
+        maleCountInt = totalGuestsInt - femaleCountInt;
+      } else if (!femaleCountInt) {
+        femaleCountInt = totalGuestsInt - maleCountInt;
+      }
     }
+
+    const totalGuestsSaved = hasGroups ? maleCountInt + femaleCountInt : totalGuestsInt;
 
     await connection.beginTransaction();
 
@@ -231,7 +276,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
           checkIn,
           checkOut,
           actualCheckOut || null,
-          totalGuests,
+          totalGuestsSaved,
           maleCountInt,
           femaleCountInt,
           purposeOfVisit,
@@ -282,7 +327,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
       const updateParams = [
         checkIn,
         checkOut,
-        totalGuests,
+        totalGuestsSaved,
         maleCountInt,
         femaleCountInt,
         purposeOfVisit,
@@ -395,6 +440,40 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
           `UPDATE rooms SET room_status = 'occupied' WHERE id IN (${placeholders})`,
           roomIds
         );
+      }
+    }
+
+    // ── Replace origin group breakdowns ───────────────────────────────────
+    // Only when the client sent the key at all (checkout flow and older
+    // clients omit it, leaving existing groups untouched). Soft-delete, never
+    // hard-delete; an empty array runs only the soft-delete.
+    if (originGroups !== undefined) {
+      await connection.execute(
+        `UPDATE guest_origin_breakdowns
+         SET deleted_at = NOW(), updated_at = NOW()
+         WHERE guest_record_id = ? AND deleted_at IS NULL`,
+        [recordId]
+      );
+
+      if (hasGroups) {
+        for (const group of parsedGroups) {
+          await connection.execute(
+            `INSERT INTO guest_origin_breakdowns (
+              id, guest_record_id, country, is_overseas,
+              province, city_municipality, male_count, female_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              uuidv4(),
+              recordId,
+              group.country,
+              group.isOverseas ? 1 : 0,
+              group.province,
+              group.cityMunicipality,
+              group.maleCount,
+              group.femaleCount,
+            ]
+          );
+        }
       }
     }
 
