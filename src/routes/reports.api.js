@@ -1269,6 +1269,20 @@ async function _fetchMonthData(businessId, month, year) {
     });
   }
 
+  let breakdownsByRecord = {};
+  if (recordIds.length > 0) {
+    const [gobRows] = await db.pool.execute(
+      `SELECT guest_record_id, country, is_overseas, province, city_municipality, male_count, female_count
+       FROM guest_origin_breakdowns
+       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
+      recordIds
+    );
+    gobRows.forEach(b => {
+      if (!breakdownsByRecord[b.guest_record_id]) breakdownsByRecord[b.guest_record_id] = [];
+      breakdownsByRecord[b.guest_record_id].push(b);
+    });
+  }
+
   const countryByDay            = {};
   const residentsByDay          = { 0: {} };
   const sexByDay                = { 0: { male: {}, female: {} } };
@@ -1292,18 +1306,13 @@ async function _fetchMonthData(businessId, month, year) {
     const effectiveCheckOut = r.actual_check_out || r.check_out;
     const checkOut   = _parseLocalDate(effectiveCheckOut);
     const nights     = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    const guestCount = r.total_guests || 0;
 
-    const country     = (r.lead_country || '').toUpperCase();
-    const nationality = (r.lead_nationality || '');
-    const sex         = (r.lead_sex || '').toLowerCase();
-    const rawBucket   = _classifyResidenceBucket({ country, nationality, isOverseas: !!r.lead_is_overseas });
-    const count       = _asInt(r.total_guests);
+    const groups = breakdownsByRecord[r.id] || [];
+    const hasGroups = groups.length > 0;
 
-    let bucket = rawBucket;
-    if (rawBucket === 'foreign_resident') {
-      bucket = listedSet.has(country) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
-    }
+    const guestCount = hasGroups
+      ? groups.reduce((sum, g) => sum + _asInt(g.male_count) + _asInt(g.female_count), 0)
+      : (r.total_guests || 0);
 
     const spreadDays = nights + 1;
     const arrivalDay = checkIn.getDate();
@@ -1340,36 +1349,80 @@ async function _fetchMonthData(businessId, month, year) {
         }
       }
 
-      // Country breakdown (all guests in party)
-      if (rawBucket === 'foreign_resident' && country) {
-        if (!countryByDay[country]) countryByDay[country] = { 0: 0 };
-        countryByDay[country][stayDay] = (countryByDay[country][stayDay] || 0) + count;
-        countryByDay[country][0]       = (countryByDay[country][0]       || 0) + count;
-      }
+      if (hasGroups) {
+        groups.forEach(g => {
+          const gCountry     = (g.country || '').toUpperCase();
+          const gIsOverseas  = !!g.is_overseas;
+          const gNationality = (gCountry === 'PHILIPPINES' || (!gCountry && gIsOverseas)) ? 'Filipino' : 'Foreign';
+          const gRawBucket   = _classifyResidenceBucket({ country: g.country, nationality: gNationality, isOverseas: gIsOverseas });
+          const gCount       = _asInt(g.male_count) + _asInt(g.female_count);
 
-      // Residency bucket totals (all guests in party)
-      residentsByDay[stayDay] = residentsByDay[stayDay] || {};
-      residentsByDay[stayDay][bucket] = (residentsByDay[stayDay][bucket] || 0) + count;
-      residentsByDay[0][bucket]       = (residentsByDay[0][bucket]       || 0) + count;
+          let gBucket = gRawBucket;
+          if (gRawBucket === 'foreign_resident') {
+            gBucket = listedSet.has(gCountry) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
+          }
 
-      // Sex × residency breakdown — counts all guests in the party via the
-      // record's male_count / female_count, not just the lead guest's sex.
-      // Residence is a party-level attribute, so the bucket is resolved once.
-      let maleCount   = _asInt(r.male_count);
-      let femaleCount = _asInt(r.female_count);
-      if (maleCount + femaleCount === 0) {
-        // Defensive fallback for legacy/anomalous rows: count the lead guest only.
-        if (sex === 'female') femaleCount = 1; else maleCount = 1;
+          const gMale   = _asInt(g.male_count);
+          const gFemale = _asInt(g.female_count);
+
+          if (gRawBucket === 'foreign_resident' && gCountry) {
+            if (!countryByDay[gCountry]) countryByDay[gCountry] = { 0: 0 };
+            countryByDay[gCountry][stayDay] = (countryByDay[gCountry][stayDay] || 0) + gCount;
+            countryByDay[gCountry][0]       = (countryByDay[gCountry][0]       || 0) + gCount;
+          }
+
+          residentsByDay[stayDay] = residentsByDay[stayDay] || {};
+          residentsByDay[stayDay][gBucket] = (residentsByDay[stayDay][gBucket] || 0) + gCount;
+          residentsByDay[0][gBucket]       = (residentsByDay[0][gBucket]       || 0) + gCount;
+
+          sexByDay[stayDay] = sexByDay[stayDay] || { male: {}, female: {} };
+          if (!sexByDay[stayDay].male)   sexByDay[stayDay].male   = {};
+          if (!sexByDay[stayDay].female) sexByDay[stayDay].female = {};
+          if (!sexByDay[0].male)         sexByDay[0].male         = {};
+          if (!sexByDay[0].female)       sexByDay[0].female       = {};
+
+          sexByDay[stayDay].male[gBucket]   = (sexByDay[stayDay].male[gBucket]   || 0) + gMale;
+          sexByDay[stayDay].female[gBucket] = (sexByDay[stayDay].female[gBucket] || 0) + gFemale;
+          sexByDay[0].male[gBucket]         = (sexByDay[0].male[gBucket]         || 0) + gMale;
+          sexByDay[0].female[gBucket]       = (sexByDay[0].female[gBucket]       || 0) + gFemale;
+        });
+      } else {
+        const country     = (r.lead_country || '').toUpperCase();
+        const nationality = (r.lead_nationality || '');
+        const sex         = (r.lead_sex || '').toLowerCase();
+        const rawBucket   = _classifyResidenceBucket({ country, nationality, isOverseas: !!r.lead_is_overseas });
+        const count       = _asInt(r.total_guests);
+
+        let bucket = rawBucket;
+        if (rawBucket === 'foreign_resident') {
+          bucket = listedSet.has(country) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
+        }
+
+        if (rawBucket === 'foreign_resident' && country) {
+          if (!countryByDay[country]) countryByDay[country] = { 0: 0 };
+          countryByDay[country][stayDay] = (countryByDay[country][stayDay] || 0) + count;
+          countryByDay[country][0]       = (countryByDay[country][0]       || 0) + count;
+        }
+
+        residentsByDay[stayDay] = residentsByDay[stayDay] || {};
+        residentsByDay[stayDay][bucket] = (residentsByDay[stayDay][bucket] || 0) + count;
+        residentsByDay[0][bucket]       = (residentsByDay[0][bucket]       || 0) + count;
+
+        let maleCount   = _asInt(r.male_count);
+        let femaleCount = _asInt(r.female_count);
+        if (maleCount + femaleCount === 0) {
+          if (sex === 'female') femaleCount = 1; else maleCount = 1;
+        }
+        sexByDay[stayDay] = sexByDay[stayDay] || { male: {}, female: {} };
+        if (!sexByDay[stayDay].male)   sexByDay[stayDay].male   = {};
+        if (!sexByDay[stayDay].female) sexByDay[stayDay].female = {};
+        if (!sexByDay[0].male)         sexByDay[0].male         = {};
+        if (!sexByDay[0].female)       sexByDay[0].female       = {};
+        sexByDay[stayDay].male[bucket]   = (sexByDay[stayDay].male[bucket]   || 0) + maleCount;
+        sexByDay[stayDay].female[bucket] = (sexByDay[stayDay].female[bucket] || 0) + femaleCount;
+        sexByDay[0].male[bucket]         = (sexByDay[0].male[bucket]         || 0) + maleCount;
+        sexByDay[0].female[bucket]       = (sexByDay[0].female[bucket]       || 0) + femaleCount;
       }
-      sexByDay[stayDay] = sexByDay[stayDay] || { male: {}, female: {} };
-      if (!sexByDay[stayDay].male)   sexByDay[stayDay].male   = {};
-      if (!sexByDay[stayDay].female) sexByDay[stayDay].female = {};
-      if (!sexByDay[0].male)         sexByDay[0].male         = {};
-      if (!sexByDay[0].female)       sexByDay[0].female       = {};
-      sexByDay[stayDay].male[bucket]   = (sexByDay[stayDay].male[bucket]   || 0) + maleCount;
-      sexByDay[stayDay].female[bucket] = (sexByDay[stayDay].female[bucket] || 0) + femaleCount;
-      sexByDay[0].male[bucket]         = (sexByDay[0].male[bucket]         || 0) + maleCount;
-      sexByDay[0].female[bucket]       = (sexByDay[0].female[bucket]       || 0) + femaleCount;
     }
   });
 
@@ -1406,6 +1459,21 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
     [businessId, firstDay, lastDay]
   );
 
+  const recordIds = records.map(r => r.id);
+  let breakdownsByRecord = {};
+  if (recordIds.length > 0) {
+    const [gobRows] = await db.pool.execute(
+      `SELECT guest_record_id, country, is_overseas, province, city_municipality, male_count, female_count
+       FROM guest_origin_breakdowns
+       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
+      recordIds
+    );
+    gobRows.forEach(b => {
+      if (!breakdownsByRecord[b.guest_record_id]) breakdownsByRecord[b.guest_record_id] = [];
+      breakdownsByRecord[b.guest_record_id].push(b);
+    });
+  }
+
   const data = {
     maleThisCity: 0, femaleThisCity: 0,
     maleOtherCity: 0, femaleOtherCity: 0,
@@ -1423,50 +1491,74 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
     const effectiveCheckOut = r.actual_check_out || r.check_out;
     const checkOut = _parseLocalDate(effectiveCheckOut);
     const nights   = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    // VAR spread (tourist presence day count): the check-out day counts too
-    // (check-in Aug 6, check-out Aug 8 is 3 days; same-day stays are 1 day).
     const spreadDays = nights + 1;
 
-    // Sex distribution uses the record's male_count / female_count (all guests
-    // in the party), not just the lead guest's sex.  Residence is a party-level
-    // attribute, so the bucket is resolved once from the lead guest's address.
-    let maleCount   = _asInt(r.male_count);
-    let femaleCount = _asInt(r.female_count);
-    if (maleCount + femaleCount === 0) {
-      // Defensive fallback for legacy/anomalous rows: count the lead guest only.
-      const sex = (r.lead_sex || '').toLowerCase();
-      if (sex === 'female') femaleCount = 1; else maleCount = 1;
-    }
-
-    const gCountry = (r.lead_country || '').toUpperCase();
-    const isForeign = !!r.lead_is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
-
-    let maleBucket;
-    let femaleBucket;
-    if (isForeign) {
-      maleBucket   = 'maleForeign';
-      femaleBucket = 'femaleForeign';
-    } else {
-      const gCity = _normalizeCityName(r.lead_city_municipality);
-      const gProv = (r.lead_province || '').toUpperCase();
-      if (gCity && gCity === bCity) {
-        maleBucket   = 'maleThisCity';
-        femaleBucket = 'femaleThisCity';
-      } else if (gProv && gProv === bProv) {
-        maleBucket   = 'maleOtherCity';
-        femaleBucket = 'femaleOtherCity';
-      } else {
-        maleBucket   = 'maleOtherProvince';
-        femaleBucket = 'femaleOtherProvince';
-      }
-    }
+    const groups = breakdownsByRecord[r.id] || [];
+    const hasGroups = groups.length > 0;
 
     for (let n = 0; n < spreadDays; n++) {
       const stayDate = new Date(checkIn);
       stayDate.setDate(checkIn.getDate() + n);
       if (stayDate.getFullYear() !== year || (stayDate.getMonth() + 1) !== month) continue;
-      data[maleBucket]   += maleCount;
-      data[femaleBucket] += femaleCount;
+
+      if (hasGroups) {
+        groups.forEach(g => {
+          const gCountry = (g.country || '').toUpperCase();
+          const isForeign = !!g.is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
+
+          let maleBucket, femaleBucket;
+          if (isForeign) {
+            maleBucket   = 'maleForeign';
+            femaleBucket = 'femaleForeign';
+          } else {
+            const gCity = _normalizeCityName(g.city_municipality);
+            const gProv = (g.province || '').toUpperCase();
+            if (gCity && gCity === bCity) {
+              maleBucket   = 'maleThisCity';
+              femaleBucket = 'femaleThisCity';
+            } else if (gProv && gProv === bProv) {
+              maleBucket   = 'maleOtherCity';
+              femaleBucket = 'femaleOtherCity';
+            } else {
+              maleBucket   = 'maleOtherProvince';
+              femaleBucket = 'femaleOtherProvince';
+            }
+          }
+          data[maleBucket]   += _asInt(g.male_count);
+          data[femaleBucket] += _asInt(g.female_count);
+        });
+      } else {
+        let maleCount   = _asInt(r.male_count);
+        let femaleCount = _asInt(r.female_count);
+        if (maleCount + femaleCount === 0) {
+          const sex = (r.lead_sex || '').toLowerCase();
+          if (sex === 'female') femaleCount = 1; else maleCount = 1;
+        }
+
+        const gCountry = (r.lead_country || '').toUpperCase();
+        const isForeign = !!r.lead_is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
+
+        let maleBucket, femaleBucket;
+        if (isForeign) {
+          maleBucket   = 'maleForeign';
+          femaleBucket = 'femaleForeign';
+        } else {
+          const gCity = _normalizeCityName(r.lead_city_municipality);
+          const gProv = (r.lead_province || '').toUpperCase();
+          if (gCity && gCity === bCity) {
+            maleBucket   = 'maleThisCity';
+            femaleBucket = 'femaleThisCity';
+          } else if (gProv && gProv === bProv) {
+            maleBucket   = 'maleOtherCity';
+            femaleBucket = 'femaleOtherCity';
+          } else {
+            maleBucket   = 'maleOtherProvince';
+            femaleBucket = 'femaleOtherProvince';
+          }
+        }
+        data[maleBucket]   += maleCount;
+        data[femaleBucket] += femaleCount;
+      }
     }
   });
 
@@ -1483,12 +1575,27 @@ async function _fetchAttractionMonthData(attractionId, month, year) {
   const lastDay  = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
 
   const [records] = await db.pool.execute(
-    `SELECT visit_date, guest_count, male_count, female_count,
+    `SELECT id, visit_date, guest_count, male_count, female_count,
             country, province, city_municipality
      FROM attraction_visit_logs
      WHERE attraction_id = ? AND visit_date BETWEEN ? AND ? AND deleted_at IS NULL`,
     [attractionId, firstDay, lastDay]
   );
+
+  const logIds = records.map(r => r.id);
+  let breakdownsByLog = {};
+  if (logIds.length > 0) {
+    const [gobRows] = await db.pool.execute(
+      `SELECT visit_log_id, country, is_overseas, province, city_municipality, male_count, female_count
+       FROM guest_origin_breakdowns
+       WHERE visit_log_id IN (${logIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
+      logIds
+    );
+    gobRows.forEach(b => {
+      if (!breakdownsByLog[b.visit_log_id]) breakdownsByLog[b.visit_log_id] = [];
+      breakdownsByLog[b.visit_log_id].push(b);
+    });
+  }
 
   const kCity = _normalizeCityName('San Pablo City');
   const kProv = 'LAGUNA';
@@ -1508,43 +1615,78 @@ async function _fetchAttractionMonthData(attractionId, month, year) {
     if (!visitDate) return;
     const dayKey = String(visitDate.getDate());
 
-    let maleCount   = _asInt(r.male_count);
-    let femaleCount = _asInt(r.female_count);
-    if (maleCount + femaleCount === 0) {
-      // Defensive fallback: split guest_count using the PSA national ratio.
-      const guest = _asInt(r.guest_count);
-      maleCount = Math.round(guest * 0.471);
-      femaleCount = guest - maleCount;
-    }
-
-    const gCountry = (r.country || '').toUpperCase();
-    const isForeign = gCountry !== '' && gCountry !== 'PHILIPPINES';
-
-    let maleBucket;
-    let femaleBucket;
-    if (isForeign) {
-      maleBucket   = 'maleForeign';
-      femaleBucket = 'femaleForeign';
-    } else {
-      const gCity = _normalizeCityName(r.city_municipality);
-      const gProv = (r.province || '').toUpperCase();
-      if (gCity && gCity === kCity) {
-        maleBucket   = 'maleThisCity';
-        femaleBucket = 'femaleThisCity';
-      } else if (gProv && gProv === kProv) {
-        maleBucket   = 'maleOtherCity';
-        femaleBucket = 'femaleOtherCity';
-      } else {
-        maleBucket   = 'maleOtherProvince';
-        femaleBucket = 'femaleOtherProvince';
-      }
-    }
+    const groups = breakdownsByLog[r.id] || [];
+    const hasGroups = groups.length > 0;
 
     const entry = (daily[dayKey] ??= emptyBucket());
-    entry[maleBucket]   += maleCount;
-    entry[femaleBucket] += femaleCount;
-    totals[maleBucket]   += maleCount;
-    totals[femaleBucket] += femaleCount;
+
+    if (hasGroups) {
+      groups.forEach(g => {
+        const gCountry = (g.country || '').toUpperCase();
+        const isForeign = !!g.is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
+
+        let maleBucket, femaleBucket;
+        if (isForeign) {
+          maleBucket   = 'maleForeign';
+          femaleBucket = 'femaleForeign';
+        } else {
+          const gCity = _normalizeCityName(g.city_municipality);
+          const gProv = (g.province || '').toUpperCase();
+          if (gCity && gCity === kCity) {
+            maleBucket   = 'maleThisCity';
+            femaleBucket = 'femaleThisCity';
+          } else if (gProv && gProv === kProv) {
+            maleBucket   = 'maleOtherCity';
+            femaleBucket = 'femaleOtherCity';
+          } else {
+            maleBucket   = 'maleOtherProvince';
+            femaleBucket = 'femaleOtherProvince';
+          }
+        }
+        const mCount = _asInt(g.male_count);
+        const fCount = _asInt(g.female_count);
+
+        entry[maleBucket]    += mCount;
+        entry[femaleBucket]  += fCount;
+        totals[maleBucket]   += mCount;
+        totals[femaleBucket] += fCount;
+      });
+    } else {
+      let maleCount   = _asInt(r.male_count);
+      let femaleCount = _asInt(r.female_count);
+      if (maleCount + femaleCount === 0) {
+        const guest = _asInt(r.guest_count);
+        maleCount = Math.round(guest * 0.471);
+        femaleCount = guest - maleCount;
+      }
+
+      const gCountry = (r.country || '').toUpperCase();
+      const isForeign = gCountry !== '' && gCountry !== 'PHILIPPINES';
+
+      let maleBucket, femaleBucket;
+      if (isForeign) {
+        maleBucket   = 'maleForeign';
+        femaleBucket = 'femaleForeign';
+      } else {
+        const gCity = _normalizeCityName(r.city_municipality);
+        const gProv = (r.province || '').toUpperCase();
+        if (gCity && gCity === kCity) {
+          maleBucket   = 'maleThisCity';
+          femaleBucket = 'femaleThisCity';
+        } else if (gProv && gProv === kProv) {
+          maleBucket   = 'maleOtherCity';
+          femaleBucket = 'femaleOtherCity';
+        } else {
+          maleBucket   = 'maleOtherProvince';
+          femaleBucket = 'femaleOtherProvince';
+        }
+      }
+
+      entry[maleBucket]    += maleCount;
+      entry[femaleBucket]  += femaleCount;
+      totals[maleBucket]   += maleCount;
+      totals[femaleBucket] += femaleCount;
+    }
   });
 
   return { month, year, daily, totals };
