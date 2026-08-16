@@ -29,6 +29,7 @@ app.use(cors({
   origin: function (origin, callback) {
     const allowed = [
       'https://e-turismo.netlify.app',
+      'https://tourism-appv1.netlify.app',
       'http://localhost:3000',
     ];
     if (!origin || allowed.includes(origin) || /^http:\/\/localhost:\d+$/.test(origin)) {
