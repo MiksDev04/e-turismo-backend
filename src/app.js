@@ -17,7 +17,6 @@ import dashboardRoutes from './routes/dashboard.api.js';
 import visitEntryRoutes from './routes/visit_entry.api.js';
 import visitRecordRoutes from './routes/visit_record.api.js';
 import messageRoutes from './routes/messages.api.js';
-import complianceRoutes from './routes/compliance.api.js';
 import reportRoutes from './routes/reports.api.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -64,7 +63,6 @@ app.use('/api/auth', loginRoutes);
 app.use('/api', profileRoutes);
 app.use('/api/admin/accommodations', accommodationRoutes);
 app.use('/api/admin/attractions', attractionRoutes);
-app.use('/api/admin/compliance', complianceRoutes);
 app.use('/api/admin', reportRoutes);
 app.use('/api/business', guestEntryRoutes);
 app.use('/api/business', guestRecordsRoutes);

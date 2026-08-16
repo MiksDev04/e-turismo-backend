@@ -1,6 +1,8 @@
 import express from 'express';
+import crypto from 'crypto';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
+import mailer from '../utils/mailer.js';
 import { parseDbDate } from '../utils/date.js';
 
 const router = express.Router();
@@ -59,10 +61,24 @@ router.get('/', adminGuard, async (req, res, next) => {
 
     // ── Fetch paginated rows ──────────────────────────────────────────────
     const [rows] = await db.pool.query(
-      `SELECT b.*, (SELECT COUNT(*) FROM rooms WHERE business_id = b.id) AS total_rooms, u.full_name, u.email, u.phone
+      `SELECT b.*,
+              (SELECT COUNT(*) FROM rooms WHERE business_id = b.id) AS total_rooms,
+              u.full_name, u.email, u.phone,
+              DATE(MAX(COALESCE(gr.actual_check_out, CURDATE()))) AS last_activity,
+              CASE
+                WHEN COUNT(gr.id) = 0 THEN 'no_activity'
+                WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 90 DAY) THEN 'inactive'
+                WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN 'low_activity'
+                ELSE 'active'
+              END AS activity_status
        FROM businesses b
        JOIN users u ON b.user_id = u.id
+       LEFT JOIN guest_records gr
+         ON  gr.business_id = b.id
+         AND gr.is_deleted  = FALSE
+         AND gr.check_in    <= CURDATE()
        WHERE ${whereClause}
+       GROUP BY b.id, u.id
        ORDER BY b.created_at DESC
        LIMIT ? OFFSET ?`,
       [...params, limit, offset]
@@ -289,6 +305,75 @@ router.put('/:id/flag', adminGuard, async (req, res, next) => {
     res.json({ message: 'Business flagged.' });
   } catch (err) {
     next(err);
+  }
+});
+
+/**
+ * PUT /api/admin/accommodations/:id/status
+ * Update a business status (approved/warning/suspended) and notify the owner.
+ * Body: { status, reason, messageContent }
+ */
+router.put('/:id/status', adminGuard, async (req, res, next) => {
+  const connection = await db.pool.getConnection();
+  await connection.beginTransaction();
+  try {
+    const { status, reason, messageContent } = req.body;
+    const { id } = req.params;
+
+    if (!['approved', 'warning', 'suspended'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status.' });
+    }
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ message: 'Reason is required.' });
+    }
+    if (!messageContent || !messageContent.trim()) {
+      return res.status(400).json({ message: 'Message content is required.' });
+    }
+
+    const [bizRows] = await connection.execute(
+      `SELECT b.business_name, u.email
+       FROM businesses b
+       JOIN users u ON b.user_id = u.id
+       WHERE b.id = ?`,
+      [id]
+    );
+
+    if (bizRows.length === 0) {
+      return res.status(404).json({ message: 'Business not found.' });
+    }
+
+    const biz = bizRows[0];
+
+    await connection.execute(
+      'UPDATE businesses SET status = ? WHERE id = ?',
+      [status, id]
+    );
+
+    const messageId = crypto.randomUUID();
+    await connection.execute(
+      `INSERT INTO messages (id, sender_id, message_type, subject, content, is_broadcast)
+       VALUES (?, ?, 'compliance', 'Business Status Update', ?, FALSE)`,
+      [messageId, req.user.id, messageContent.trim()]
+    );
+
+    await connection.execute(
+      'INSERT INTO message_recipients (message_id, business_id) VALUES (?, ?)',
+      [messageId, id]
+    );
+
+    await connection.commit();
+
+    res.json({ message: 'Business status updated.' });
+
+    if (biz.email) {
+      mailer.sendSystemMessage(biz.email, 'Business Status Update', messageContent.trim(), 'compliance')
+        .catch((err) => console.error('Failed to send status-change email:', err.message));
+    }
+  } catch (err) {
+    await connection.rollback();
+    next(err);
+  } finally {
+    connection.release();
   }
 });
 

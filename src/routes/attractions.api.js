@@ -1,6 +1,8 @@
 import express from 'express';
+import crypto from 'crypto';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
+import mailer from '../utils/mailer.js';
 
 const router = express.Router();
 
@@ -58,10 +60,22 @@ router.get('/', adminGuard, async (req, res, next) => {
 
     // ── Fetch paginated rows ──────────────────────────────────────────────
     const [rows] = await db.pool.query(
-      `SELECT ta.*, u.full_name, u.email, u.phone
+      `SELECT ta.*, u.full_name, u.email, u.phone,
+              MAX(avl.visit_date) AS last_activity,
+              CASE
+                WHEN COUNT(avl.id) = 0 THEN 'no_activity'
+                WHEN MAX(avl.visit_date) < DATE_SUB(CURDATE(), INTERVAL 90 DAY) THEN 'inactive'
+                WHEN MAX(avl.visit_date) < DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN 'low_activity'
+                ELSE 'active'
+              END AS activity_status
        FROM tourist_attractions ta
        JOIN users u ON ta.user_id = u.id
+       LEFT JOIN attraction_visit_logs avl
+         ON  avl.attraction_id = ta.id
+         AND avl.deleted_at   IS NULL
+         AND avl.visit_date   <= CURDATE()
        WHERE ${whereClause}
+       GROUP BY ta.id, u.id
        ORDER BY ta.created_at DESC
        LIMIT ? OFFSET ?`,
       [...params, limit, offset]
@@ -233,6 +247,75 @@ router.put('/:id/flag', adminGuard, async (req, res, next) => {
     res.json({ message: 'Attraction flagged.' });
   } catch (err) {
     next(err);
+  }
+});
+
+/**
+ * PUT /api/admin/attractions/:id/status
+ * Update an attraction status (approved/warning) and notify the owner.
+ * Body: { status, reason, messageContent }
+ */
+router.put('/:id/status', adminGuard, async (req, res, next) => {
+  const connection = await db.pool.getConnection();
+  await connection.beginTransaction();
+  try {
+    const { status, reason, messageContent } = req.body;
+    const { id } = req.params;
+
+    if (!['approved', 'warning'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status.' });
+    }
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ message: 'Reason is required.' });
+    }
+    if (!messageContent || !messageContent.trim()) {
+      return res.status(400).json({ message: 'Message content is required.' });
+    }
+
+    const [attRows] = await connection.execute(
+      `SELECT ta.attraction_name, u.email
+       FROM tourist_attractions ta
+       JOIN users u ON ta.user_id = u.id
+       WHERE ta.id = ?`,
+      [id]
+    );
+
+    if (attRows.length === 0) {
+      return res.status(404).json({ message: 'Attraction not found.' });
+    }
+
+    const att = attRows[0];
+
+    await connection.execute(
+      'UPDATE tourist_attractions SET status = ? WHERE id = ?',
+      [status, id]
+    );
+
+    const messageId = crypto.randomUUID();
+    await connection.execute(
+      `INSERT INTO messages (id, sender_id, message_type, subject, content, is_broadcast)
+       VALUES (?, ?, 'compliance', 'Business Status Update', ?, FALSE)`,
+      [messageId, req.user.id, messageContent.trim()]
+    );
+
+    await connection.execute(
+      'INSERT INTO message_recipients (message_id, attraction_id) VALUES (?, ?)',
+      [messageId, id]
+    );
+
+    await connection.commit();
+
+    res.json({ message: 'Attraction status updated.' });
+
+    if (att.email) {
+      mailer.sendSystemMessage(att.email, 'Business Status Update', messageContent.trim(), 'compliance')
+        .catch((err) => console.error('Failed to send status-change email:', err.message));
+    }
+  } catch (err) {
+    await connection.rollback();
+    next(err);
+  } finally {
+    connection.release();
   }
 });
 
