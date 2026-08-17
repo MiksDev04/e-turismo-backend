@@ -14,6 +14,7 @@ const router = express.Router();
  */
 router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'), async (req, res, next) => {
   const connection = await db.pool.getConnection();
+  await connection.beginTransaction();
   try {
     const {
       visitDate,
@@ -147,8 +148,10 @@ router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'),
       }
     }
 
+    await connection.commit();
     res.status(201).json({ message: 'Visit entry saved successfully', visitEntryId });
   } catch (err) {
+    await connection.rollback();
     next(err);
   } finally {
     connection.release();
