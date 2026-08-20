@@ -192,13 +192,14 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
       for (const group of parsedGroups) {
         await connection.execute(
           `INSERT INTO guest_origin_breakdowns (
-            id, guest_record_id, country, is_overseas,
+            id, guest_record_id, country, nationality, is_overseas,
             province, city_municipality, male_count, female_count
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             uuidv4(),
             guestRecordId,
             group.country,
+            group.nationality,
             group.isOverseas ? 1 : 0,
             group.province,
             group.cityMunicipality,

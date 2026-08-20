@@ -16,9 +16,11 @@
 --   - `guest_record_rooms` (new): junction table -- a stay can span
 --     more than one room (a party of 5 might get split across two)
 --   - `guest_origin_breakdowns` (new): repeatable Origin Groups
---     (country / is_overseas / province / city_municipality / male /
---     female), shared by `guest_records` (accommodation) and
---     `attraction_visit_logs` (attraction), exactly one parent per row.
+--     (country / nationality / is_overseas / province / city_municipality /
+--     male / female), keyed by `guest_records` (accommodation).
+--     nationality is 'Filipino' or 'Foreign'.
+--     country may be NULL when is_overseas = 1.
+--     province / city_municipality are Philippines-only.
 --   - `guest_breakdowns` / `guest_breakdowns_synced` are retired.
 --
 -- Includes the tourist-attraction model:
@@ -285,18 +287,18 @@ CREATE TABLE `guest_record_rooms` (
 
 -- ---------------------------------------------------------------
 -- Table: guest_origin_breakdowns
--- Origin Groups: repeatable Country / Province / City-Municipality /
--- Male / Female rows. Shared by accommodation guest records
--- (guest_record_id) and attraction visit logs (visit_log_id) — exactly
--- one parent per row. country may be NULL when is_overseas = 1.
--- province / city_municipality are Philippines-only.
+-- Origin Groups: repeatable Country / Nationality /
+-- Province / City-Municipality / Male / Female rows. Keyed by
+-- guest_records (accommodation). country may be NULL when
+-- is_overseas = 1. province / city_municipality are
+-- Philippines-only.
 -- ---------------------------------------------------------------
 DROP TABLE IF EXISTS `guest_origin_breakdowns`;
 CREATE TABLE `guest_origin_breakdowns` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
-  `guest_record_id` char(36) DEFAULT NULL,
-  `visit_log_id` char(36) DEFAULT NULL,
+  `guest_record_id` char(36) NOT NULL,
   `country` varchar(255) DEFAULT NULL,
+  `nationality` varchar(255) DEFAULT NULL,
   `is_overseas` tinyint(1) NOT NULL DEFAULT 0,
   `province` varchar(255) DEFAULT NULL,
   `city_municipality` varchar(255) DEFAULT NULL,
@@ -307,16 +309,9 @@ CREATE TABLE `guest_origin_breakdowns` (
   `deleted_at` datetime DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_gob_guest_record_id` (`guest_record_id`),
-  KEY `idx_gob_visit_log_id` (`visit_log_id`),
   KEY `idx_gob_deleted_at` (`deleted_at`),
   CONSTRAINT `fk_gob_guest_record`
     FOREIGN KEY (`guest_record_id`) REFERENCES `guest_records` (`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_gob_visit_log`
-    FOREIGN KEY (`visit_log_id`) REFERENCES `attraction_visit_logs` (`id`) ON DELETE CASCADE,
-  CONSTRAINT `chk_gob_parent_exclusive` CHECK (
-    (guest_record_id IS NOT NULL AND visit_log_id IS NULL)
-    OR (guest_record_id IS NULL AND visit_log_id IS NOT NULL)
-  ),
   CONSTRAINT `chk_gob_sex_sum` CHECK (male_count + female_count >= 1),
   CONSTRAINT `chk_gob_country_required` CHECK (is_overseas = 1 OR country IS NOT NULL),
   CONSTRAINT `chk_gob_origin_only_philippines` CHECK (
@@ -440,18 +435,18 @@ SET FOREIGN_KEY_CHECKS = 1;
 -- GROUP BY gr.id;
 --
 -- VAR total now combines both sources (accommodations + attractions).
--- Source of truth per record/log: when it has live origin groups
+-- Source of truth per record: when it has live origin groups
 -- (guest_origin_breakdowns), spread each group's origin + counts;
--- otherwise fall back to the record/log lead origin + counts. Attraction
--- nationality is derived from country (country = 'Philippines' => Filipino,
--- else Foreign):
+-- otherwise fall back to the record lead origin + counts. When groups
+-- exist, nationality is read from the stored column; when absent, the lead
+-- record nationality is used directly.
 --
 -- SELECT nationality, country, province, city_municipality,
 --        SUM(guest_count) AS guest_count
 -- FROM (
 --   SELECT
 --     CASE WHEN gob.id IS NULL THEN gr.lead_nationality
---          WHEN gob.country = 'Philippines' THEN 'Filipino' ELSE 'Foreign' END AS nationality,
+--          ELSE COALESCE(gob.nationality, CASE WHEN gob.country = 'Philippines' THEN 'Filipino' ELSE 'Foreign' END) END AS nationality,
 --     COALESCE(gob.country, gr.lead_country) AS country,
 --     COALESCE(gob.province, gr.lead_province) AS province,
 --     COALESCE(gob.city_municipality, gr.lead_city_municipality) AS city_municipality,
@@ -463,17 +458,12 @@ SET FOREIGN_KEY_CHECKS = 1;
 --   WHERE gr.is_deleted = 0
 --   UNION ALL
 --   SELECT
---     CASE WHEN avl_gob.id IS NULL
---          THEN CASE WHEN avl.country = 'Philippines' THEN 'Filipino' ELSE 'Foreign' END
---          WHEN avl_gob.country = 'Philippines' THEN 'Filipino' ELSE 'Foreign' END AS nationality,
---     COALESCE(avl_gob.country, avl.country) AS country,
---     COALESCE(avl_gob.province, avl.province) AS province,
---     COALESCE(avl_gob.city_municipality, avl.city_municipality) AS city_municipality,
---     CASE WHEN avl_gob.id IS NULL THEN avl.guest_count
---          ELSE avl_gob.male_count + avl_gob.female_count END AS guest_count
+--     CASE WHEN avl.country = 'Philippines' THEN 'Filipino' ELSE 'Foreign' END AS nationality,
+--     avl.country,
+--     avl.province,
+--     avl.city_municipality,
+--     avl.guest_count
 --   FROM attraction_visit_logs avl
---   LEFT JOIN guest_origin_breakdowns avl_gob
---     ON avl_gob.visit_log_id = avl.id AND avl_gob.deleted_at IS NULL
 --   WHERE avl.deleted_at IS NULL
 -- ) combined
 -- GROUP BY nationality, country, province, city_municipality;

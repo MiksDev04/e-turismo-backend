@@ -1272,7 +1272,7 @@ async function _fetchMonthData(businessId, month, year) {
   let breakdownsByRecord = {};
   if (recordIds.length > 0) {
     const [gobRows] = await db.pool.execute(
-      `SELECT guest_record_id, country, is_overseas, province, city_municipality, male_count, female_count
+      `SELECT guest_record_id, country, nationality, is_overseas, province, city_municipality, male_count, female_count
        FROM guest_origin_breakdowns
        WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
       recordIds
@@ -1353,7 +1353,7 @@ async function _fetchMonthData(businessId, month, year) {
         groups.forEach(g => {
           const gCountry     = (g.country || '').toUpperCase();
           const gIsOverseas  = !!g.is_overseas;
-          const gNationality = (gCountry === 'PHILIPPINES' || (!gCountry && gIsOverseas)) ? 'Filipino' : 'Foreign';
+          const gNationality = g.nationality || ((gCountry === 'PHILIPPINES' || (!gCountry && gIsOverseas)) ? 'Filipino' : 'Foreign');
           const gRawBucket   = _classifyResidenceBucket({ country: g.country, nationality: gNationality, isOverseas: gIsOverseas });
           const gCount       = _asInt(g.male_count) + _asInt(g.female_count);
 
@@ -1463,7 +1463,7 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
   let breakdownsByRecord = {};
   if (recordIds.length > 0) {
     const [gobRows] = await db.pool.execute(
-      `SELECT guest_record_id, country, is_overseas, province, city_municipality, male_count, female_count
+      `SELECT guest_record_id, country, nationality, is_overseas, province, city_municipality, male_count, female_count
        FROM guest_origin_breakdowns
        WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
       recordIds
@@ -1582,21 +1582,6 @@ async function _fetchAttractionMonthData(attractionId, month, year) {
     [attractionId, firstDay, lastDay]
   );
 
-  const logIds = records.map(r => r.id);
-  let breakdownsByLog = {};
-  if (logIds.length > 0) {
-    const [gobRows] = await db.pool.execute(
-      `SELECT visit_log_id, country, is_overseas, province, city_municipality, male_count, female_count
-       FROM guest_origin_breakdowns
-       WHERE visit_log_id IN (${logIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
-      logIds
-    );
-    gobRows.forEach(b => {
-      if (!breakdownsByLog[b.visit_log_id]) breakdownsByLog[b.visit_log_id] = [];
-      breakdownsByLog[b.visit_log_id].push(b);
-    });
-  }
-
   const kCity = _normalizeCityName('San Pablo City');
   const kProv = 'LAGUNA';
 
@@ -1615,78 +1600,42 @@ async function _fetchAttractionMonthData(attractionId, month, year) {
     if (!visitDate) return;
     const dayKey = String(visitDate.getDate());
 
-    const groups = breakdownsByLog[r.id] || [];
-    const hasGroups = groups.length > 0;
+    let maleCount   = _asInt(r.male_count);
+    let femaleCount = _asInt(r.female_count);
+    if (maleCount + femaleCount === 0) {
+      const guest = _asInt(r.guest_count);
+      maleCount = Math.round(guest * 0.471);
+      femaleCount = guest - maleCount;
+    }
+
+    const gCountry = (r.country || '').toUpperCase();
+    const isForeign = gCountry !== '' && gCountry !== 'PHILIPPINES';
 
     const entry = (daily[dayKey] ??= emptyBucket());
 
-    if (hasGroups) {
-      groups.forEach(g => {
-        const gCountry = (g.country || '').toUpperCase();
-        const isForeign = !!g.is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
-
-        let maleBucket, femaleBucket;
-        if (isForeign) {
-          maleBucket   = 'maleForeign';
-          femaleBucket = 'femaleForeign';
-        } else {
-          const gCity = _normalizeCityName(g.city_municipality);
-          const gProv = (g.province || '').toUpperCase();
-          if (gCity && gCity === kCity) {
-            maleBucket   = 'maleThisCity';
-            femaleBucket = 'femaleThisCity';
-          } else if (gProv && gProv === kProv) {
-            maleBucket   = 'maleOtherCity';
-            femaleBucket = 'femaleOtherCity';
-          } else {
-            maleBucket   = 'maleOtherProvince';
-            femaleBucket = 'femaleOtherProvince';
-          }
-        }
-        const mCount = _asInt(g.male_count);
-        const fCount = _asInt(g.female_count);
-
-        entry[maleBucket]    += mCount;
-        entry[femaleBucket]  += fCount;
-        totals[maleBucket]   += mCount;
-        totals[femaleBucket] += fCount;
-      });
+    let maleBucket, femaleBucket;
+    if (isForeign) {
+      maleBucket   = 'maleForeign';
+      femaleBucket = 'femaleForeign';
     } else {
-      let maleCount   = _asInt(r.male_count);
-      let femaleCount = _asInt(r.female_count);
-      if (maleCount + femaleCount === 0) {
-        const guest = _asInt(r.guest_count);
-        maleCount = Math.round(guest * 0.471);
-        femaleCount = guest - maleCount;
-      }
-
-      const gCountry = (r.country || '').toUpperCase();
-      const isForeign = gCountry !== '' && gCountry !== 'PHILIPPINES';
-
-      let maleBucket, femaleBucket;
-      if (isForeign) {
-        maleBucket   = 'maleForeign';
-        femaleBucket = 'femaleForeign';
+      const gCity = _normalizeCityName(r.city_municipality);
+      const gProv = (r.province || '').toUpperCase();
+      if (gCity && gCity === kCity) {
+        maleBucket   = 'maleThisCity';
+        femaleBucket = 'femaleThisCity';
+      } else if (gProv && gProv === kProv) {
+        maleBucket   = 'maleOtherCity';
+        femaleBucket = 'femaleOtherCity';
       } else {
-        const gCity = _normalizeCityName(r.city_municipality);
-        const gProv = (r.province || '').toUpperCase();
-        if (gCity && gCity === kCity) {
-          maleBucket   = 'maleThisCity';
-          femaleBucket = 'femaleThisCity';
-        } else if (gProv && gProv === kProv) {
-          maleBucket   = 'maleOtherCity';
-          femaleBucket = 'femaleOtherCity';
-        } else {
-          maleBucket   = 'maleOtherProvince';
-          femaleBucket = 'femaleOtherProvince';
-        }
+        maleBucket   = 'maleOtherProvince';
+        femaleBucket = 'femaleOtherProvince';
       }
-
-      entry[maleBucket]    += maleCount;
-      entry[femaleBucket]  += femaleCount;
-      totals[maleBucket]   += maleCount;
-      totals[femaleBucket] += femaleCount;
     }
+
+    entry[maleBucket]    += maleCount;
+    entry[femaleBucket]  += femaleCount;
+    totals[maleBucket]   += maleCount;
+    totals[femaleBucket] += femaleCount;
   });
 
   return { month, year, daily, totals };

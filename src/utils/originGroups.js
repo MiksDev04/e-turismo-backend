@@ -17,11 +17,17 @@ export function parseOriginGroups(list) {
   const groups = [];
   for (const raw of list) {
     const country = typeof raw?.country === 'string' ? raw.country.trim() : '';
+    const nationality = typeof raw?.nationality === 'string' ? raw.nationality.trim() : null;
     const province = typeof raw?.province === 'string' ? raw.province.trim() : '';
     const cityMunicipality = typeof raw?.cityMunicipality === 'string' ? raw.cityMunicipality.trim() : '';
     const isOverseas = !!raw?.isOverseas;
     const maleCount = parseInt(raw?.maleCount, 10);
     const femaleCount = parseInt(raw?.femaleCount, 10);
+
+    const resolvedNationality = nationality
+      || ((!isOverseas && country === 'Philippines') || isOverseas
+          ? 'Filipino'
+          : 'Foreign');
 
     if (isNaN(maleCount) || isNaN(femaleCount) || maleCount < 0 || femaleCount < 0) {
       return { ok: false, message: 'maleCount and femaleCount must be non-negative integers' };
@@ -41,6 +47,7 @@ export function parseOriginGroups(list) {
 
     groups.push({
       country: country || null,
+      nationality: resolvedNationality,
       isOverseas,
       province: province || null,
       cityMunicipality: cityMunicipality || null,
@@ -57,6 +64,7 @@ export function breakdownToJson(row) {
   return {
     id: row.id,
     country: row.country,
+    nationality: row.nationality,
     isOverseas: row.is_overseas === 1 || row.is_overseas === true,
     province: row.province,
     cityMunicipality: row.city_municipality,

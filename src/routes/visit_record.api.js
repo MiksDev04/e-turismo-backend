@@ -1,7 +1,6 @@
 import express from 'express';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
-import { breakdownToJson } from '../utils/originGroups.js';
 
 const router = express.Router();
 
@@ -106,28 +105,6 @@ router.get('/visit-records', auth.authenticate, auth.requireRole('attraction'), 
       [...params, limit, offset],
     );
 
-    // ── Fetch origin groups for these logs via guest_origin_breakdowns ────
-    const logIds = rows.map((r) => r.id);
-    let breakdownsByLog = {};
-
-    if (logIds.length > 0) {
-      const placeholders = logIds.map(() => '?').join(',');
-      const [breakdowns] = await connection.execute(
-        `SELECT visit_log_id, id, country, is_overseas, province,
-                city_municipality, male_count, female_count
-         FROM guest_origin_breakdowns
-         WHERE visit_log_id IN (${placeholders}) AND deleted_at IS NULL`,
-        logIds
-      );
-
-      for (const b of breakdowns) {
-        if (!breakdownsByLog[b.visit_log_id]) {
-          breakdownsByLog[b.visit_log_id] = [];
-        }
-        breakdownsByLog[b.visit_log_id].push(breakdownToJson(b));
-      }
-    }
-
     const data = rows.map((r) => ({
       ...r,
       nationality: r.nationality,
@@ -135,7 +112,6 @@ router.get('/visit-records', auth.authenticate, auth.requireRole('attraction'), 
       male_count: r.male_count,
       female_count: r.female_count,
       isDeleted: r.deleted_at !== null && r.deleted_at !== undefined,
-      guest_breakdowns: breakdownsByLog[r.id] || [],
     }));
 
     res.json({ data, totalCount, pageCount });
@@ -184,15 +160,7 @@ router.get('/visit-records/:id', auth.authenticate, auth.requireRole('attraction
       return res.status(404).json({ message: 'Visit log not found.' });
     }
 
-    const [breakdowns] = await connection.execute(
-      `SELECT id, country, is_overseas, province,
-              city_municipality, male_count, female_count
-       FROM guest_origin_breakdowns
-       WHERE visit_log_id = ? AND deleted_at IS NULL`,
-      [req.params.id]
-    );
-
-    res.json({ ...rows[0], guest_breakdowns: breakdowns.map(breakdownToJson) });
+    res.json(rows[0]);
   } catch (err) {
     next(err);
   } finally {

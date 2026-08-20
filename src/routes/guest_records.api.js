@@ -144,7 +144,7 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('business'), as
     if (recordIds.length > 0) {
       const placeholders = recordIds.map(() => '?').join(',');
       const [breakdowns] = await connection.execute(
-        `SELECT guest_record_id, id, country, is_overseas, province,
+        `SELECT guest_record_id, id, country, nationality, is_overseas, province,
                 city_municipality, male_count, female_count
          FROM guest_origin_breakdowns
          WHERE guest_record_id IN (${placeholders}) AND deleted_at IS NULL`,
@@ -459,13 +459,14 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
         for (const group of parsedGroups) {
           await connection.execute(
             `INSERT INTO guest_origin_breakdowns (
-              id, guest_record_id, country, is_overseas,
+              id, guest_record_id, country, nationality, is_overseas,
               province, city_municipality, male_count, female_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               uuidv4(),
               recordId,
               group.country,
+              group.nationality,
               group.isOverseas ? 1 : 0,
               group.province,
               group.cityMunicipality,
