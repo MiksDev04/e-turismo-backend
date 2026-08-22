@@ -2125,7 +2125,9 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   const r = kRows.sum;
 
   sheet.getCell('B3').value = 'Region: __4-A';
-  sheet.getCell('A4').value = `Jan-Dec, ${year}`;
+  const abbr = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  sheet.getCell('A4').value =
+    `${abbr[allMonths[0].month]}-${abbr[allMonths[allMonths.length - 1].month]}, ${year}`;
   sheet.getCell('A22').value = `City/Municipality: ${city || ''}`;
   sheet.getCell('A23').value = `Province: ${province || ''}`;
   sheet.getCell('A19').value = `AE ID Code (LGU Assigned): ${biz?.ae_id || ''}`;
@@ -2140,6 +2142,16 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
       sheet.getCell(`B${t.row}`).alignment = { horizontal: 'center' };
     }
   });
+
+  // ── Remove unused month columns BEFORE writing data ──────────────────────
+  // Template has 12 month columns (B-M) + 1 total column (N) whose header row
+  // lives at row 25.  Deleting the unused month columns between the last
+  // selected month and TOTAL shifts the native "TOTAL" header column left so
+  // it sits directly after the last selected month (e.g. Jan-May → TOTAL in G).
+  const unusedMonthCols = 12 - allMonths.length;
+  if (unusedMonthCols > 0) {
+    sheet.spliceColumns(allMonths.length + 2, unusedMonthCols);
+  }
 
   const _sumTotalRows = new Set([30, 45, 53, 62, 72, 80, 88, 99, 108, 116, 122, 130, 137, 140, 142, 144, 146, 147, 148, 149, 150, 159, 160]);
   const setMonthValues = (rowNum, fn) => {
@@ -2257,15 +2269,6 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   };
   setMonthlySexValues(r.maleStart, 'male');
   setMonthlySexValues(r.femaleStart, 'female');
-
-  // ── Remove unused month columns for the requested range ──────────────────
-  // Template has 12 month columns (B-M) + 1 total column (N).
-  // After writing, data occupies columns 2..(allMonths.length+1) and total at
-  // allMonths.length+2.  Delete leftover template columns after the total.
-  const unusedMonthCols = 12 - allMonths.length;
-  if (unusedMonthCols > 0) {
-    sheet.spliceColumns(allMonths.length + 3, unusedMonthCols);
-  }
 }
 
 // ==============================================================================================
