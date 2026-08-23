@@ -100,7 +100,7 @@ router.get('/visit-records', auth.authenticate, auth.requireRole('attraction'), 
               END AS nationality
        FROM attraction_visit_logs avl
        WHERE ${whereClause}
-       ORDER BY avl.visit_date DESC
+       ORDER BY avl.created_at DESC, avl.id DESC
        LIMIT ? OFFSET ?`,
       [...params, limit, offset],
     );

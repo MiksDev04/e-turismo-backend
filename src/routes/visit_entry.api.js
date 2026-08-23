@@ -24,6 +24,7 @@ router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'),
       cityMunicipality,
       maleCount,
       femaleCount,
+      createdAt,
     } = req.body;
 
     if (!visitDate || !guestCount || typeof isForeign === 'undefined') {
@@ -72,23 +73,50 @@ router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'),
     const attractionId = attractions[0].id;
     const visitEntryId = uuidv4();
 
+    // Optional client-supplied creation timestamp (offline-first devices save
+    // to SQLite first and sync later; keeping their original time preserves
+    // faithful created_at ordering). Formatted in server-local time to match
+    // the DATETIME DEFAULT CURRENT_TIMESTAMP convention. Absent/invalid input
+    // falls back to the DB default.
+    let resolvedCreatedAt = null;
+    if (createdAt) {
+      const d = new Date(createdAt);
+      if (!Number.isNaN(d.getTime())) {
+        const pad = (n) => String(n).padStart(2, '0');
+        resolvedCreatedAt =
+          `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+          `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      }
+    }
+
+    const insertColumns = [
+      'id', 'attraction_id', 'visit_date', 'guest_count',
+      'male_count', 'female_count',
+      'country', 'province', 'city_municipality',
+    ];
+    const insertValues = [
+      visitEntryId,
+      attractionId,
+      visitDate,
+      guestCountInt,
+      maleCountInt,
+      femaleCountInt,
+      resolvedCountry,
+      resolvedProvince,
+      resolvedCityMunicipality,
+    ];
+
+    if (resolvedCreatedAt) {
+      insertColumns.push('created_at');
+      insertValues.push(resolvedCreatedAt);
+    }
+
+    const placeholders = insertColumns.map(() => '?').join(', ');
+
     await connection.execute(
-      `INSERT INTO attraction_visit_logs (
-        id, attraction_id, visit_date, guest_count,
-        male_count, female_count,
-        country, province, city_municipality
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        visitEntryId,
-        attractionId,
-        visitDate,
-        guestCountInt,
-        maleCountInt,
-        femaleCountInt,
-        resolvedCountry,
-        resolvedProvince,
-        resolvedCityMunicipality,
-      ]
+      `INSERT INTO attraction_visit_logs (${insertColumns.join(', ')})
+       VALUES (${placeholders})`,
+      insertValues
     );
 
     await connection.commit();
