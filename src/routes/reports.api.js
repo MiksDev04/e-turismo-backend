@@ -2153,6 +2153,17 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
     sheet.spliceColumns(allMonths.length + 2, unusedMonthCols);
   }
 
+  // Header row (25) is hardcoded JANUARY-DECEMBER in the template. Rewrite it
+  // so each month column reflects the actual selected range (e.g. May-Aug →
+  // B=MAY, C=JUNE, D=JULY, E=AUGUST). TOTAL (after the last month) is left as-is.
+  const fullMonthNames = [
+    '', 'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+  for (let i = 0; i < allMonths.length; i++) {
+    sheet.getCell(25, i + 2).value = fullMonthNames[allMonths[i].month].toUpperCase();
+  }
+
   const _sumTotalRows = new Set([30, 45, 53, 62, 72, 80, 88, 99, 108, 116, 122, 130, 137, 140, 142, 144, 146, 147, 148, 149, 150, 159, 160]);
   const setMonthValues = (rowNum, fn) => {
     const useZero = _sumTotalRows.has(rowNum);
