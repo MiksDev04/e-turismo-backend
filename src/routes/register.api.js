@@ -293,6 +293,17 @@ async function hasUserConflict({ username, email, connection = db.pool }) {
   return existingUsers.length > 0;
 }
 
+async function userEmailExists({ email, connection = db.pool }) {
+  const [existingUsers] = await connection.execute(
+    `SELECT id FROM users
+     WHERE deleted_at IS NULL
+       AND LOWER(email) = ?
+     LIMIT 1`,
+    [normalizeEmail(email)]
+  );
+  return existingUsers.length > 0;
+}
+
 router.post('/register/send-confirmation', async (req, res, next) => {
   try {
     const purpose = String(req.body.purpose || 'business_registration').trim();
@@ -311,10 +322,18 @@ router.post('/register/send-confirmation', async (req, res, next) => {
     const phoneNumber = normalizePhone(req.body.phoneNumber);
     const password = String(req.body.password);
 
-    if (await hasUserConflict({ username, email })) {
+    if (await userEmailExists({ email })) {
       return res.status(409).json({
-        message: 'Username or email is already taken.',
+        message: 'An account with this email already exists.',
       });
+    }
+
+    const [existingByUsername] = await db.pool.execute(
+      `SELECT id FROM users WHERE deleted_at IS NULL AND username = ? LIMIT 1`,
+      [username]
+    );
+    if (existingByUsername.length > 0) {
+      return res.status(409).json({ message: 'Username is already taken.' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -345,6 +364,25 @@ router.post('/register/send-confirmation', async (req, res, next) => {
     });
 
     res.json({ message: 'Confirmation email sent. Please check your inbox.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/register/check-email', async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.query.email);
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required.' });
+    }
+
+    if (!emailRe.test(email)) {
+      return res.status(400).json({ message: 'Enter a valid email address.' });
+    }
+
+    const available = !(await userEmailExists({ email }));
+    res.json({ available });
   } catch (err) {
     next(err);
   }
