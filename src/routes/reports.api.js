@@ -769,10 +769,9 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
       };
 
       for (const biz of businesses) {
-        const varDataList = [];
-        for (const m of sortedMonths) {
-          varDataList.push(await _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year));
-        }
+        const varDataList = await Promise.all(
+          sortedMonths.map(m => _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year))
+        );
 
         const varData = {
           maleThisCity: 0, femaleThisCity: 0,
@@ -811,10 +810,9 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
       );
 
       for (const att of attractions) {
-        const attDataList = [];
-        for (const m of sortedMonths) {
-          attDataList.push(await _fetchAttractionMonthData(att.id, m, year));
-        }
+        const attDataList = await Promise.all(
+          sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
+        );
         const varData = {
           maleThisCity: 0, femaleThisCity: 0,
           maleOtherCity: 0, femaleOtherCity: 0,
@@ -899,10 +897,9 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
     } else {
       // DAE: existing logic
       for (const biz of businesses) {
-        const monthDataList = [];
-        for (const m of sortedMonths) {
-          monthDataList.push(await _fetchMonthData(biz.id, m, year));
-        }
+        const monthDataList = await Promise.all(
+          sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
+        );
         allMonthData.push(...monthDataList);
 
         establishments.push({
@@ -1038,10 +1035,9 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       const varRows = [];
       const varDataList = [];
       for (const biz of businesses) {
-        const monthlyData = [];
-        for (const m of sortedMonths) {
-          monthlyData.push(await _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year));
-        }
+        const monthlyData = await Promise.all(
+          sortedMonths.map(m => _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year))
+        );
         // Aggregate across months
         const aggregated = {
           maleThisCity: 0, femaleThisCity: 0,
@@ -1068,10 +1064,9 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       );
 
       for (const att of attractions) {
-        const monthlyData = [];
-        for (const m of sortedMonths) {
-          monthlyData.push(await _fetchAttractionMonthData(att.id, m, year));
-        }
+        const monthlyData = await Promise.all(
+          sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
+        );
         const aggregated = {
           maleThisCity: 0, femaleThisCity: 0,
           maleOtherCity: 0, femaleOtherCity: 0,
@@ -1148,10 +1143,9 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       for (const biz of businesses) {
         let bizAllMonths = null;
         if (reportVariant === 'series' && sortedMonths.length > 1) {
-          bizAllMonths = [];
-          for (const m of sortedMonths) {
-            bizAllMonths.push(await _fetchMonthData(biz.id, m, year));
-          }
+          bizAllMonths = await Promise.all(
+            sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
+          );
         } else if (sortedMonths.length === 1) {
           const md = await _fetchMonthData(biz.id, sortedMonths[0], year);
           bizAllMonths = [md];
