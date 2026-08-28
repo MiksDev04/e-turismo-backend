@@ -12,8 +12,8 @@ export const pool = mysql.createPool({
   // Serverless: keep pool small — each invocation creates its own pool
   connectionLimit:    isVercel ? 2 : 10,
   queueLimit:         isVercel ? 5 : 0,
-  // Abort connection attempt after 10 s (Aiven MySQL may be slower from Vercel edge)
-  connectTimeout:     10000,
+  // Abort connection attempt after 30 s (Aiven free-tier may take 15-20 s to wake up from hibernation)
+  connectTimeout:     30000,
   // Return dates as strings to avoid client-side timezone shifting
   dateStrings:        true,
   // Serialize JS Date params as Philippine (UTC+8) wall-clock so writes are

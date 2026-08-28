@@ -3,7 +3,7 @@ import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import PDFDocument from 'pdfkit';
 import { promises as fsp } from 'fs';
-import db from '../config/db.js';
+import db, { queryWithRetry } from '../config/db.js';
 import auth from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
@@ -769,9 +769,10 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
       };
 
       for (const biz of businesses) {
-        const varDataList = await Promise.all(
-          sortedMonths.map(m => _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year))
-        );
+        const varDataList = [];
+        for (const m of sortedMonths) {
+          varDataList.push(await _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year));
+        }
 
         const varData = {
           maleThisCity: 0, femaleThisCity: 0,
@@ -810,9 +811,10 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
       );
 
       for (const att of attractions) {
-        const attDataList = await Promise.all(
-          sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
-        );
+        const attDataList = [];
+        for (const m of sortedMonths) {
+          attDataList.push(await _fetchAttractionMonthData(att.id, m, year));
+        }
         const varData = {
           maleThisCity: 0, femaleThisCity: 0,
           maleOtherCity: 0, femaleOtherCity: 0,
@@ -897,9 +899,10 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
     } else {
       // DAE: existing logic
       for (const biz of businesses) {
-        const monthDataList = await Promise.all(
-          sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
-        );
+        const monthDataList = [];
+        for (const m of sortedMonths) {
+          monthDataList.push(await _fetchMonthData(biz.id, m, year));
+        }
         allMonthData.push(...monthDataList);
 
         establishments.push({
@@ -1035,9 +1038,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       const varRows = [];
       const varDataList = [];
       for (const biz of businesses) {
-        const monthlyData = await Promise.all(
-          sortedMonths.map(m => _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year))
-        );
+        const monthlyData = [];
+        for (const m of sortedMonths) {
+          monthlyData.push(await _fetchVarMonthData(biz.id, biz.city_municipality, biz.province, m, year));
+        }
         // Aggregate across months
         const aggregated = {
           maleThisCity: 0, femaleThisCity: 0,
@@ -1064,9 +1068,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       );
 
       for (const att of attractions) {
-        const monthlyData = await Promise.all(
-          sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
-        );
+        const monthlyData = [];
+        for (const m of sortedMonths) {
+          monthlyData.push(await _fetchAttractionMonthData(att.id, m, year));
+        }
         const aggregated = {
           maleThisCity: 0, femaleThisCity: 0,
           maleOtherCity: 0, femaleOtherCity: 0,
@@ -1143,9 +1148,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       for (const biz of businesses) {
         let bizAllMonths = null;
         if (reportVariant === 'series' && sortedMonths.length > 1) {
-          bizAllMonths = await Promise.all(
-            sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
-          );
+          bizAllMonths = [];
+          for (const m of sortedMonths) {
+            bizAllMonths.push(await _fetchMonthData(biz.id, m, year));
+          }
         } else if (sortedMonths.length === 1) {
           const md = await _fetchMonthData(biz.id, sortedMonths[0], year);
           bizAllMonths = [md];
@@ -1239,14 +1245,16 @@ async function _fetchMonthData(businessId, month, year) {
   // Fetch records that have ANY presence in the month (not just check_in).
   // This catches cross-month stays: check_in before the month but check_out after it starts,
   // or check_in within the month but check_out after it ends.
-  const [records] = await db.pool.execute(
-    `SELECT id, check_in, check_out, actual_check_out, total_guests,
-            lead_country, lead_sex, lead_nationality, lead_is_overseas,
-            male_count, female_count
-     FROM guest_records
-     WHERE business_id = ? AND is_deleted = false
-       AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ? ${statusFilter}`,
+  const [records] = await queryWithRetry(() =>
+    db.pool.execute(
+      `SELECT id, check_in, check_out, actual_check_out, total_guests,
+              lead_country, lead_sex, lead_nationality, lead_is_overseas,
+              male_count, female_count
+       FROM guest_records
+       WHERE business_id = ? AND is_deleted = false
+         AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ? ${statusFilter}`,
     [businessId, firstDay, lastDay]
+  )
   );
 
   // Fetch room assignment windows to compute rooms_occupied per record per day.
@@ -1447,16 +1455,18 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
   const firstDay = `${year}-${String(month).padStart(2, '0')}-01`;
   const lastDay  = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
 
-  const [records] = await db.pool.execute(
-    `SELECT id, check_in, check_out, actual_check_out, total_guests,
-            lead_country, lead_sex, lead_nationality, lead_is_overseas,
-            lead_city_municipality, lead_province,
-            male_count, female_count
-     FROM guest_records
-     WHERE business_id = ? AND is_deleted = false
-       AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?
-       AND status IN ('active', 'archived')`,
-    [businessId, firstDay, lastDay]
+  const [records] = await queryWithRetry(() =>
+    db.pool.execute(
+      `SELECT id, check_in, check_out, actual_check_out, total_guests,
+              lead_country, lead_sex, lead_nationality, lead_is_overseas,
+              lead_city_municipality, lead_province,
+              male_count, female_count
+       FROM guest_records
+       WHERE business_id = ? AND is_deleted = false
+         AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?
+         AND status IN ('active', 'archived')`,
+      [businessId, firstDay, lastDay]
+    )
   );
 
   const recordIds = records.map(r => r.id);
