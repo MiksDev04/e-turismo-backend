@@ -328,7 +328,7 @@ CREATE TABLE `guest_origin_breakdowns` (
 CREATE TABLE `messages` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
   `sender_id` char(36) NOT NULL,
-  `message_type` enum('compliance','announcement','general') NOT NULL DEFAULT 'general',
+  `message_type` enum('compliance','announcement') NOT NULL DEFAULT 'announcement',
   `subject` varchar(255) NOT NULL,
   `content` text NOT NULL,
   `is_broadcast` tinyint(1) NOT NULL DEFAULT '0',
