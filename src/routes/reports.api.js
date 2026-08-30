@@ -55,14 +55,84 @@ try {
   varTemplateWb = null;
 }
 
-// ─── Load the tourism office logo for the VAR header ─────────────────────────
-let varLogoBuffer = null;
-try {
-  varLogoBuffer = await fsp.readFile(path.join(__dirname, '..', '..', 'sample', 'tourism_office_logo.jpg'));
-  console.log('[report] VAR logo loaded');
-} catch (err) {
-  console.warn('[report] VAR logo not found, VAR exports will have no logo:', err.message);
+// ─── VAR 2 template images (top logo + footer graphic) ────────────────────────
+// The new VAR-REPORT.xlsx blank carries its own artwork (a header logo spanning
+// rows 2-7 and a footer graphic at rows 67-69).  The clone strips images, so
+// exports must restore the template's own media at its original two-cell anchors
+// (parsed from drawing1.xml) rather than re-injecting a separate logo file.
+const varTemplateImages = [];
+
+async function _loadVarTemplateImages() {
+  try {
+    const filePath = path.join(__dirname, '..', '..', 'sample', 'VAR-REPORT.xlsx');
+    const zip = await JSZip.loadAsync(await fsp.readFile(filePath));
+
+    const drawingXml = await zip.file('xl/drawings/drawing1.xml').async('string');
+    const relsXml = await zip.file('xl/drawings/_rels/drawing1.xml.rels').async('string');
+
+    // Map r:embed rIds (rIdN) → media target file (../media/imageX.png).
+    const relMap = {};
+    for (const m of relsXml.matchAll(/Id="(rId\d+)"[^>]*Target="\.\.\/([^"]+)"/g)) {
+      relMap[m[1]] = m[2];
+    }
+
+    // Shorthand: each anchor's text content as embed id + anchor corners.
+    const getText = (block, tag, nth) => {
+      const all = [...block.matchAll(new RegExp(`<xdr:${tag}>\\s*(\\d+)\\s*</xdr:${tag}>`, 'g'))];
+      const m = all[nth];
+      return m ? parseInt(m[1], 10) : 0;
+    };
+
+    const anchorBlocks = drawingXml
+      .split(/<xdr:twoCellAnchor>|<xdr:oneCellAnchor>/)
+      .slice(1)
+      .filter(b => /r:embed="/.test(b));
+
+    const images = [];
+    for (const block of anchorBlocks) {
+      const embedMatch = block.match(/r:embed="([^"]+)"/);
+      if (!embedMatch) continue;
+      const rel = relMap[embedMatch[1]];
+      if (!rel) continue;
+
+      let mediaName = rel;
+      if (!mediaName.startsWith('xl/')) mediaName = 'xl/media/' + mediaName.split('/').pop();
+
+      const media = zip.file(mediaName);
+      if (!media) continue;
+      const buffer = await media.async('nodebuffer');
+      const extension = mediaName.split('.').pop().toLowerCase();
+
+      images.push({
+        buffer,
+        extension,
+        tl: {
+          col: getText(block, 'col', 0),
+          colOff: getText(block, 'colOff', 0),
+          row: getText(block, 'row', 0),
+          rowOff: getText(block, 'rowOff', 0),
+        },
+        br: {
+          col: getText(block, 'col', 1),
+          colOff: getText(block, 'colOff', 1),
+          row: getText(block, 'row', 1),
+          rowOff: getText(block, 'rowOff', 1),
+        },
+      });
+    }
+
+    if (images.length === 0) return;
+
+    // Sort by start row so [0] = top (logo) and [last] = bottom (footer graphic).
+    images.sort((a, b) => a.tl.row - b.tl.row);
+    for (const img of images) varTemplateImages.push(img);
+    console.log(`[report] VAR 2 template images loaded (${varTemplateImages.length})`);
+  } catch (err) {
+    console.warn('[report] VAR 2 template images not found:', err.message);
+  }
 }
+
+await _loadVarTemplateImages();
 
 // ─── VAR 1 (Tourist Attraction) template ─────────────────────────────────────
 let attractionTemplateWb = null;
@@ -101,6 +171,25 @@ const kVar1ImageAnchors = [
     fromCol: 1, fromRow: 61, toCol: 5, toRow: 63,
     fromColOff: 449482, fromRowOff: 237814,
     toColOff: 90894, toRowOff: 255295,
+  },
+];
+
+// VAR 2 image anchors lifted from the new "VAR-REPORT.xlsx" drawing1.xml —
+// a header logo (rows 2-7) and a footer graphic (rows 67-69).  Same rationale
+// as kVar1ImageAnchors: ExcelJS zeroes colOff/rowOff, so the exported drawing
+// XML must be patched back to these exact EMU offsets.
+const kVar2ImageAnchors = [
+  {
+    name: 'logo',
+    fromCol: 1, fromRow: 2, toCol: 2, toRow: 7,
+    fromColOff: 2106705, fromRowOff: 100853,
+    toColOff: 669737, toRowOff: 11667,
+  },
+  {
+    name: 'footer',
+    fromCol: 1, fromRow: 67, toCol: 1, toRow: 69,
+    fromColOff: 68035, fromRowOff: 244929,
+    toColOff: 2009054, toRowOff: 262410,
   },
 ];
 
@@ -1090,17 +1179,15 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
       _buildVarExcelSheet(sheet, varRows, varDataList, sortedMonths, year);
 
-      // Embed the tourism office logo in the header (mirrors the template's
-      // B1 anchor spanning rows 1-4).
-      if (varLogoBuffer) {
+      // Restore the template's own artwork (top logo + footer graphic) into the
+      // cloned sheet — the clone strips images, so they must be re-added with
+      // their original two-cell anchors.
+      for (const img of varTemplateImages) {
         try {
-          const logoId = wb.addImage({ buffer: varLogoBuffer, extension: 'jpeg' });
-          sheet.addImage(logoId, {
-            tl: { nativeCol: 1, nativeColOff: 1038225, nativeRow: 0, nativeRowOff: 57150 },
-            ext: { width: 64, height: 64 },
-          });
+          const imageId = wb.addImage({ buffer: img.buffer, extension: img.extension });
+          sheet.addImage(imageId, { tl: img.tl, br: img.br });
         } catch (err) {
-          console.warn('[report] Could not embed VAR logo:', err.message);
+          console.warn('[report] Could not restore VAR 2 template image:', err.message);
         }
       }
     } else if (reportType === 'var1') {
@@ -1206,6 +1293,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       let outBuffer = fontXml ? await _patchDefaultFont(buffer, fontXml) : buffer;
       if (reportType === 'var1') {
         outBuffer = await _patchVar1ImageOffsets(outBuffer);
+      } else if (reportType === 'var2') {
+        outBuffer = await _patchVar2ImageOffsets(outBuffer);
       }
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
       res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1735,13 +1824,13 @@ async function _patchDefaultFont(buffer, fontXml) {
 
 // ExcelJS writes every image anchor with colOff/rowOff zeroed and editAs
 // "oneCell".  Restore the template's exact EMU offsets (and the default
-// two-cell edit behavior) so the VAR 1 logo + QR sit precisely where the
-// blank template places them.
-async function _patchVar1ImageOffsets(buffer) {
+// two-cell edit behavior) so the VAR 1 logo + QR and the VAR 2 logo + footer
+// graphic sit precisely where the blank templates place them.
+async function _patchImageOffsets(buffer, anchors, label) {
   const _matchSpec = (inner) => {
     const m = inner.match(/<xdr:from><xdr:col>(\d+)<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row><xdr:rowOff>\d+<\/xdr:rowOff><\/xdr:from><xdr:to><xdr:col>(\d+)<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row>/);
     if (!m) return null;
-    return kVar1ImageAnchors.find(s =>
+    return anchors.find(s =>
       s.fromCol === +m[1] && s.fromRow === +m[2] &&
       s.toCol === +m[3] && s.toRow === +m[4]) || null;
   };
@@ -1781,14 +1870,22 @@ async function _patchVar1ImageOffsets(buffer) {
     }
 
     if (!anyChanged) {
-      console.warn('[report] VAR 1 image offset patch: no matching anchors found, export unchanged');
+      console.warn(`[report] ${label} image offset patch: no matching anchors found, export unchanged`);
       return buffer;
     }
     return await zip.generateAsync({ type: 'nodebuffer' });
   } catch (err) {
-    console.warn('[report] VAR 1 image offset patch skipped:', err.message);
+    console.warn(`[report] ${label} image offset patch skipped:`, err.message);
     return buffer;
   }
+}
+
+async function _patchVar1ImageOffsets(buffer) {
+  return _patchImageOffsets(buffer, kVar1ImageAnchors, 'VAR 1');
+}
+
+async function _patchVar2ImageOffsets(buffer) {
+  return _patchImageOffsets(buffer, kVar2ImageAnchors, 'VAR 2');
 }
 
 // ─── Template Cloning ────────────────────────────────────────────────────────
@@ -2311,8 +2408,8 @@ const kVarCols = {
   grandTotal: 18,     // R
 };
 
-const kVarDataRowStart = 16;
-const kVarTotalRow = 57;
+const kVarDataRowStart = 21;
+const kVarTotalRow = 62;
 
 function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year) {
   const kVarMonthNames = [
@@ -2329,12 +2426,12 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
     : `${kVarMonthAbbr[sortedMonths[0]]}-${kVarMonthAbbr[sortedMonths[sortedMonths.length - 1]]}, ${year}`;
 
   // Update header fields
-  // Row 9: Month/Year — write value in the cells near E9
-  sheet.getCell('G9').value = monthLabel;
+  // Row 14: Month/Year — write value in the cells near E14
+  sheet.getCell('G14').value = monthLabel;
 
-  // Row 10: Municipality — write the first business city or leave template default
+  // Row 15: Municipality — write the first business city or leave template default
   if (businesses.length === 1) {
-    sheet.getCell('G10').value = (businesses[0].city_municipality || '').toUpperCase();
+    sheet.getCell('G15').value = (businesses[0].city_municipality || '').toUpperCase();
   }
 
   const c = kVarCols;
@@ -2675,9 +2772,13 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       if (rowUsed) used = rn;
     });
     // VAR 1 restores its template artwork (top logo rows 2-6, QR graphic rows
-    // 61-63), so rows spanned by those anchors count as used too.
+    // 61-63) and VAR 2 does the same (top logo rows 2-7, footer graphic rows
+    // 67-69), so rows spanned by those anchors count as used too.
     if (reportType === 'var1') {
       for (const img of attractionTemplateImages) used = Math.max(used, img.br.row);
+    }
+    if (reportType === 'var2') {
+      for (const img of varTemplateImages) used = Math.max(used, img.br.row);
     }
     return used;
   };
@@ -3018,28 +3119,32 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
         curY += rh;
       }
 
-      // Draw the template's own artwork for VAR 1 (attraction) — the top logo
-      // and footer graphic — at their original anchor boxes, using the same
-      // origin/scale math as the cell grid.  The VAR 2 report keeps drawing the
-      // tourism office logo over its header (B1, rows 1-4).
-      if (reportType === 'var1') {
-        for (const img of attractionTemplateImages) {
-          try {
-            const { x, y, boxW, boxH } = _pdfImageBox(sheet, img.tl, img.br, scale, geo.originX, geo.originY);
-            if (boxW <= 0 || boxH <= 0) continue;
-            const imgMeta = doc.openImage(img.buffer);
+      // Draw the template's own artwork — the top logo and footer graphic for
+      // VAR 1 (attraction) and VAR 2 — at their original anchor boxes, using
+      // the same origin/scale math as the cell grid.
+      const templateImages = reportType === 'var1'
+        ? attractionTemplateImages
+        : reportType === 'var2' ? varTemplateImages : [];
+      for (const img of templateImages) {
+        try {
+          const { x, y, boxW, boxH } = _pdfImageBox(sheet, img.tl, img.br, scale, geo.originX, geo.originY);
+          if (boxW <= 0 || boxH <= 0) continue;
+          const imgMeta = doc.openImage(img.buffer);
+          // The VAR 2 footer graphic is a tall-thin sliver whose anchor box is
+          // much taller than its natural aspect ratio.  Excel's template uses
+          // "stretch to fill" for it, so reproduce that here (else it renders
+          // thinned/pancaked).  Detect it by its single-column anchor (to.col
+          // === from.col); the top logos keep aspect-preserving fit.
+          const stretchToFill = reportType === 'var2' && img.tl.col === img.br.col;
+          if (stretchToFill) {
+            doc.image(img.buffer, x, y, { width: boxW, height: boxH });
+          } else {
             const ratio = Math.min(boxW / imgMeta.width, boxH / imgMeta.height);
             doc.image(img.buffer, x, y, { width: imgMeta.width * ratio, height: imgMeta.height * ratio });
-          } catch (err) {
-            console.warn('[report] Could not draw VAR 1 template image:', err.message);
           }
+        } catch (err) {
+          console.warn(`[report] Could not draw ${reportType} template image:`, err.message);
         }
-      } else if (reportType === 'var2' && s === 0 && varLogoBuffer) {
-        const colAW = (sheet.getColumn(1).width || 10) * CHAR_WIDTH_PT * scale + CELL_PAD_PT * scale;
-        const logoX = originX + colAW + (1038225 / 914400) * 72 * scale;
-        const logoY = originY + (57150 / 914400) * 72 * scale;
-        const logoPx = 64 * 0.75 * scale;
-        doc.image(varLogoBuffer, logoX, logoY, { width: logoPx, height: logoPx });
       }
     }
   }
