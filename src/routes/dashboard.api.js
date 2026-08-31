@@ -159,6 +159,7 @@ router.get('/breakdowns', auth.authenticate, auth.requireRole('admin', 'business
               lead_province AS province,
               lead_city_municipality AS city_municipality,
               lead_sex AS sex,
+              lead_is_overseas AS is_overseas,
               CASE
                 WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
                 WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 17 THEN '10-17'
@@ -371,6 +372,7 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
                 lead_province AS province,
                 lead_city_municipality AS city_municipality,
                 lead_sex AS sex,
+                lead_is_overseas AS is_overseas,
                 CASE
                   WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
                   WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 17 THEN '10-17'
