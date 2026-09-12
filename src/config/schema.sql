@@ -132,7 +132,7 @@ CREATE TABLE `businesses` (
 
   `permit_file_url` varchar(1000) DEFAULT NULL,
   `valid_id_url` varchar(1000) DEFAULT NULL,
-  `status` enum('pending','approved','rejected','warning','suspended') NOT NULL DEFAULT 'pending',
+  `status` enum('pending','approved','rejected','warning') NOT NULL DEFAULT 'pending',
   `remarks` text,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

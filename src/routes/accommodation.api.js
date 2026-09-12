@@ -310,7 +310,7 @@ router.put('/:id/flag', adminGuard, async (req, res, next) => {
 
 /**
  * PUT /api/admin/accommodations/:id/status
- * Update a business status (approved/warning/suspended) and notify the owner.
+ * Update a business status (approved/warning) and notify the owner.
  * Body: { status, reason, messageContent }
  */
 router.put('/:id/status', adminGuard, async (req, res, next) => {
@@ -320,7 +320,7 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     const { status, reason, messageContent } = req.body;
     const { id } = req.params;
 
-    if (!['approved', 'warning', 'suspended'].includes(status)) {
+    if (!['approved', 'warning'].includes(status)) {
       return res.status(400).json({ message: 'Invalid status.' });
     }
     if (!reason || !reason.trim()) {

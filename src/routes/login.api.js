@@ -72,9 +72,6 @@ router.post('/login', async (req, res, next) => {
       if (business.status === 'pending') {
         return res.status(403).json({ message: 'Your account is still pending approval.' });
       }
-      if (business.status === 'suspended') {
-        return res.status(403).json({ message: 'Your account is suspended because of violations.' });
-      }
       if (business.status === 'rejected') {
         return res.status(403).json({ message: 'Your account application was not approved.' });
       }
