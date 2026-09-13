@@ -2692,6 +2692,9 @@ function _buildVar1ExcelSheet(sheet, attractionName, attractionType, daily, tota
   totalRow.getCell(c.grandFemale).value      = { formula: `SUM(Q${kVar1DayRowStart}:Q${lastDataRow})` };
   // Column R grand total — mirrors the template's R51 formula (=F51+I51+L51+O51)
   totalRow.getCell(c.grandTotal).value       = { formula: `F${kVar1TotalRow}+I${kVar1TotalRow}+L${kVar1TotalRow}+O${kVar1TotalRow}` };
+  // The blank template bakes a two-decimal (#,##0.00) format into this cell;
+  // reset it to General so integer totals render as "84", matching the PDF.
+  totalRow.getCell(c.grandTotal).numFmt = 'General';
 }
 
 // ─── PDF Layout & Page-Break Config ─────────────────────────────────────────
