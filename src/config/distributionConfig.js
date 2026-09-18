@@ -13,10 +13,10 @@
 //   slightly toward females, 52.9% vs 47.1%).
 const distributionConfig = {
   origin: {
-    thisCityPct: 0.55,
-    otherCityPct: 0.20,
-    otherProvincePct: 0.15,
-    foreignPct: 0.10,
+    thisCityPct: 0.71,
+    otherCityPct: 0.22,
+    otherProvincePct: 0.03,
+    foreignPct: 0.03,
   },
   gender: {
     malePct: 0.471,
