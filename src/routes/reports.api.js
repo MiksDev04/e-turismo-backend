@@ -8,6 +8,7 @@ import auth from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import distributionConfig, { kOriginPct, kOriginCategories } from '../config/distributionConfig.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -908,8 +909,16 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
           maleOtherProvince: 0, femaleOtherProvince: 0,
           maleForeign: 0, femaleForeign: 0,
         };
+        const attractionEstimation = _emptyEstimation();
         for (const ad of attDataList) {
           for (const k of Object.keys(varData)) varData[k] += ad.totals[k] || 0;
+          attractionEstimation.originEstimated.count += ad.estimation.originEstimated.count;
+          for (const cat of kOriginCategories) {
+            attractionEstimation.originEstimated.byCategory[cat] += ad.estimation.originEstimated.byCategory[cat] || 0;
+          }
+          attractionEstimation.genderEstimated.count += ad.estimation.genderEstimated.count;
+          attractionEstimation.genderEstimated.male += ad.estimation.genderEstimated.male;
+          attractionEstimation.genderEstimated.female += ad.estimation.genderEstimated.female;
         }
 
         accumulate(varData);
@@ -930,6 +939,7 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
           monthData: null,
           seriesData: null,
           varData,
+          attractionEstimation,
         });
       }
 
@@ -952,6 +962,7 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
         maleOtherProvince: 0, femaleOtherProvince: 0,
         maleForeign: 0, femaleForeign: 0,
       };
+      const totalEstimation = _emptyEstimation();
       const establishments = [];
 
       for (const att of attractions) {
@@ -974,14 +985,23 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
           varData: null,
           attractionDaily: md.daily,
           attractionTotals: md.totals,
+          attractionEstimation: md.estimation,
         });
         for (const k of Object.keys(md.totals)) totalsVar[k] += md.totals[k];
+        totalEstimation.originEstimated.count += md.estimation.originEstimated.count;
+        for (const cat of kOriginCategories) {
+          totalEstimation.originEstimated.byCategory[cat] += md.estimation.originEstimated.byCategory[cat] || 0;
+        }
+        totalEstimation.genderEstimated.count += md.estimation.genderEstimated.count;
+        totalEstimation.genderEstimated.male += md.estimation.genderEstimated.male;
+        totalEstimation.genderEstimated.female += md.estimation.genderEstimated.female;
       }
 
       res.json({
         batch: { id: batchId, reportType, reportVariant: effectiveVariant, periodYear: year, periodMonths: sortedMonths },
         establishments,
         totals: totalsVar,
+        estimation: totalEstimation,
       });
     } else {
       // DAE: existing logic
@@ -1152,6 +1172,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
          WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
       );
 
+      const sheetEstimation = _emptyEstimation();
+
       for (const att of attractions) {
         const monthlyData = await Promise.all(
           sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
@@ -1164,6 +1186,13 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         };
         for (const md of monthlyData) {
           for (const k of Object.keys(aggregated)) aggregated[k] += md.totals[k] || 0;
+          sheetEstimation.originEstimated.count += md.estimation.originEstimated.count;
+          for (const cat of kOriginCategories) {
+            sheetEstimation.originEstimated.byCategory[cat] += md.estimation.originEstimated.byCategory[cat] || 0;
+          }
+          sheetEstimation.genderEstimated.count += md.estimation.genderEstimated.count;
+          sheetEstimation.genderEstimated.male += md.estimation.genderEstimated.male;
+          sheetEstimation.genderEstimated.female += md.estimation.genderEstimated.female;
         }
         varRows.push({
           business_name: att.attraction_name,
@@ -1177,7 +1206,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         console.warn(`[report] VAR 2 combined rows (${varRows.length}) exceed the template's data rows (${kVarTotalRow - kVarDataRowStart}); trailing rows will be dropped.`);
       }
 
-      _buildVarExcelSheet(sheet, varRows, varDataList, sortedMonths, year);
+      _buildVarExcelSheet(sheet, varRows, varDataList, sortedMonths, year, sheetEstimation);
 
       // Restore the template's own artwork (top logo + footer graphic) into the
       // cloned sheet — the clone strips images, so they must be re-added with
@@ -1211,7 +1240,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
           ? JSON.parse(att.attraction_type || '[]')
           : (att.attraction_type || []);
         _buildVar1ExcelSheet(sheet, att.attraction_name, attractionType, md.daily, md.totals,
-          sortedMonths[0], year);
+          sortedMonths[0], year, md.estimation);
 
         // Restore the template's own artwork (top logo + footer graphic) into
         // the cloned sheet — the clone strips images, so they must be re-added
@@ -1658,18 +1687,44 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
   return data;
 }
 
+// Empty estimation accumulator shared by the aggregation and route-level totals.
+function _emptyEstimation() {
+  return {
+    originEstimated: { count: 0, byCategory: { thisCity: 0, otherCity: 0, otherProvince: 0, foreign: 0 } },
+    genderEstimated: { count: 0, male: 0, female: 0 },
+  };
+}
+
 // ─── VAR 1 (Tourist Attraction) month aggregation ────────────────────────────
 // Daily sex × residence grid from attraction_visit_logs for a single month.
 // The VAR 1 form classifies Philippine visitors against the attraction's
 // location; attractions are San Pablo City-only, so This City/Municipality is
 // SAN PABLO CITY and same-province residents are Other City/Municipality.
+//
+// ─── Estimation methodology ───────────────────────────────────────────────────
+// Origin AND gender are optional at data-entry time. A headcount-only log row
+// stores NULLs, so reports must distribute those visitors. Per day the rows
+// are grouped by what they actually recorded, and each unknown dimension is
+// estimated ONCE per group against the config in src/config/distributionConfig.js
+// (origin distribution study + PSA 47.1%/52.9% gender split). The doc's four
+// groups:
+//    A — origin known, gender known   → used directly (male/female counts)
+//    B — origin known, gender unknown → sex-estimated once per residence category
+//    C — origin unknown, gender known → origin-estimated once per sex pool
+//    D — origin unknown, gender unknown → origin-estimated once, then
+//        sex-estimated once per category amount
+// Per day, the 4 residence-category totals are rounded with the largest-remainder
+// method so category totals sum to the day's exact Grand Total (= Σ guest_count);
+// per category, Male is largest-remainder rounded and Female = Total − Male.
+// Rows that only imply "Philippines" with no province/city are treated as origin
+// unknown (legacy rows silently recorded exactly the case we now store as NULL).
 async function _fetchAttractionMonthData(attractionId, month, year) {
   const firstDay = `${year}-${String(month).padStart(2, '0')}-01`;
   const lastDay  = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
 
   const [records] = await db.pool.execute(
     `SELECT id, visit_date, guest_count, male_count, female_count,
-            country, province, city_municipality
+            is_foreign, country, province, city_municipality
      FROM attraction_visit_logs
      WHERE attraction_id = ? AND visit_date BETWEEN ? AND ? AND deleted_at IS NULL`,
     [attractionId, firstDay, lastDay]
@@ -1685,53 +1740,168 @@ async function _fetchAttractionMonthData(attractionId, month, year) {
     maleForeign: 0, femaleForeign: 0,
   });
 
+  // Build a camelCase bucket key from a sex + kOriginCategories key
+  // (e.g. 'male' + 'thisCity' → 'maleThisCity'). Never use `male${cat}` — the
+  // first word of the category is lowercase, which would mismatch the bucket.
+  const bk = (sex, cat) => sex + cat.charAt(0).toUpperCase() + cat.slice(1);
+
+  const emptyEstimation = _emptyEstimation;
+
+  const acc = {};
   const daily = {};
   const totals = emptyBucket();
+  const estimation = emptyEstimation();
+
+  // Resolve the residence category for a row. Returns one of the kOriginCategories
+  // keys, or null when the origin is unknown (not enough recorded to classify).
+  const _categoryOf = (r) => {
+    if (r.is_foreign === 1 || r.is_foreign === true) return 'foreign';
+    const gCountry = (r.country || '').trim().toUpperCase();
+    if (gCountry === '') return null;
+    if (gCountry !== 'PHILIPPINES') return 'foreign';
+
+    const gCity = _normalizeCityName(r.city_municipality);
+    const gProv = (r.province || '').trim().toUpperCase();
+    if (gCity === kCity) return 'thisCity';
+    if (gProv === kProv) return 'otherCity';
+    if (gCity !== '' || gProv !== '') return 'otherProvince';
+    return null; // 'Philippines' with no province/city → origin unknown
+  };
 
   records.forEach(r => {
     const visitDate = _parseLocalDate(r.visit_date);
     if (!visitDate) return;
     const dayKey = String(visitDate.getDate());
 
-    let maleCount   = _asInt(r.male_count);
-    let femaleCount = _asInt(r.female_count);
-    if (maleCount + femaleCount === 0) {
-      const guest = _asInt(r.guest_count);
-      maleCount = Math.round(guest * 0.471);
-      femaleCount = guest - maleCount;
-    }
+    const guest     = _asInt(r.guest_count);
+    const category  = _categoryOf(r);
+    const originKnown = category !== null;
+    const mRaw = r.male_count;
+    const fRaw = r.female_count;
+    const male = _asInt(mRaw);
+    const female = _asInt(fRaw);
+    // A row counts as gender-known only when it actually carries counts; a
+    // legacy 0/0 row with a positive guest count is treated as gender-unknown.
+    const genderKnown = mRaw != null && fRaw != null && (male + female > 0);
 
-    const gCountry = (r.country || '').toUpperCase();
-    const isForeign = gCountry !== '' && gCountry !== 'PHILIPPINES';
+    const entry   = (acc[dayKey] ??= { bucket: emptyBucket(), est: emptyEstimation(),
+      bByCategory: emptyBucket(), malePool: 0, femalePool: 0, unknownPool: 0 });
 
-    const entry = (daily[dayKey] ??= emptyBucket());
-
-    let maleBucket, femaleBucket;
-    if (isForeign) {
-      maleBucket   = 'maleForeign';
-      femaleBucket = 'femaleForeign';
+    if (originKnown && genderKnown) {
+      // Group A — direct.
+      entry.bucket[bk('male', category)] += male;
+      entry.bucket[bk('female', category)] += female;
+    } else if (originKnown) {
+      // Group B — known origin, unknown gender; sex-split per category later.
+      entry.bByCategory[bk('male', category)] += guest;
+    } else if (genderKnown) {
+      // Group C — unknown origin, known gender; origin-split per sex pool later.
+      entry.malePool += male;
+      entry.femalePool += female;
     } else {
-      const gCity = _normalizeCityName(r.city_municipality);
-      const gProv = (r.province || '').toUpperCase();
-      if (gCity && gCity === kCity) {
-        maleBucket   = 'maleThisCity';
-        femaleBucket = 'femaleThisCity';
-      } else if (gProv && gProv === kProv) {
-        maleBucket   = 'maleOtherCity';
-        femaleBucket = 'femaleOtherCity';
-      } else {
-        maleBucket   = 'maleOtherProvince';
-        femaleBucket = 'femaleOtherProvince';
-      }
+      // Group D — everything unknown; origin-then-sex split later.
+      entry.unknownPool += guest;
     }
-
-    entry[maleBucket]    += maleCount;
-    entry[femaleBucket]  += femaleCount;
-    totals[maleBucket]   += maleCount;
-    totals[femaleBucket] += femaleCount;
   });
 
-  return { month, year, daily, totals };
+  const malePct = distributionConfig.gender.malePct;
+  const femalePct = distributionConfig.gender.femalePct;
+
+  Object.entries(acc).forEach(([dayKey, entry]) => {
+    // Group B — for each known-origin category with sex-estimated visitors.
+    kOriginCategories.forEach(cat => {
+      const guestB = entry.bByCategory[bk('male', cat)];
+      if (!guestB) return;
+      const maleB = _largestRemainderScalar(guestB * malePct, 0, guestB);
+      entry.bucket[bk('male', cat)] += maleB;
+      entry.bucket[bk('female', cat)] += guestB - maleB;
+      entry.est.genderEstimated.count += guestB;
+      entry.est.genderEstimated.male += maleB;
+      entry.est.genderEstimated.female += guestB - maleB;
+    });
+
+    // Group C — unknown origin, known gender: origin-split each sex pool once.
+    const malePoolC = entry.malePool;
+    const femalePoolC = entry.femalePool;
+    if (malePoolC || femalePoolC) {
+      const maleAlloc = _largestRemainderVec(kOriginCategories.map(c => malePoolC * kOriginPct[c]), malePoolC);
+      const femaleAlloc = _largestRemainderVec(kOriginCategories.map(c => femalePoolC * kOriginPct[c]), femalePoolC);
+      kOriginCategories.forEach((cat, i) => {
+        const mC = maleAlloc[i];
+        const fC = femaleAlloc[i];
+        entry.bucket[bk('male', cat)] += mC;
+        entry.bucket[bk('female', cat)] += fC;
+        entry.est.originEstimated.count += mC + fC;
+        entry.est.originEstimated.byCategory[cat] += mC + fC;
+      });
+    }
+
+    // Group D — unknown origin AND gender: origin-split once, then sex-split
+    // each category amount once.
+    const unknownD = entry.unknownPool;
+    if (unknownD) {
+      const catTotals = _largestRemainderVec(kOriginCategories.map(c => unknownD * kOriginPct[c]), unknownD);
+      kOriginCategories.forEach((cat, i) => {
+        const totalD = catTotals[i];
+        const maleD = _largestRemainderScalar(totalD * malePct, 0, totalD);
+        entry.bucket[bk('male', cat)] += maleD;
+        entry.bucket[bk('female', cat)] += totalD - maleD;
+        entry.est.originEstimated.count += totalD;
+        entry.est.originEstimated.byCategory[cat] += totalD;
+        entry.est.genderEstimated.count += totalD;
+        entry.est.genderEstimated.male += maleD;
+        entry.est.genderEstimated.female += totalD - maleD;
+      });
+    }
+  });
+
+  // Repackage the per-day accounting back into flat buckets (what the sheet
+  // builders expect) while rolling everything up to month totals + estimation.
+  Object.entries(acc).forEach(([dayKey, entry]) => {
+    daily[dayKey] = entry.bucket;
+    for (const k of Object.keys(totals)) totals[k] += entry.bucket[k] || 0;
+    estimation.originEstimated.count += entry.est.originEstimated.count;
+    for (const cat of kOriginCategories) {
+      estimation.originEstimated.byCategory[cat] += entry.est.originEstimated.byCategory[cat] || 0;
+    }
+    estimation.genderEstimated.count += entry.est.genderEstimated.count;
+    estimation.genderEstimated.male += entry.est.genderEstimated.male;
+    estimation.genderEstimated.female += entry.est.genderEstimated.female;
+  });
+
+  return { month, year, daily, totals, estimation };
+}
+
+// Largest-remainder rounding of a list of unrounded counts to integers whose
+// sum equals `total` exactly.
+function _largestRemainderVec(unrounded, total) {
+  const n = unrounded.length;
+  const floor = unrounded.map(v => Math.floor(v));
+  let remaining = total - floor.reduce((a, b) => a + b, 0);
+  while (remaining > 0) {
+    let bestIdx = -1;
+    let bestRemainder = -1;
+    for (let i = 0; i < n; i++) {
+      const rem = unrounded[i] - floor[i];
+      if (rem > bestRemainder) {
+        bestRemainder = rem;
+        bestIdx = i;
+      }
+    }
+    floor[bestIdx] += 1;
+    unrounded[bestIdx] -= 1;
+    remaining -= 1;
+  }
+  return floor;
+}
+
+// Largest-remainder rounding of a single scalar to an integer within [min, max].
+function _largestRemainderScalar(value, min, max) {
+  const floor = Math.min(Math.floor(value), max);
+  const rest = max - floor;
+  if (rest <= 0) return floor;
+  const remainder = value - Math.floor(value);
+  return remainder >= 0.5 ? floor + 1 : floor;
 }
 
 // ─── Merge helpers ────────────────────────────────────────────────────────────
@@ -2411,7 +2581,7 @@ const kVarCols = {
 const kVarDataRowStart = 21;
 const kVarTotalRow = 62;
 
-function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year) {
+function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year, estimation) {
   const kVarMonthNames = [
     '', 'January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December',
@@ -2544,7 +2714,6 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
   totalRow.getCell(c.grandMale).value        = { formula: `SUM(P${kVarDataRowStart}:P${lastDataRow})` };
   totalRow.getCell(c.grandFemale).value      = { formula: `SUM(Q${kVarDataRowStart}:Q${lastDataRow})` };
   totalRow.getCell(c.grandTotal).value       = { formula: `F${kVarTotalRow}+I${kVarTotalRow}+L${kVarTotalRow}+O${kVarTotalRow}` };
-
 }
 
 // ─── VAR 1 (Tourist Attraction) sheet builder ────────────────────────────────
@@ -2595,7 +2764,7 @@ function _attractionTypeLabel(value) {
     .join(' ');
 }
 
-function _buildVar1ExcelSheet(sheet, attractionName, attractionType, daily, totals, month, year) {
+function _buildVar1ExcelSheet(sheet, attractionName, attractionType, daily, totals, month, year, estimation) {
   const c = kVar1Cols;
   const daysInMonth = new Date(year, month, 0).getDate();
   const kWeekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];

@@ -8,7 +8,9 @@ const router = express.Router();
 /**
  * POST /api/attraction/visit-entry/visit-entries
  * Attraction only: Records a new tourist visit entry.
- * country defaults to 'Philippines' for domestic visitors; nationality is
+ * Origin is optional: 'Philippines' is only stored when a domestic origin is
+ * actually captured (province/city present); a blank origin stores NULL so the
+ * report distributes the visitor over the residence categories. Nationality is
  * derived from country (country = Philippines => Filipino), never stored.
  */
 router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'), async (req, res, next) => {
@@ -36,29 +38,63 @@ router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'),
       return res.status(400).json({ message: 'guestCount must be a positive integer' });
     }
 
-    // A foreign entry must always carry a country; for domestic visitors the
-    // country column is defaulted to 'Philippines' (nationality is derived
-    // from the country value, never stored).
-    if (isForeign && !country) {
-      return res.status(400).json({ message: 'country is required for foreign tourists' });
-    }
+    // Origin is now optional for BOTH foreign and domestic entries: an
+    // attraction that only does a headcount can leave country/province/city
+    // blank, storing NULL and letting the report distribute the visitors over
+    // the residence categories at generation time.
 
-    // Male/female counts: optional. If one is missing it is derived from the
-    // other; if both are blank, fall back to the PSA 47.1%/52.9% split.
-    let maleCountInt = parseInt(maleCount, 10) || 0;
-    let femaleCountInt = parseInt(femaleCount, 10) || 0;
-    if (!maleCountInt && !femaleCountInt) {
-      maleCountInt = Math.round(guestCountInt * 0.471);
-      femaleCountInt = guestCountInt - maleCountInt;
-    } else if (!maleCountInt) {
+    // Male/female counts: optional (nullable in the schema). If exactly one is
+    // missing it is completed from the other (male + female = guest_count),
+    // because we already have all the information for it. When BOTH are blank
+    // the row stores NULL/NULL and gender is estimated at report-generation
+    // time (PSA 47.1%/52.9%) — no save-time guessing.
+    const hasMale = maleCount != null && String(maleCount).trim() !== '';
+    const hasFemale = femaleCount != null && String(femaleCount).trim() !== '';
+    let maleCountInt = hasMale ? parseInt(maleCount, 10) : null;
+    let femaleCountInt = hasFemale ? parseInt(femaleCount, 10) : null;
+    if (maleCountInt != null && (isNaN(maleCountInt) || maleCountInt < 0)) maleCountInt = null;
+    if (femaleCountInt != null && (isNaN(femaleCountInt) || femaleCountInt < 0)) femaleCountInt = null;
+    if (maleCountInt == null && femaleCountInt == null) {
+      // Keep both NULL — origin/gender estimation happens in the report.
+    } else if (maleCountInt == null) {
       maleCountInt = guestCountInt - femaleCountInt;
-    } else if (!femaleCountInt) {
+      if (maleCountInt < 0) maleCountInt = null;
+    } else if (femaleCountInt == null) {
       femaleCountInt = guestCountInt - maleCountInt;
+      if (femaleCountInt < 0) femaleCountInt = null;
+    } else if (maleCountInt + femaleCountInt !== guestCountInt && maleCountInt + femaleCountInt === 0) {
+      // Both supplied but sum to 0 against a positive guest count — fall through
+      // as if unknown so the report can estimate rather than store garbage.
+      maleCountInt = null;
+      femaleCountInt = null;
     }
 
-    const resolvedCountry = isForeign ? country : 'Philippines';
-    const resolvedProvince = !isForeign ? (province || null) : null;
-    const resolvedCityMunicipality = !isForeign ? (cityMunicipality || null) : null;
+    // Origin: optional. 'Philippines' is only stored when a domestic origin is
+    // actually captured (province/city present). A blank origin — foreign with
+    // no country, or domestic with no province/city — stores NULL so the report
+    // can distribute it over the residence categories instead of silently
+    // treating it as 'Philippines, no city'.
+    let resolvedCountry = null;
+    let resolvedProvince = null;
+    let resolvedCityMunicipality = null;
+    if (isForeign) {
+      if (country && String(country).trim() !== '') {
+        resolvedCountry = String(country).trim();
+      }
+    } else {
+      const provinceVal = province && String(province).trim() !== '' ? String(province).trim() : null;
+      const cityVal = cityMunicipality && String(cityMunicipality).trim() !== '' ? String(cityMunicipality).trim() : null;
+      if (provinceVal || cityVal) {
+        resolvedCountry = 'Philippines';
+        resolvedProvince = provinceVal;
+        resolvedCityMunicipality = cityVal;
+      }
+    }
+
+    // is_foreign: records that this entry was logged as a foreign tourist even
+    // when no country was named (country stays NULL). Derived defensively so a
+    // mismatched client payload can never violate the DB consistency check.
+    const resolvedIsForeign = isForeign || (resolvedCountry && resolvedCountry !== 'Philippines') ? 1 : 0;
 
     // Resolve the attraction that belongs to this user.
     const [attractions] = await connection.execute(
@@ -92,7 +128,7 @@ router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'),
     const insertColumns = [
       'id', 'attraction_id', 'visit_date', 'guest_count',
       'male_count', 'female_count',
-      'country', 'province', 'city_municipality',
+      'is_foreign', 'country', 'province', 'city_municipality',
     ];
     const insertValues = [
       visitEntryId,
@@ -101,6 +137,7 @@ router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'),
       guestCountInt,
       maleCountInt,
       femaleCountInt,
+      resolvedIsForeign,
       resolvedCountry,
       resolvedProvince,
       resolvedCityMunicipality,

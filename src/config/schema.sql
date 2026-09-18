@@ -185,11 +185,12 @@ CREATE TABLE `attraction_visit_logs` (
   `attraction_id` char(36) NOT NULL,
   `visit_date` date NOT NULL,
   `guest_count` int NOT NULL,
-  `male_count` int DEFAULT NULL COMMENT 'Optional; auto-filled via PSA 47.1/52.9 split when blank',
-  `female_count` int DEFAULT NULL COMMENT 'Optional; female = guest_count - male_count',
-  `country` varchar(255) NOT NULL DEFAULT 'Philippines' COMMENT 'Philippines = Filipino tourist; otherwise Foreign. Nationality is derived from this value, never stored',
-  `province` varchar(255) DEFAULT NULL COMMENT 'Only set for domestic (Filipino) tourists',
-  `city_municipality` varchar(255) DEFAULT NULL COMMENT 'Only set for domestic (Filipino) tourists',
+  `male_count` int DEFAULT NULL COMMENT 'Optional; left NULL when gender not captured (estimated at report time via PSA 47.1/52.9 split)',
+  `female_count` int DEFAULT NULL COMMENT 'Optional; female = guest_count - male_count when the other side is entered',
+  `is_foreign` tinyint(1) NOT NULL DEFAULT 0 COMMENT '1 = recorded as Foreign tourist by the app user (country may still be NULL when no country was named); 0 = domestic (Filipino) or origin not captured',
+  `country` varchar(255) DEFAULT NULL COMMENT 'NULL = not named (origin not captured, or Foreign tourist who did not say which country); Philippines = Filipino tourist; otherwise Foreign. Nationality is derived from is_foreign + this value, never stored',
+  `province` varchar(255) DEFAULT NULL COMMENT 'Only set for domestic (Filipino) tourists; NULL whenever is_foreign = 1',
+  `city_municipality` varchar(255) DEFAULT NULL COMMENT 'Only set for domestic (Filipino) tourists; NULL whenever is_foreign = 1',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   `deleted_at` datetime DEFAULT NULL,
@@ -197,9 +198,16 @@ CREATE TABLE `attraction_visit_logs` (
   KEY `idx_avl_attraction_id` (`attraction_id`),
   KEY `idx_avl_visit_date` (`visit_date`),
   KEY `idx_avl_deleted_at` (`deleted_at`),
+  KEY `idx_avl_is_foreign` (`is_foreign`),
   CONSTRAINT `attraction_visit_logs_attraction_id_fkey` FOREIGN KEY (`attraction_id`) REFERENCES `tourist_attractions` (`id`) ON DELETE RESTRICT,
   CONSTRAINT `chk_avl_guest_count` CHECK (`guest_count` >= 1),
-  CONSTRAINT `chk_avl_sex_sum` CHECK (`male_count` IS NULL OR `female_count` IS NULL OR `male_count` + `female_count` = `guest_count`)
+  CONSTRAINT `chk_avl_sex_sum` CHECK (`male_count` IS NULL OR `female_count` IS NULL OR `male_count` + `female_count` = `guest_count`),
+  CONSTRAINT `chk_avl_is_foreign_consistency` CHECK (
+    (`is_foreign` = 1 AND `province` IS NULL AND `city_municipality` IS NULL
+      AND (`country` IS NULL OR `country` <> 'Philippines'))
+    OR
+    (`is_foreign` = 0 AND (`country` IS NULL OR `country` = 'Philippines'))
+  )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- ---------------------------------------------------------------
