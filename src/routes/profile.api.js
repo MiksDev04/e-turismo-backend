@@ -6,6 +6,7 @@ import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
 import cloudinary from '../config/cloudinary.js';
 import upload from '../middleware/upload.js';
+import { otpRequestLimiter, otpVerifyLimiter, authedActionLimiter } from '../middleware/rateLimiter.js';
 
 const router = express.Router();
 
@@ -312,7 +313,7 @@ router.post('/business/upload',
  * POST /api/profile/change-password
  * Updates password for logged-in user
  */
-router.post('/change-password', auth.authenticate, async (req, res, next) => {
+router.post('/change-password', auth.authenticate, authedActionLimiter, async (req, res, next) => {
   try {
     const { old_password, new_password } = req.body;
 
@@ -346,7 +347,7 @@ router.post('/change-password', auth.authenticate, async (req, res, next) => {
  * POST /api/send-email-otp
  * Sends OTP to CURRENT email to verify identity for email/password change
  */
-router.post('/send-email-otp', auth.authenticate, async (req, res, next) => {
+router.post('/send-email-otp', auth.authenticate, otpRequestLimiter, async (req, res, next) => {
   try {
     const [users] = await db.pool.execute('SELECT email, full_name FROM users WHERE id = ?', [req.user.id]);
     if (users.length === 0) return res.status(404).json({ message: 'User not found.' });
@@ -377,7 +378,7 @@ router.post('/send-email-otp', auth.authenticate, async (req, res, next) => {
  * PUT /api/update-email
  * Sends a confirmation link to the new email instead of directly updating it
  */
-router.put('/update-email', auth.authenticate, async (req, res, next) => {
+router.put('/update-email', auth.authenticate, otpVerifyLimiter, async (req, res, next) => {
   try {
     const { new_email, otp } = req.body;
     if (!new_email || !otp) return res.status(400).json({ message: 'New email and code are required.' });

@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import db from '../config/db.js';
 import mailer from '../utils/mailer.js';
+import { otpRequestLimiter, otpVerifyLimiter, loginLimiter } from '../middleware/rateLimiter.js';
 
 const router = express.Router();
 
@@ -10,7 +11,7 @@ const router = express.Router();
  * POST /api/auth/login
  * Authenticates user and returns profile + business data + JWT
  */
-router.post('/login', async (req, res, next) => {
+router.post('/login', loginLimiter, async (req, res, next) => {
   try {
     const { username, password } = req.body;
 
@@ -162,7 +163,7 @@ router.post('/login', async (req, res, next) => {
  * POST /api/auth/forgot-password
  * Sends a 6-digit OTP to the user's email
  */
-router.post('/forgot-password', async (req, res, next) => {
+router.post('/forgot-password', otpRequestLimiter, async (req, res, next) => {
   try {
     const { email } = req.body;
 
@@ -213,7 +214,7 @@ const [users] = await db.pool.execute(
  * POST /api/auth/verify-otp
  * Verifies if the provided OTP is correct and not expired
  */
-router.post('/verify-otp', async (req, res, next) => {
+router.post('/verify-otp', otpVerifyLimiter, async (req, res, next) => {
   try {
     const { email, otp } = req.body;
 
@@ -251,7 +252,7 @@ router.post('/verify-otp', async (req, res, next) => {
  * POST /api/auth/reset-password
  * Resets the password if the OTP is valid
  */
-router.post('/reset-password', async (req, res, next) => {
+router.post('/reset-password', otpVerifyLimiter, async (req, res, next) => {
   try {
     const { email, otp, new_password } = req.body;
 
