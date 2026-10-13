@@ -21,7 +21,7 @@ router.post('/login', loginLimiter, async (req, res, next) => {
 
     // 1. Fetch user by username
     const [users] = await db.pool.execute(
-      'SELECT * FROM users WHERE (username = ? OR email = ?) AND deleted_at IS NULL',
+      'SELECT * FROM users WHERE (username = ? OR email = ?) AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1',
       [username.trim().toLowerCase(), username.trim().toLowerCase()]
     );
 
@@ -173,7 +173,7 @@ router.post('/forgot-password', otpRequestLimiter, async (req, res, next) => {
 
     // 1. Find user by email
 const [users] = await db.pool.execute(
-      'SELECT id, email, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, email, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1',
       [email.trim().toLowerCase()]
     );
 
@@ -223,7 +223,7 @@ router.post('/verify-otp', otpVerifyLimiter, async (req, res, next) => {
     }
 
     const [users] = await db.pool.execute(
-      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1',
       [email.trim().toLowerCase()]
     );
 
@@ -262,7 +262,7 @@ router.post('/reset-password', otpVerifyLimiter, async (req, res, next) => {
 
     // 1. Verify OTP again for security
     const [users] = await db.pool.execute(
-      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1',
       [email.trim().toLowerCase()]
     );
 

@@ -283,25 +283,35 @@ async function handleAttractionRegistration(req, res, next, connection) {
 }
 
 async function hasUserConflict({ username, email, connection = db.pool }) {
-  const [existingUsers] = await connection.execute(
+  const [existingByUsername] = await connection.execute(
     `SELECT id FROM users
-     WHERE deleted_at IS NULL
-       AND (username = ? OR LOWER(email) = ?)
+     WHERE deleted_at IS NULL AND username = ?
      LIMIT 1`,
-    [username.trim().toLowerCase(), normalizeEmail(email)]
+    [username.trim().toLowerCase()]
   );
-  return existingUsers.length > 0;
+  if (existingByUsername.length > 0) return true;
+  return userEmailExists({ email, connection });
 }
 
 async function userEmailExists({ email, connection = db.pool }) {
-  const [existingUsers] = await connection.execute(
-    `SELECT id FROM users
-     WHERE deleted_at IS NULL
-       AND LOWER(email) = ?
+  const [rows] = await connection.execute(
+    `SELECT u.id
+     FROM users u
+     LEFT JOIN businesses b
+       ON b.user_id = u.id AND b.deleted_at IS NULL
+     LEFT JOIN tourist_attractions ta
+       ON ta.user_id = u.id AND ta.deleted_at IS NULL
+     WHERE u.deleted_at IS NULL
+       AND LOWER(u.email) = ?
+       AND (
+         (b.status IS NOT NULL AND b.status <> 'rejected')
+         OR (ta.status IS NOT NULL AND ta.status <> 'rejected')
+         OR (b.id IS NULL AND ta.id IS NULL)
+       )
      LIMIT 1`,
     [normalizeEmail(email)]
   );
-  return existingUsers.length > 0;
+  return rows.length > 0;
 }
 
 router.post('/register/send-confirmation', async (req, res, next) => {
