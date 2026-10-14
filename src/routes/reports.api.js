@@ -610,6 +610,138 @@ function _evaluateFormulasInSheet(sheet) {
   });
 }
 
+// ─── Report file cache + data revision ───────────────────────────────────────
+// Viewing a report regenerates the whole workbook + PDF every time (expensive:
+// N+1 aggregation, ExcelJS build, pdfkit render).  We cache the generated file
+// per batch+format and only serve it when the underlying data is unchanged, so
+// "view" stays byte-for-byte identical to a fresh build while skipping the work.
+//
+// Validity is decided by a data revision = the latest created_at/updated_at
+// across every report-feeding table, plus their total row count (so hard
+// deletes — none exist today — would still invalidate).  All report-feeding
+// tables soft-delete (bumping updated_at) or insert (bumping created_at), so
+// the revision changes on any insert, edit, or delete.
+const _reportRevisionTables = [
+  'guest_records',
+  'guest_record_rooms',
+  'guest_origin_breakdowns',
+  'attraction_visit_logs',
+  'businesses',
+  'tourist_attractions',
+  'rooms',
+];
+
+async function _reportDataRevision() {
+  let ts = 0;
+  let rows = 0;
+  for (const table of _reportRevisionTables) {
+    const [r] = await db.pool.query(
+      `SELECT MAX(created_at) AS c, MAX(updated_at) AS u, COUNT(*) AS n FROM \`${table}\``
+    );
+    const row = r[0] || {};
+    for (const v of [row.c, row.u]) {
+      if (v) {
+        const ms = new Date(v).getTime();
+        if (ms > ts) ts = ms;
+      }
+    }
+    rows += Number(row.n) || 0;
+  }
+  return { ts, rows };
+}
+
+function _sameRevision(a, b) {
+  return !!a && !!b && a.ts === b.ts && a.rows === b.rows;
+}
+
+function _revTag(rev) {
+  return `${rev.ts}:${rev.rows}`;
+}
+
+// Shared cache key used by the download route, _getOrGenerate and pre-generation
+// so a pre-generated file is actually found by a later view.
+function _cacheKey(batchId, format, w, h) {
+  return `${batchId}:${format}:${w == null ? '' : w}x${h == null ? '' : h}`;
+}
+
+const _REPORT_CACHE_MAX_ENTRIES = 20;
+const _REPORT_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+const _reportFileCache = new Map(); // key -> { buffer, revision, contentType, filename, bytes }
+let _reportCacheBytes = 0;
+const _reportInflight = new Map(); // `${key}@${revTag}` -> Promise<entry>
+
+function _cacheGet(key) {
+  const entry = _reportFileCache.get(key);
+  if (!entry) return null;
+  // Refresh LRU recency.
+  _reportFileCache.delete(key);
+  _reportFileCache.set(key, entry);
+  return entry;
+}
+
+function _cacheSet(key, entry) {
+  const prev = _reportFileCache.get(key);
+  if (prev) {
+    _reportCacheBytes -= prev.bytes;
+    _reportFileCache.delete(key);
+  }
+  _reportFileCache.set(key, entry);
+  _reportCacheBytes += entry.bytes;
+  while (
+    _reportFileCache.size > _REPORT_CACHE_MAX_ENTRIES ||
+    _reportCacheBytes > _REPORT_CACHE_MAX_BYTES
+  ) {
+    const oldestKey = _reportFileCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = _reportFileCache.get(oldestKey);
+    _reportCacheBytes -= oldest.bytes;
+    _reportFileCache.delete(oldestKey);
+  }
+}
+
+// Returns { buffer, contentType, filename, revision } — the cached entry if the
+// data is unchanged, otherwise builds once.  Builds are deduped per key+revision
+// so a request that arrives after a data change never joins an old-data build.
+// A build is cached only if the revision did not move during it; a failed build
+// is never cached.
+async function _getOrGenerate({ batchId, format, pageWidth, pageHeight, build }) {
+  const key = _cacheKey(batchId, format, pageWidth, pageHeight);
+  const rev = await _reportDataRevision();
+
+  const hit = _cacheGet(key);
+  if (hit && _sameRevision(hit.revision, rev)) return hit;
+
+  const flight = `${key}@${_revTag(rev)}`;
+  if (_reportInflight.has(flight)) return _reportInflight.get(flight);
+
+  const promise = (async () => {
+    const out = await build();
+    const post = await _reportDataRevision();
+    if (_sameRevision(post, rev)) {
+      const entry = { ...out, revision: rev, bytes: out.buffer.length };
+      _cacheSet(key, entry);
+      return entry;
+    }
+    return { ...out, revision: null, bytes: out.buffer.length };
+  })().finally(() => {
+    _reportInflight.delete(flight);
+  });
+
+  _reportInflight.set(flight, promise);
+  return promise;
+}
+
+// Serialized pre-generation queue (length-1) so a burst of batch creations does
+// not stack CPU-bound workbook/PDF builds.  Failures are logged, never cached.
+let _preGenChain = Promise.resolve();
+
+function _enqueuePreGen(task) {
+  _preGenChain = _preGenChain.then(task).catch((err) => {
+    console.error('[report] pregenerate failed:', err.message);
+  });
+  return _preGenChain;
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 // ── List report batches ─────────────────────────────────────────────────────
@@ -769,8 +901,23 @@ router.post('/reports', adminGuard, async (req, res, next) => {
        WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
       [reportType, effectiveVariant, parseInt(periodYear, 10), JSON.stringify(months)]
     );
-    const isExisting = rows[0].id !== newBatchId;
-    res.status(200).json({ batchId: rows[0].id, existing: isExisting });
+    const batchId = rows[0].id;
+    const isExisting = batchId !== newBatchId;
+    res.status(200).json({ batchId, existing: isExisting });
+
+    // Warm the file cache in the background so the first view is a cache hit.
+    // Serialized (length-1 queue) to avoid stacking CPU-bound builds; failures
+    // are logged only and never cached.
+    _enqueuePreGen(() => _getOrGenerate({
+      batchId,
+      format: 'pdf',
+      pageWidth: undefined,
+      pageHeight: undefined,
+      build: () => _generateReportFile({
+        reportType, variant: effectiveVariant, sortedMonths: months, year: parseInt(periodYear, 10),
+        format: 'pdf', pageWidth: undefined, pageHeight: undefined, batchId, userId: req.user.id,
+      }),
+    }));
   } catch (err) {
     next(err);
   }
@@ -1099,20 +1246,52 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
     const year = parseInt(periodYear, 10);
 
-    // Find-or-create batch (atomic: INSERT IGNORE + SELECT)
-    const newBatchId = uuidv4();
-    await db.pool.execute(
-      `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [newBatchId, reportType, effectiveVariant, year, JSON.stringify(sortedMonths), req.user.id]
-    );
-    const [dlRows] = await db.pool.execute(
-      `SELECT id FROM report_batches
-       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
-      [reportType, effectiveVariant, year, JSON.stringify(sortedMonths)]
-    );
-    const batchId = dlRows[0].id;
+    const batchId = await _resolveBatch({
+      reportType, variant: effectiveVariant, year, months: sortedMonths, userId: req.user.id,
+    });
 
+    const entry = await _getOrGenerate({
+      batchId, format, pageWidth, pageHeight,
+      build: () => _generateReportFile({
+        reportType, variant: effectiveVariant, sortedMonths, year,
+        format, pageWidth, pageHeight, batchId, userId: req.user.id,
+      }),
+    });
+
+    res.set('Content-Type', entry.contentType);
+    res.set('Content-Disposition', `attachment; filename="${entry.filename}"`);
+    res.send(entry.buffer);
+  } catch (err) {
+    console.error('Report download error:', err);
+    // Error must be sent BEFORE any binary headers are set
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err.message || 'Failed to generate report' });
+    }
+  }
+});
+
+// Resolve (find-or-create) the report_batches row for a download request.
+async function _resolveBatch({ reportType, variant, year, months, userId }) {
+  const newBatchId = uuidv4();
+  await db.pool.execute(
+    `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [newBatchId, reportType, variant, year, JSON.stringify(months), userId]
+  );
+  const [rows] = await db.pool.execute(
+    `SELECT id FROM report_batches
+     WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
+    [reportType, variant, year, JSON.stringify(months)]
+  );
+  return rows[0].id;
+}
+
+// Build the report file in memory and return { buffer, contentType, filename }.
+// Pure w.r.t. the HTTP layer so it can be driven by both the download route and
+// background pre-generation on batch creation.
+async function _generateReportFile({
+  reportType, variant, sortedMonths, year, format, pageWidth, pageHeight, batchId, userId,
+}) {
     // ── Aggregate (reuse same logic as /view) ─────────────────────────────────
     const [businesses] = await db.pool.execute(
       `SELECT id, business_name, business_line, ae_id, region, city_municipality, province,
@@ -1121,13 +1300,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
        FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY business_name`
     );
 
-    const [userRows] = await db.pool.execute('SELECT full_name FROM users WHERE id = ?', [req.user.id]);
+    const [userRows] = await db.pool.execute('SELECT full_name FROM users WHERE id = ?', [userId]);
     const adminName = userRows[0]?.full_name || 'System Admin';
 
     const daysInMonth = sortedMonths.length === 1 ? new Date(year, sortedMonths[0], 0).getDate() : 0;
-    const monthLabel = sortedMonths.length === 1
-      ? String(sortedMonths[0]).padStart(2, '0')
-      : sortedMonths.length === 12 ? 'FULL' : sortedMonths.join('-');
 
     // ── Build workbooks ───────────────────────────────────────────────────────
     const wb = new ExcelJS.Workbook();
@@ -1258,7 +1434,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       // ── DAE: Per-establishment worksheets ──────────────────────────────────
       for (const biz of businesses) {
         let bizAllMonths = null;
-        if (reportVariant === 'series' && sortedMonths.length > 1) {
+        if (variant === 'series' && sortedMonths.length > 1) {
           bizAllMonths = await Promise.all(
             sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
           );
@@ -1267,14 +1443,14 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
           bizAllMonths = [md];
         }
 
-        if (reportVariant === 'daily' && bizAllMonths?.[0]) {
+        if (variant === 'daily' && bizAllMonths?.[0]) {
           const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
           const tmpl = templateWb?.getWorksheet('Name of Establishment');
           const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
           _buildDailySheet(sheet, biz, bizAllMonths[0], sortedMonths[0], year, daysInMonth, adminName);
         }
 
-        if (reportVariant === 'summary' && bizAllMonths?.[0]) {
+        if (variant === 'summary' && bizAllMonths?.[0]) {
           const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
           const tmpl = templateWb?.getWorksheet('AE DAE-1B by Country (Sum) ');
           const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
@@ -1282,7 +1458,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
             daysInMonth, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
         }
 
-        if (reportVariant === 'series' && bizAllMonths && bizAllMonths.length > 1) {
+        if (variant === 'series' && bizAllMonths && bizAllMonths.length > 1) {
           const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
           const tmpl = templateWb?.getWorksheet('AE DAE-1B (Monthly)');
           const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
@@ -1308,7 +1484,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       if (ms.length === 1) return _abbr[ms[0]];
       return `${_abbr[ms[0]]}-${_abbr[ms[ms.length - 1]]}`;
     };
-    const baseFilename = `${reportType.toUpperCase()}_${reportVariant}_${_fmtPeriod(sortedMonths)}_${year}`;
+    const baseFilename = `${reportType.toUpperCase()}_${variant}_${_fmtPeriod(sortedMonths)}_${year}`;
 
     if (format === 'xlsx') {
       // Evaluate all formulas so the exported file carries cached results
@@ -1326,26 +1502,19 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         outBuffer = await _patchVar2ImageOffsets(outBuffer);
       }
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
-      res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.set('Content-Disposition', `attachment; filename="${baseFilename}.xlsx"`);
-      res.send(Buffer.from(outBuffer));
-    } else {
-      // Evaluate all formulas so the PDF renderer can read cached results
-      wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
-      const pdfBuffer = await _generatePdfBuffer(wb, effectiveVariant, sortedMonths[0], year, reportType, { pageWidth, pageHeight });
-      await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
-      res.set('Content-Type', 'application/pdf');
-      res.set('Content-Disposition', `attachment; filename="${baseFilename}.pdf"`);
-      res.send(pdfBuffer);
+      return {
+        buffer: Buffer.from(outBuffer),
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        filename: `${baseFilename}.xlsx`,
+      };
     }
-  } catch (err) {
-    console.error('Report download error:', err);
-    // Error must be sent BEFORE any binary headers are set
-    if (!res.headersSent) {
-      return res.status(500).json({ error: err.message || 'Failed to generate report' });
-    }
-  }
-});
+
+    // Evaluate all formulas so the PDF renderer can read cached results
+    wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
+    const pdfBuffer = await _generatePdfBuffer(wb, variant, sortedMonths[0], year, reportType, { pageWidth, pageHeight });
+    await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
+    return { buffer: pdfBuffer, contentType: 'application/pdf', filename: `${baseFilename}.pdf` };
+}
 
 // ─── Data Fetching (new schema: guest_records lead fields + guest_record_rooms) ─
 
