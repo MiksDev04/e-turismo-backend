@@ -109,7 +109,8 @@ function validateBusinessRegistration(body) {
   if (!ownerFirstName) return 'Owner first name is required.';
   if (!ownerLastName) return 'Owner last name is required.';
   if (!permitNumber) return 'Permit number is required.';
-  if (!registrationNumber) return 'Registration number is required.';
+  // HIDDEN: registration number not required
+  // if (!registrationNumber) return 'Registration number is required.';
   if (!aeId) return 'AE ID is required.';
   if (!street) return 'Street is required.';
   if (!barangay) return 'Barangay is required.';
