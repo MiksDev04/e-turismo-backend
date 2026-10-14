@@ -22,7 +22,7 @@ const distributionConfig = {
     malePct: 0.471,
     femalePct: 0.529,
   },
-};
+}; 
 
 // Order the origin categories are applied in (must sum to 1.0).
 export const kOriginCategories = ['thisCity', 'otherCity', 'otherProvince', 'foreign'];
