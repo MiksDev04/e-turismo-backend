@@ -155,23 +155,31 @@ router.get('/breakdowns', auth.authenticate, auth.requireRole('admin', 'business
 
     const placeholders = idsArray.map(() => '?').join(',');
     const [rows] = await connection.execute(
-      `SELECT id AS guest_record_id, lead_country AS country,
-              lead_province AS province,
-              lead_city_municipality AS city_municipality,
-              lead_sex AS sex,
-              lead_is_overseas AS is_overseas,
+      `SELECT gr.id AS guest_record_id, gr.lead_country AS country,
+              COALESCE(NULLIF(TRIM(gr.lead_province), ''),
+                (SELECT g.province FROM guest_origin_breakdowns g
+                  WHERE g.guest_record_id = gr.id AND g.deleted_at IS NULL
+                    AND g.province IS NOT NULL AND TRIM(g.province) <> ''
+                  LIMIT 1)) AS province,
+              COALESCE(NULLIF(TRIM(gr.lead_city_municipality), ''),
+                (SELECT g.city_municipality FROM guest_origin_breakdowns g
+                  WHERE g.guest_record_id = gr.id AND g.deleted_at IS NULL
+                    AND g.city_municipality IS NOT NULL AND TRIM(g.city_municipality) <> ''
+                  LIMIT 1)) AS city_municipality,
+              gr.lead_sex AS sex,
+              gr.lead_is_overseas AS is_overseas,
               CASE
-                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
-                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 17 THEN '10-17'
-                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 25 THEN '18-25'
-                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 35 THEN '26-35'
-                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 45 THEN '36-45'
-                WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 55 THEN '46-55'
+                WHEN TIMESTAMPDIFF(YEAR, gr.lead_birthdate, gr.check_in) <= 9  THEN '0-9'
+                WHEN TIMESTAMPDIFF(YEAR, gr.lead_birthdate, gr.check_in) <= 17 THEN '10-17'
+                WHEN TIMESTAMPDIFF(YEAR, gr.lead_birthdate, gr.check_in) <= 25 THEN '18-25'
+                WHEN TIMESTAMPDIFF(YEAR, gr.lead_birthdate, gr.check_in) <= 35 THEN '26-35'
+                WHEN TIMESTAMPDIFF(YEAR, gr.lead_birthdate, gr.check_in) <= 45 THEN '36-45'
+                WHEN TIMESTAMPDIFF(YEAR, gr.lead_birthdate, gr.check_in) <= 55 THEN '46-55'
                 ELSE '56+'
               END AS age_group,
               1 AS count
-       FROM guest_records
-       WHERE id IN (${placeholders}) AND is_deleted = FALSE`,
+       FROM guest_records gr
+       WHERE gr.id IN (${placeholders}) AND gr.is_deleted = FALSE`,
       idsArray
     );
 
