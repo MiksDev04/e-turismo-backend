@@ -1292,6 +1292,15 @@ async function _resolveBatch({ reportType, variant, year, months, userId }) {
 async function _generateReportFile({
   reportType, variant, sortedMonths, year, format, pageWidth, pageHeight, batchId, userId,
 }) {
+    // ── Phase 0 timing (report-viewing-tasks.md T0.1) ─────────────────────────
+    const t0 = Date.now();
+    let _prev = t0;
+    const lap = (label) => {
+      const now = Date.now();
+      console.log(`[report-timing] ${label} total=${now - t0}ms delta=${now - _prev}ms businesses=${businesses.length} format=${format}`);
+      _prev = now;
+    };
+
     // ── Aggregate (reuse same logic as /view) ─────────────────────────────────
     const [businesses] = await db.pool.execute(
       `SELECT id, business_name, business_line, ae_id, region, city_municipality, province,
@@ -1468,6 +1477,8 @@ async function _generateReportFile({
       }
     }
 
+    lap('sheets built');
+
     _purgeOrphanedDefinedNames(wb);
     wb.eachSheet(ws => {
       if (ws.pageSetup) {
@@ -1490,6 +1501,7 @@ async function _generateReportFile({
       // Evaluate all formulas so the exported file carries cached results
       // (viewers that don't recalculate show 0 in totals/subtotals otherwise).
       wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
+      lap('formulas');
       wb.calcProperties.fullCalcOnLoad = true;
       const buffer = await wb.xlsx.writeBuffer();
       const fontXml = reportType === 'var2' ? defaultFontXml.var
@@ -1502,6 +1514,7 @@ async function _generateReportFile({
         outBuffer = await _patchVar2ImageOffsets(outBuffer);
       }
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
+      lap('file written');
       return {
         buffer: Buffer.from(outBuffer),
         contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -1511,8 +1524,10 @@ async function _generateReportFile({
 
     // Evaluate all formulas so the PDF renderer can read cached results
     wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
+    lap('formulas');
     const pdfBuffer = await _generatePdfBuffer(wb, variant, sortedMonths[0], year, reportType, { pageWidth, pageHeight });
     await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
+    lap('file written');
     return { buffer: pdfBuffer, contentType: 'application/pdf', filename: `${baseFilename}.pdf` };
 }
 
