@@ -9,12 +9,14 @@ import adminSetupRoutes from './routes/admin_setup.api.js';
 import loginRoutes from './routes/login.api.js';
 import profileRoutes from './routes/profile.api.js';
 import accommodationRoutes from './routes/accommodation.api.js';
+import attractionRoutes from './routes/attractions.api.js';
 import guestEntryRoutes from './routes/guest_entry.api.js';
 import guestRecordsRoutes from './routes/guest_records.api.js';
 import roomRoutes from './routes/rooms.api.js';
 import dashboardRoutes from './routes/dashboard.api.js';
+import visitEntryRoutes from './routes/visit_entry.api.js';
+import visitRecordRoutes from './routes/visit_record.api.js';
 import messageRoutes from './routes/messages.api.js';
-import complianceRoutes from './routes/compliance.api.js';
 import reportRoutes from './routes/reports.api.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,6 +29,7 @@ app.use(cors({
   origin: function (origin, callback) {
     const allowed = [
       'https://e-turismo.netlify.app',
+      'https://tourism-appv1.netlify.app',
       'http://localhost:3000',
     ];
     if (!origin || allowed.includes(origin) || /^http:\/\/localhost:\d+$/.test(origin)) {
@@ -60,12 +63,14 @@ app.use('/api/auth', adminSetupRoutes);
 app.use('/api/auth', loginRoutes);
 app.use('/api', profileRoutes);
 app.use('/api/admin/accommodations', accommodationRoutes);
-app.use('/api/admin/compliance', complianceRoutes);
+app.use('/api/admin/attractions', attractionRoutes);
 app.use('/api/admin', reportRoutes);
 app.use('/api/business', guestEntryRoutes);
 app.use('/api/business', guestRecordsRoutes);
 app.use('/api/business', roomRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/attraction/visit-entry', visitEntryRoutes);
+app.use('/api/attraction', visitRecordRoutes);
 app.use('/api/messages', messageRoutes);
 
 // ── Error handler (must be last) ──────────────────────────────

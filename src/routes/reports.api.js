@@ -3,11 +3,12 @@ import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import PDFDocument from 'pdfkit';
 import { promises as fsp } from 'fs';
-import db from '../config/db.js';
+import db, { queryWithRetry } from '../config/db.js';
 import auth from '../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import distributionConfig, { kOriginPct, kOriginCategories } from '../config/distributionConfig.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -31,7 +32,7 @@ async function _readTemplateDefaultFont(filePath) {
 }
 
 // ─── Load template workbook for styled Excel exports ─────────────────────────
-const defaultFontXml = { var: null, dae: null };
+const defaultFontXml = { var: null, dae: null, attraction: null };
 
 let templateWb = null;
 try {
@@ -55,14 +56,202 @@ try {
   varTemplateWb = null;
 }
 
-// ─── Load the tourism office logo for the VAR header ─────────────────────────
-let varLogoBuffer = null;
-try {
-  varLogoBuffer = await fsp.readFile(path.join(__dirname, '..', '..', 'sample', 'tourism_office_logo.jpg'));
-  console.log('[report] VAR logo loaded');
-} catch (err) {
-  console.warn('[report] VAR logo not found, VAR exports will have no logo:', err.message);
+// ─── VAR 2 template images (top logo + footer graphic) ────────────────────────
+// The new VAR-REPORT.xlsx blank carries its own artwork (a header logo spanning
+// rows 2-7 and a footer graphic at rows 67-69).  The clone strips images, so
+// exports must restore the template's own media at its original two-cell anchors
+// (parsed from drawing1.xml) rather than re-injecting a separate logo file.
+const varTemplateImages = [];
+
+async function _loadVarTemplateImages() {
+  try {
+    const filePath = path.join(__dirname, '..', '..', 'sample', 'VAR-REPORT.xlsx');
+    const zip = await JSZip.loadAsync(await fsp.readFile(filePath));
+
+    const drawingXml = await zip.file('xl/drawings/drawing1.xml').async('string');
+    const relsXml = await zip.file('xl/drawings/_rels/drawing1.xml.rels').async('string');
+
+    // Map r:embed rIds (rIdN) → media target file (../media/imageX.png).
+    const relMap = {};
+    for (const m of relsXml.matchAll(/Id="(rId\d+)"[^>]*Target="\.\.\/([^"]+)"/g)) {
+      relMap[m[1]] = m[2];
+    }
+
+    // Shorthand: each anchor's text content as embed id + anchor corners.
+    const getText = (block, tag, nth) => {
+      const all = [...block.matchAll(new RegExp(`<xdr:${tag}>\\s*(\\d+)\\s*</xdr:${tag}>`, 'g'))];
+      const m = all[nth];
+      return m ? parseInt(m[1], 10) : 0;
+    };
+
+    const anchorBlocks = drawingXml
+      .split(/<xdr:twoCellAnchor>|<xdr:oneCellAnchor>/)
+      .slice(1)
+      .filter(b => /r:embed="/.test(b));
+
+    const images = [];
+    for (const block of anchorBlocks) {
+      const embedMatch = block.match(/r:embed="([^"]+)"/);
+      if (!embedMatch) continue;
+      const rel = relMap[embedMatch[1]];
+      if (!rel) continue;
+
+      let mediaName = rel;
+      if (!mediaName.startsWith('xl/')) mediaName = 'xl/media/' + mediaName.split('/').pop();
+
+      const media = zip.file(mediaName);
+      if (!media) continue;
+      const buffer = await media.async('nodebuffer');
+      const extension = mediaName.split('.').pop().toLowerCase();
+
+      images.push({
+        buffer,
+        extension,
+        tl: {
+          col: getText(block, 'col', 0),
+          colOff: getText(block, 'colOff', 0),
+          row: getText(block, 'row', 0),
+          rowOff: getText(block, 'rowOff', 0),
+        },
+        br: {
+          col: getText(block, 'col', 1),
+          colOff: getText(block, 'colOff', 1),
+          row: getText(block, 'row', 1),
+          rowOff: getText(block, 'rowOff', 1),
+        },
+      });
+    }
+
+    if (images.length === 0) return;
+
+    // Sort by start row so [0] = top (logo) and [last] = bottom (footer graphic).
+    images.sort((a, b) => a.tl.row - b.tl.row);
+    for (const img of images) varTemplateImages.push(img);
+    console.log(`[report] VAR 2 template images loaded (${varTemplateImages.length})`);
+  } catch (err) {
+    console.warn('[report] VAR 2 template images not found:', err.message);
+  }
 }
+
+await _loadVarTemplateImages();
+
+// ─── VAR 1 (Tourist Attraction) template ─────────────────────────────────────
+let attractionTemplateWb = null;
+try {
+  attractionTemplateWb = new ExcelJS.Workbook();
+  await attractionTemplateWb.xlsx.readFile(path.join(__dirname, '..', '..', 'sample', 'same day blank.xlsx'));
+  defaultFontXml.attraction = await _readTemplateDefaultFont(path.join(__dirname, '..', '..', 'sample', 'same day blank.xlsx'));
+  console.log('[report] VAR 1 (Attraction) Template loaded successfully');
+} catch (err) {
+  console.warn('[report] VAR 1 Template not found, attraction exports will be unformatted:', err.message);
+  attractionTemplateWb = null;
+}
+
+// ─── VAR 1 template images (top logo + footer graphic) ───────────────────────
+// The blank already carries its own artwork, so exports must reproduce it
+// rather than re-injecting a separate logo.  The anchors (twoCell) are parsed
+// from the template's drawing XML; the media bytes come from the canonical
+// sample files (tourism office logo on top, QR graphic at the bottom) so both
+// the Excel and PDF exports render the official artwork at the exact spots
+// where the blank template places its images.
+const attractionTemplateImages = [];
+
+// Two-cell anchor offsets lifted from "same day blank.xlsx" drawing1.xml.
+// ExcelJS zeroes out colOff/rowOff when it serializes image anchors, so the
+// exported drawing XML must be patched back to these exact EMU offsets to put
+// the logo + QR on the same spot as the blank template.
+const kVar1ImageAnchors = [
+  {
+    name: 'logo',
+    fromCol: 2, fromRow: 2, toCol: 4, toRow: 6,
+    fromColOff: 470148, fromRowOff: 149413,
+    toColOff: 562783, toRowOff: 186853,
+  },
+  {
+    name: 'qr',
+    fromCol: 1, fromRow: 61, toCol: 5, toRow: 63,
+    fromColOff: 449482, fromRowOff: 237814,
+    toColOff: 90894, toRowOff: 255295,
+  },
+];
+
+// VAR 2 image anchors lifted from the new "VAR-REPORT.xlsx" drawing1.xml —
+// a header logo (rows 2-7) and a footer graphic (rows 67-69).  Same rationale
+// as kVar1ImageAnchors: ExcelJS zeroes colOff/rowOff, so the exported drawing
+// XML must be patched back to these exact EMU offsets.
+const kVar2ImageAnchors = [
+  {
+    name: 'logo',
+    fromCol: 1, fromRow: 2, toCol: 2, toRow: 7,
+    fromColOff: 2106705, fromRowOff: 100853,
+    toColOff: 669737, toRowOff: 11667,
+  },
+  {
+    name: 'footer',
+    fromCol: 1, fromRow: 67, toCol: 1, toRow: 69,
+    fromColOff: 68035, fromRowOff: 244929,
+    toColOff: 2009054, toRowOff: 262410,
+  },
+];
+
+async function _loadAttractionTemplateImages() {
+  try {
+    const filePath = path.join(__dirname, '..', '..', 'sample', 'same day blank.xlsx');
+    const zip = await JSZip.loadAsync(await fsp.readFile(filePath));
+
+    const drawingXml = await zip.file('xl/drawings/drawing1.xml').async('string');
+
+    // Split the drawing XML into per-anchor blocks, keeping only the ones that
+    // actually embed a picture.
+    const anchorBlocks = drawingXml
+      .split(/<xdr:twoCellAnchor>|<xdr:oneCellAnchor>/)
+      .slice(1)
+      .filter(block => /r:embed="/.test(block));
+
+    // Parse each block's two-cell anchor (top-left + bottom-right corners).
+    const anchors = anchorBlocks.map(block => {
+      const getVal = (tag, nth) => {
+        const all = [...block.matchAll(new RegExp(`<xdr:${tag}>\\s*(\\d+)\\s*</xdr:${tag}>`, 'g'))];
+        const m = all[nth];
+        return m ? parseInt(m[1], 10) : 0;
+      };
+      const getOff = (tag, nth) => {
+        const all = [...block.matchAll(new RegExp(`<xdr:${tag}>\\s*(\\d+)\\s*</xdr:${tag}>`, 'g'))];
+        const m = all[nth];
+        return m ? parseInt(m[1], 10) : 0;
+      };
+      return {
+        tl: { col: getVal('col', 0), colOff: getOff('colOff', 0), row: getVal('row', 0), rowOff: getOff('rowOff', 0) },
+        br: { col: getVal('col', 1), colOff: getOff('colOff', 1), row: getVal('row', 1), rowOff: getOff('rowOff', 1) },
+      };
+    });
+
+    if (anchors.length === 0) return;
+
+    // Sort by starting row so [0] = top (logo) and [last] = bottom (QR).
+    anchors.sort((a, b) => a.tl.row - b.tl.row);
+    const logo = anchors[0];
+    const qr = anchors[anchors.length - 1];
+
+    const logoPath = path.join(__dirname, '..', '..', 'sample', 'tourism_office_logo.jpg');
+    const qrPath = path.join(__dirname, '..', '..', 'sample', 'qr-pic.png');
+
+    const [logoBuffer, qrBuffer] = await Promise.all([
+      fsp.readFile(logoPath),
+      fsp.readFile(qrPath),
+    ]);
+
+    attractionTemplateImages.push(
+      { buffer: logoBuffer, extension: 'jpeg', tl: logo.tl, br: logo.br },
+      { buffer: qrBuffer, extension: 'png', tl: qr.tl, br: qr.br },
+    );
+    console.log(`[report] VAR 1 template images loaded (${attractionTemplateImages.length})`);
+  } catch (err) {
+    console.warn('[report] VAR 1 template images not found:', err.message);
+  }
+}
+
+await _loadAttractionTemplateImages();
 
 // ─── Country / Region Definitions ────────────────────────────────────────────
 const kCountryRows = [
@@ -421,6 +610,138 @@ function _evaluateFormulasInSheet(sheet) {
   });
 }
 
+// ─── Report file cache + data revision ───────────────────────────────────────
+// Viewing a report regenerates the whole workbook + PDF every time (expensive:
+// N+1 aggregation, ExcelJS build, pdfkit render).  We cache the generated file
+// per batch+format and only serve it when the underlying data is unchanged, so
+// "view" stays byte-for-byte identical to a fresh build while skipping the work.
+//
+// Validity is decided by a data revision = the latest created_at/updated_at
+// across every report-feeding table, plus their total row count (so hard
+// deletes — none exist today — would still invalidate).  All report-feeding
+// tables soft-delete (bumping updated_at) or insert (bumping created_at), so
+// the revision changes on any insert, edit, or delete.
+const _reportRevisionTables = [
+  'guest_records',
+  'guest_record_rooms',
+  'guest_origin_breakdowns',
+  'attraction_visit_logs',
+  'businesses',
+  'tourist_attractions',
+  'rooms',
+];
+
+async function _reportDataRevision() {
+  let ts = 0;
+  let rows = 0;
+  for (const table of _reportRevisionTables) {
+    const [r] = await db.pool.query(
+      `SELECT MAX(created_at) AS c, MAX(updated_at) AS u, COUNT(*) AS n FROM \`${table}\``
+    );
+    const row = r[0] || {};
+    for (const v of [row.c, row.u]) {
+      if (v) {
+        const ms = new Date(v).getTime();
+        if (ms > ts) ts = ms;
+      }
+    }
+    rows += Number(row.n) || 0;
+  }
+  return { ts, rows };
+}
+
+function _sameRevision(a, b) {
+  return !!a && !!b && a.ts === b.ts && a.rows === b.rows;
+}
+
+function _revTag(rev) {
+  return `${rev.ts}:${rev.rows}`;
+}
+
+// Shared cache key used by the download route, _getOrGenerate and pre-generation
+// so a pre-generated file is actually found by a later view.
+function _cacheKey(batchId, format, w, h) {
+  return `${batchId}:${format}:${w == null ? '' : w}x${h == null ? '' : h}`;
+}
+
+const _REPORT_CACHE_MAX_ENTRIES = 20;
+const _REPORT_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+const _reportFileCache = new Map(); // key -> { buffer, revision, contentType, filename, bytes }
+let _reportCacheBytes = 0;
+const _reportInflight = new Map(); // `${key}@${revTag}` -> Promise<entry>
+
+function _cacheGet(key) {
+  const entry = _reportFileCache.get(key);
+  if (!entry) return null;
+  // Refresh LRU recency.
+  _reportFileCache.delete(key);
+  _reportFileCache.set(key, entry);
+  return entry;
+}
+
+function _cacheSet(key, entry) {
+  const prev = _reportFileCache.get(key);
+  if (prev) {
+    _reportCacheBytes -= prev.bytes;
+    _reportFileCache.delete(key);
+  }
+  _reportFileCache.set(key, entry);
+  _reportCacheBytes += entry.bytes;
+  while (
+    _reportFileCache.size > _REPORT_CACHE_MAX_ENTRIES ||
+    _reportCacheBytes > _REPORT_CACHE_MAX_BYTES
+  ) {
+    const oldestKey = _reportFileCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = _reportFileCache.get(oldestKey);
+    _reportCacheBytes -= oldest.bytes;
+    _reportFileCache.delete(oldestKey);
+  }
+}
+
+// Returns { buffer, contentType, filename, revision } — the cached entry if the
+// data is unchanged, otherwise builds once.  Builds are deduped per key+revision
+// so a request that arrives after a data change never joins an old-data build.
+// A build is cached only if the revision did not move during it; a failed build
+// is never cached.
+async function _getOrGenerate({ batchId, format, pageWidth, pageHeight, build }) {
+  const key = _cacheKey(batchId, format, pageWidth, pageHeight);
+  const rev = await _reportDataRevision();
+
+  const hit = _cacheGet(key);
+  if (hit && _sameRevision(hit.revision, rev)) return hit;
+
+  const flight = `${key}@${_revTag(rev)}`;
+  if (_reportInflight.has(flight)) return _reportInflight.get(flight);
+
+  const promise = (async () => {
+    const out = await build();
+    const post = await _reportDataRevision();
+    if (_sameRevision(post, rev)) {
+      const entry = { ...out, revision: rev, bytes: out.buffer.length };
+      _cacheSet(key, entry);
+      return entry;
+    }
+    return { ...out, revision: null, bytes: out.buffer.length };
+  })().finally(() => {
+    _reportInflight.delete(flight);
+  });
+
+  _reportInflight.set(flight, promise);
+  return promise;
+}
+
+// Serialized pre-generation queue (length-1) so a burst of batch creations does
+// not stack CPU-bound workbook/PDF builds.  Failures are logged, never cached.
+let _preGenChain = Promise.resolve();
+
+function _enqueuePreGen(task) {
+  _preGenChain = _preGenChain.then(task).catch((err) => {
+    console.error('[report] pregenerate failed:', err.message);
+  });
+  return _preGenChain;
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 // ── List report batches ─────────────────────────────────────────────────────
@@ -535,21 +856,25 @@ router.post('/reports', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.body;
 
-    if (!['dae', 'var'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
+    if (!['dae', 'var1', 'var2'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var1", or "var2"' });
     }
 
     if (reportType === 'dae') {
       if (!reportVariant || !['daily', 'summary', 'series'].includes(reportVariant)) {
         return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series" (DAE)' });
       }
-    } else {
+    } else if (reportType === 'var2') {
       if (reportVariant && reportVariant !== 'total') {
-        return res.status(400).json({ message: 'VAR reportVariant must be "total"' });
+        return res.status(400).json({ message: 'VAR 2 reportVariant must be "total"' });
+      }
+    } else {
+      if (reportVariant && reportVariant !== 'daily') {
+        return res.status(400).json({ message: 'VAR 1 reportVariant must be "daily"' });
       }
     }
 
-    const effectiveVariant = reportType === 'var' ? 'total' : reportVariant;
+    const effectiveVariant = reportType === 'var2' ? 'total' : reportType === 'var1' ? 'daily' : reportVariant;
 
     if (!periodYear || parseInt(periodYear, 10) < 2000) {
       return res.status(400).json({ message: 'periodYear must be >= 2000' });
@@ -576,8 +901,23 @@ router.post('/reports', adminGuard, async (req, res, next) => {
        WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
       [reportType, effectiveVariant, parseInt(periodYear, 10), JSON.stringify(months)]
     );
-    const isExisting = rows[0].id !== newBatchId;
-    res.status(200).json({ batchId: rows[0].id, existing: isExisting });
+    const batchId = rows[0].id;
+    const isExisting = batchId !== newBatchId;
+    res.status(200).json({ batchId, existing: isExisting });
+
+    // Warm the file cache in the background so the first view is a cache hit.
+    // Serialized (length-1 queue) to avoid stacking CPU-bound builds; failures
+    // are logged only and never cached.
+    _enqueuePreGen(() => _getOrGenerate({
+      batchId,
+      format: 'pdf',
+      pageWidth: undefined,
+      pageHeight: undefined,
+      build: () => _generateReportFile({
+        reportType, variant: effectiveVariant, sortedMonths: months, year: parseInt(periodYear, 10),
+        format: 'pdf', pageWidth: undefined, pageHeight: undefined, batchId, userId: req.user.id,
+      }),
+    }));
   } catch (err) {
     next(err);
   }
@@ -588,8 +928,8 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths } = req.query;
 
-    if (!['dae', 'var'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
+    if (!['dae', 'var1', 'var2'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var1", or "var2"' });
     }
 
     let effectiveVariant;
@@ -598,8 +938,10 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
         return res.status(400).json({ message: 'reportVariant is required (daily|summary|series)' });
       }
       effectiveVariant = reportVariant;
-    } else {
+    } else if (reportType === 'var2') {
       effectiveVariant = 'total';
+    } else {
+      effectiveVariant = 'daily';
     }
 
     if (!periodYear) {
@@ -648,13 +990,19 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
     const establishments = [];
     const allMonthData = [];
 
-    if (reportType === 'var') {
-      // VAR: fetch per-establishment sex × residence aggregates
+    if (reportType === 'var2') {
+      // VAR 2: combined tourist-attraction + accommodation aggregate, one row each.
+      // Fetch per-establishment sex × residence aggregates, then append one row
+      // per approved tourist attraction using its month totals.
       let totalsVar = {
         maleThisCity: 0, femaleThisCity: 0,
         maleOtherCity: 0, femaleOtherCity: 0,
         maleOtherProvince: 0, femaleOtherProvince: 0,
         maleForeign: 0, femaleForeign: 0,
+      };
+
+      const accumulate = (vd) => {
+        for (const k of Object.keys(totalsVar)) totalsVar[k] += vd[k] || 0;
       };
 
       for (const biz of businesses) {
@@ -669,10 +1017,10 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
           maleForeign: 0, femaleForeign: 0,
         };
         for (const vd of varDataList) {
-          for (const k of Object.keys(vd)) varData[k] += vd[k];
+          for (const k of Object.keys(varData)) varData[k] += vd[k];
         }
 
-        for (const k of Object.keys(varData)) totalsVar[k] += varData[k];
+        accumulate(varData);
 
         establishments.push({
           businessId: biz.id,
@@ -691,10 +1039,116 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
         });
       }
 
+      // Append approved tourist attractions as one row per attraction.
+      const [attractions] = await db.pool.execute(
+        `SELECT id, attraction_name, attraction_type, barangay
+         FROM tourist_attractions
+         WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
+      );
+
+      for (const att of attractions) {
+        const attDataList = await Promise.all(
+          sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
+        );
+        const varData = {
+          maleThisCity: 0, femaleThisCity: 0,
+          maleOtherCity: 0, femaleOtherCity: 0,
+          maleOtherProvince: 0, femaleOtherProvince: 0,
+          maleForeign: 0, femaleForeign: 0,
+        };
+        const attractionEstimation = _emptyEstimation();
+        for (const ad of attDataList) {
+          for (const k of Object.keys(varData)) varData[k] += ad.totals[k] || 0;
+          attractionEstimation.originEstimated.count += ad.estimation.originEstimated.count;
+          for (const cat of kOriginCategories) {
+            attractionEstimation.originEstimated.byCategory[cat] += ad.estimation.originEstimated.byCategory[cat] || 0;
+          }
+          attractionEstimation.genderEstimated.count += ad.estimation.genderEstimated.count;
+          attractionEstimation.genderEstimated.male += ad.estimation.genderEstimated.male;
+          attractionEstimation.genderEstimated.female += ad.estimation.genderEstimated.female;
+        }
+
+        accumulate(varData);
+
+        establishments.push({
+          businessId: String(att.id),
+          businessName: att.attraction_name,
+          totalRooms: 0,
+          aeId: null,
+          region: null,
+          cityMunicipality: 'San Pablo City',
+          province: 'Laguna',
+          businessLine: [],
+          attractionType: typeof att.attraction_type === 'string'
+            ? JSON.parse(att.attraction_type || '[]')
+            : (att.attraction_type || []),
+          barangay: att.barangay,
+          monthData: null,
+          seriesData: null,
+          varData,
+          attractionEstimation,
+        });
+      }
+
       res.json({
         batch: { id: batchId, reportType, reportVariant: effectiveVariant, periodYear: year, periodMonths: sortedMonths },
         establishments,
         totals: totalsVar,
+      });
+    } else if (reportType === 'var1') {
+      // VAR 1: one daily sex × residence grid per approved tourist attraction
+      const [attractions] = await db.pool.execute(
+        `SELECT id, attraction_name, attraction_type, barangay
+         FROM tourist_attractions
+         WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
+      );
+
+      const totalsVar = {
+        maleThisCity: 0, femaleThisCity: 0,
+        maleOtherCity: 0, femaleOtherCity: 0,
+        maleOtherProvince: 0, femaleOtherProvince: 0,
+        maleForeign: 0, femaleForeign: 0,
+      };
+      const totalEstimation = _emptyEstimation();
+      const establishments = [];
+
+      for (const att of attractions) {
+        const md = await _fetchAttractionMonthData(att.id, sortedMonths[0], year);
+        establishments.push({
+          businessId: String(att.id),
+          businessName: att.attraction_name,
+          totalRooms: 0,
+          aeId: null,
+          region: null,
+          cityMunicipality: 'San Pablo City',
+          province: 'Laguna',
+          businessLine: [],
+          attractionType: typeof att.attraction_type === 'string'
+            ? JSON.parse(att.attraction_type || '[]')
+            : (att.attraction_type || []),
+          barangay: att.barangay,
+          monthData: null,
+          seriesData: null,
+          varData: null,
+          attractionDaily: md.daily,
+          attractionTotals: md.totals,
+          attractionEstimation: md.estimation,
+        });
+        for (const k of Object.keys(md.totals)) totalsVar[k] += md.totals[k];
+        totalEstimation.originEstimated.count += md.estimation.originEstimated.count;
+        for (const cat of kOriginCategories) {
+          totalEstimation.originEstimated.byCategory[cat] += md.estimation.originEstimated.byCategory[cat] || 0;
+        }
+        totalEstimation.genderEstimated.count += md.estimation.genderEstimated.count;
+        totalEstimation.genderEstimated.male += md.estimation.genderEstimated.male;
+        totalEstimation.genderEstimated.female += md.estimation.genderEstimated.female;
+      }
+
+      res.json({
+        batch: { id: batchId, reportType, reportVariant: effectiveVariant, periodYear: year, periodMonths: sortedMonths },
+        establishments,
+        totals: totalsVar,
+        estimation: totalEstimation,
       });
     } else {
       // DAE: existing logic
@@ -749,8 +1203,8 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
   try {
     const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx', pageWidth, pageHeight } = req.body;
 
-    if (!['dae', 'var'].includes(reportType)) {
-      return res.status(400).json({ message: 'reportType must be "dae" or "var"' });
+    if (!['dae', 'var1', 'var2'].includes(reportType)) {
+      return res.status(400).json({ message: 'reportType must be "dae", "var1", or "var2"' });
     }
 
     let effectiveVariant;
@@ -759,8 +1213,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         return res.status(400).json({ message: 'reportVariant must be "daily", "summary", or "series"' });
       }
       effectiveVariant = reportVariant;
-    } else {
+    } else if (reportType === 'var2') {
       effectiveVariant = 'total';
+    } else {
+      effectiveVariant = 'daily';
     }
 
     if (!periodYear) {
@@ -790,20 +1246,52 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
     const year = parseInt(periodYear, 10);
 
-    // Find-or-create batch (atomic: INSERT IGNORE + SELECT)
-    const newBatchId = uuidv4();
-    await db.pool.execute(
-      `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [newBatchId, reportType, effectiveVariant, year, JSON.stringify(sortedMonths), req.user.id]
-    );
-    const [dlRows] = await db.pool.execute(
-      `SELECT id FROM report_batches
-       WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
-      [reportType, effectiveVariant, year, JSON.stringify(sortedMonths)]
-    );
-    const batchId = dlRows[0].id;
+    const batchId = await _resolveBatch({
+      reportType, variant: effectiveVariant, year, months: sortedMonths, userId: req.user.id,
+    });
 
+    const entry = await _getOrGenerate({
+      batchId, format, pageWidth, pageHeight,
+      build: () => _generateReportFile({
+        reportType, variant: effectiveVariant, sortedMonths, year,
+        format, pageWidth, pageHeight, batchId, userId: req.user.id,
+      }),
+    });
+
+    res.set('Content-Type', entry.contentType);
+    res.set('Content-Disposition', `attachment; filename="${entry.filename}"`);
+    res.send(entry.buffer);
+  } catch (err) {
+    console.error('Report download error:', err);
+    // Error must be sent BEFORE any binary headers are set
+    if (!res.headersSent) {
+      return res.status(500).json({ error: err.message || 'Failed to generate report' });
+    }
+  }
+});
+
+// Resolve (find-or-create) the report_batches row for a download request.
+async function _resolveBatch({ reportType, variant, year, months, userId }) {
+  const newBatchId = uuidv4();
+  await db.pool.execute(
+    `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [newBatchId, reportType, variant, year, JSON.stringify(months), userId]
+  );
+  const [rows] = await db.pool.execute(
+    `SELECT id FROM report_batches
+     WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
+    [reportType, variant, year, JSON.stringify(months)]
+  );
+  return rows[0].id;
+}
+
+// Build the report file in memory and return { buffer, contentType, filename }.
+// Pure w.r.t. the HTTP layer so it can be driven by both the download route and
+// background pre-generation on batch creation.
+async function _generateReportFile({
+  reportType, variant, sortedMonths, year, format, pageWidth, pageHeight, batchId, userId,
+}) {
     // ── Aggregate (reuse same logic as /view) ─────────────────────────────────
     const [businesses] = await db.pool.execute(
       `SELECT id, business_name, business_line, ae_id, region, city_municipality, province,
@@ -812,19 +1300,16 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
        FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY business_name`
     );
 
-    const [userRows] = await db.pool.execute('SELECT full_name FROM users WHERE id = ?', [req.user.id]);
+    const [userRows] = await db.pool.execute('SELECT full_name FROM users WHERE id = ?', [userId]);
     const adminName = userRows[0]?.full_name || 'System Admin';
 
     const daysInMonth = sortedMonths.length === 1 ? new Date(year, sortedMonths[0], 0).getDate() : 0;
-    const monthLabel = sortedMonths.length === 1
-      ? String(sortedMonths[0]).padStart(2, '0')
-      : sortedMonths.length === 12 ? 'FULL' : sortedMonths.join('-');
 
     // ── Build workbooks ───────────────────────────────────────────────────────
     const wb = new ExcelJS.Workbook();
 
-    if (reportType === 'var') {
-      // ── VAR: Single worksheet with all establishments ──────────────────────
+    if (reportType === 'var2') {
+      // ── VAR 2: Single worksheet with all accommodations + attractions ─────
       const varTmpl = varTemplateWb?.getWorksheet('VAR 2M LGU Month Report');
       const sheetName = 'VAR Report';
       const sheet = varTmpl
@@ -832,6 +1317,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         : wb.addWorksheet(sheetName);
 
       // Fetch var data for each business across all requested months
+      const varRows = [];
       const varDataList = [];
       for (const biz of businesses) {
         const monthlyData = await Promise.all(
@@ -847,29 +1333,108 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
         for (const md of monthlyData) {
           for (const k of Object.keys(aggregated)) aggregated[k] += md[k] || 0;
         }
+        varRows.push({
+          business_name: biz.business_name,
+          city_municipality: biz.city_municipality,
+          attrCode: '9-902',
+        });
         varDataList.push(aggregated);
       }
 
-      _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year);
+      // Append approved tourist attractions as one row each (attr code 1-103)
+      const [attractions] = await db.pool.execute(
+        `SELECT id, attraction_name
+         FROM tourist_attractions
+         WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
+      );
 
-      // Embed the tourism office logo in the header (mirrors the template's
-      // B1 anchor spanning rows 1-4).
-      if (varLogoBuffer) {
+      const sheetEstimation = _emptyEstimation();
+
+      for (const att of attractions) {
+        const monthlyData = await Promise.all(
+          sortedMonths.map(m => _fetchAttractionMonthData(att.id, m, year))
+        );
+        const aggregated = {
+          maleThisCity: 0, femaleThisCity: 0,
+          maleOtherCity: 0, femaleOtherCity: 0,
+          maleOtherProvince: 0, femaleOtherProvince: 0,
+          maleForeign: 0, femaleForeign: 0,
+        };
+        for (const md of monthlyData) {
+          for (const k of Object.keys(aggregated)) aggregated[k] += md.totals[k] || 0;
+          sheetEstimation.originEstimated.count += md.estimation.originEstimated.count;
+          for (const cat of kOriginCategories) {
+            sheetEstimation.originEstimated.byCategory[cat] += md.estimation.originEstimated.byCategory[cat] || 0;
+          }
+          sheetEstimation.genderEstimated.count += md.estimation.genderEstimated.count;
+          sheetEstimation.genderEstimated.male += md.estimation.genderEstimated.male;
+          sheetEstimation.genderEstimated.female += md.estimation.genderEstimated.female;
+        }
+        varRows.push({
+          business_name: att.attraction_name,
+          city_municipality: 'San Pablo City',
+          attrCode: '1-103',
+        });
+        varDataList.push(aggregated);
+      }
+
+      if (varRows.length > kVarTotalRow - kVarDataRowStart) {
+        console.warn(`[report] VAR 2 combined rows (${varRows.length}) exceed the template's data rows (${kVarTotalRow - kVarDataRowStart}); trailing rows will be dropped.`);
+      }
+
+      _buildVarExcelSheet(sheet, varRows, varDataList, sortedMonths, year, sheetEstimation);
+
+      // Restore the template's own artwork (top logo + footer graphic) into the
+      // cloned sheet — the clone strips images, so they must be re-added with
+      // their original two-cell anchors.
+      for (const img of varTemplateImages) {
         try {
-          const logoId = wb.addImage({ buffer: varLogoBuffer, extension: 'jpeg' });
-          sheet.addImage(logoId, {
-            tl: { nativeCol: 1, nativeColOff: 1038225, nativeRow: 0, nativeRowOff: 57150 },
-            ext: { width: 64, height: 64 },
-          });
+          const imageId = wb.addImage({ buffer: img.buffer, extension: img.extension });
+          sheet.addImage(imageId, { tl: img.tl, br: img.br });
         } catch (err) {
-          console.warn('[report] Could not embed VAR logo:', err.message);
+          console.warn('[report] Could not restore VAR 2 template image:', err.message);
+        }
+      }
+    } else if (reportType === 'var1') {
+      // ── VAR 1: Per-attraction worksheets (daily sex × residence grid) ──────
+      const [attractions] = await db.pool.execute(
+        `SELECT id, attraction_name, attraction_type
+         FROM tourist_attractions
+         WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY attraction_name`
+      );
+
+      const attractionTmpl = attractionTemplateWb?.getWorksheet('Sheet1');
+
+      for (const att of attractions) {
+        const md = await _fetchAttractionMonthData(att.id, sortedMonths[0], year);
+        const sheetName = att.attraction_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
+        const sheet = attractionTmpl
+          ? _cloneSheetFromTemplate(attractionTmpl, sheetName, wb)
+          : wb.addWorksheet(sheetName);
+
+        const attractionType = typeof att.attraction_type === 'string'
+          ? JSON.parse(att.attraction_type || '[]')
+          : (att.attraction_type || []);
+        _buildVar1ExcelSheet(sheet, att.attraction_name, attractionType, md.daily, md.totals,
+          sortedMonths[0], year, md.estimation);
+
+        // Restore the template's own artwork (top logo + footer graphic) into
+        // the cloned sheet — the clone strips images, so they must be re-added
+        // with their original two-cell anchors.
+        for (const img of attractionTemplateImages) {
+          try {
+            const imageId = wb.addImage({ buffer: img.buffer, extension: img.extension });
+            sheet.addImage(imageId, { tl: img.tl, br: img.br });
+          } catch (err) {
+            console.warn('[report] Could not restore VAR 1 template image:', err.message);
+          }
         }
       }
     } else {
       // ── DAE: Per-establishment worksheets ──────────────────────────────────
       for (const biz of businesses) {
         let bizAllMonths = null;
-        if (reportVariant === 'series' && sortedMonths.length > 1) {
+        if (variant === 'series' && sortedMonths.length > 1) {
           bizAllMonths = await Promise.all(
             sortedMonths.map(m => _fetchMonthData(biz.id, m, year))
           );
@@ -878,14 +1443,14 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
           bizAllMonths = [md];
         }
 
-        if (reportVariant === 'daily' && bizAllMonths?.[0]) {
+        if (variant === 'daily' && bizAllMonths?.[0]) {
           const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
           const tmpl = templateWb?.getWorksheet('Name of Establishment');
           const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
           _buildDailySheet(sheet, biz, bizAllMonths[0], sortedMonths[0], year, daysInMonth, adminName);
         }
 
-        if (reportVariant === 'summary' && bizAllMonths?.[0]) {
+        if (variant === 'summary' && bizAllMonths?.[0]) {
           const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
           const tmpl = templateWb?.getWorksheet('AE DAE-1B by Country (Sum) ');
           const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
@@ -893,7 +1458,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
             daysInMonth, adminName, biz.city_municipality || '', biz.province || '', biz.business_name, biz);
         }
 
-        if (reportVariant === 'series' && bizAllMonths && bizAllMonths.length > 1) {
+        if (variant === 'series' && bizAllMonths && bizAllMonths.length > 1) {
           const sheetName = biz.business_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
           const tmpl = templateWb?.getWorksheet('AE DAE-1B (Monthly)');
           const sheet = tmpl ? _cloneSheetFromTemplate(tmpl, sheetName, wb) : wb.addWorksheet(sheetName);
@@ -919,7 +1484,7 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       if (ms.length === 1) return _abbr[ms[0]];
       return `${_abbr[ms[0]]}-${_abbr[ms[ms.length - 1]]}`;
     };
-    const baseFilename = `${reportType.toUpperCase()}_${reportVariant}_${_fmtPeriod(sortedMonths)}_${year}`;
+    const baseFilename = `${reportType.toUpperCase()}_${variant}_${_fmtPeriod(sortedMonths)}_${year}`;
 
     if (format === 'xlsx') {
       // Evaluate all formulas so the exported file carries cached results
@@ -927,29 +1492,29 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
       wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
       wb.calcProperties.fullCalcOnLoad = true;
       const buffer = await wb.xlsx.writeBuffer();
-      const fontXml = reportType === 'var' ? defaultFontXml.var : defaultFontXml.dae;
-      const outBuffer = fontXml ? await _patchDefaultFont(buffer, fontXml) : buffer;
+      const fontXml = reportType === 'var2' ? defaultFontXml.var
+        : reportType === 'var1' ? defaultFontXml.attraction
+        : defaultFontXml.dae;
+      let outBuffer = fontXml ? await _patchDefaultFont(buffer, fontXml) : buffer;
+      if (reportType === 'var1') {
+        outBuffer = await _patchVar1ImageOffsets(outBuffer);
+      } else if (reportType === 'var2') {
+        outBuffer = await _patchVar2ImageOffsets(outBuffer);
+      }
       await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
-      res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.set('Content-Disposition', `attachment; filename="${baseFilename}.xlsx"`);
-      res.send(Buffer.from(outBuffer));
-    } else {
-      // Evaluate all formulas so the PDF renderer can read cached results
-      wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
-      const pdfBuffer = await _generatePdfBuffer(wb, effectiveVariant, sortedMonths[0], year, reportType, { pageWidth, pageHeight });
-      await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
-      res.set('Content-Type', 'application/pdf');
-      res.set('Content-Disposition', `attachment; filename="${baseFilename}.pdf"`);
-      res.send(pdfBuffer);
+      return {
+        buffer: Buffer.from(outBuffer),
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        filename: `${baseFilename}.xlsx`,
+      };
     }
-  } catch (err) {
-    console.error('Report download error:', err);
-    // Error must be sent BEFORE any binary headers are set
-    if (!res.headersSent) {
-      return res.status(500).json({ error: err.message || 'Failed to generate report' });
-    }
-  }
-});
+
+    // Evaluate all formulas so the PDF renderer can read cached results
+    wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
+    const pdfBuffer = await _generatePdfBuffer(wb, variant, sortedMonths[0], year, reportType, { pageWidth, pageHeight });
+    await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
+    return { buffer: pdfBuffer, contentType: 'application/pdf', filename: `${baseFilename}.pdf` };
+}
 
 // ─── Data Fetching (new schema: guest_records lead fields + guest_record_rooms) ─
 
@@ -961,14 +1526,16 @@ async function _fetchMonthData(businessId, month, year) {
   // Fetch records that have ANY presence in the month (not just check_in).
   // This catches cross-month stays: check_in before the month but check_out after it starts,
   // or check_in within the month but check_out after it ends.
-  const [records] = await db.pool.execute(
-    `SELECT id, check_in, check_out, actual_check_out, total_guests,
-            lead_country, lead_sex, lead_nationality, lead_is_overseas,
-            male_count, female_count
-     FROM guest_records
-     WHERE business_id = ? AND is_deleted = false
-       AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ? ${statusFilter}`,
+  const [records] = await queryWithRetry(() =>
+    db.pool.execute(
+      `SELECT id, check_in, check_out, actual_check_out, total_guests,
+              lead_country, lead_sex, lead_nationality, lead_is_overseas,
+              male_count, female_count
+       FROM guest_records
+       WHERE business_id = ? AND is_deleted = false
+         AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ? ${statusFilter}`,
     [businessId, firstDay, lastDay]
+  )
   );
 
   // Fetch room assignment windows to compute rooms_occupied per record per day.
@@ -988,6 +1555,20 @@ async function _fetchMonthData(businessId, month, year) {
     grrRows.forEach(r => {
       if (!roomWindows[r.guest_record_id]) roomWindows[r.guest_record_id] = [];
       roomWindows[r.guest_record_id].push({ startDate: r.start_date, endDate: r.end_date });
+    });
+  }
+
+  let breakdownsByRecord = {};
+  if (recordIds.length > 0) {
+    const [gobRows] = await db.pool.execute(
+      `SELECT guest_record_id, country, nationality, is_overseas, province, city_municipality, male_count, female_count
+       FROM guest_origin_breakdowns
+       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
+      recordIds
+    );
+    gobRows.forEach(b => {
+      if (!breakdownsByRecord[b.guest_record_id]) breakdownsByRecord[b.guest_record_id] = [];
+      breakdownsByRecord[b.guest_record_id].push(b);
     });
   }
 
@@ -1014,18 +1595,13 @@ async function _fetchMonthData(businessId, month, year) {
     const effectiveCheckOut = r.actual_check_out || r.check_out;
     const checkOut   = _parseLocalDate(effectiveCheckOut);
     const nights     = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    const guestCount = r.total_guests || 0;
 
-    const country     = (r.lead_country || '').toUpperCase();
-    const nationality = (r.lead_nationality || '');
-    const sex         = (r.lead_sex || '').toLowerCase();
-    const rawBucket   = _classifyResidenceBucket({ country, nationality, isOverseas: !!r.lead_is_overseas });
-    const count       = _asInt(r.total_guests);
+    const groups = breakdownsByRecord[r.id] || [];
+    const hasGroups = groups.length > 0;
 
-    let bucket = rawBucket;
-    if (rawBucket === 'foreign_resident') {
-      bucket = listedSet.has(country) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
-    }
+    const guestCount = hasGroups
+      ? groups.reduce((sum, g) => sum + _asInt(g.male_count) + _asInt(g.female_count), 0)
+      : (r.total_guests || 0);
 
     const spreadDays = nights + 1;
     const arrivalDay = checkIn.getDate();
@@ -1062,36 +1638,80 @@ async function _fetchMonthData(businessId, month, year) {
         }
       }
 
-      // Country breakdown (all guests in party)
-      if (rawBucket === 'foreign_resident' && country) {
-        if (!countryByDay[country]) countryByDay[country] = { 0: 0 };
-        countryByDay[country][stayDay] = (countryByDay[country][stayDay] || 0) + count;
-        countryByDay[country][0]       = (countryByDay[country][0]       || 0) + count;
-      }
+      if (hasGroups) {
+        groups.forEach(g => {
+          const gCountry     = (g.country || '').toUpperCase();
+          const gIsOverseas  = !!g.is_overseas;
+          const gNationality = g.nationality || ((gCountry === 'PHILIPPINES' || (!gCountry && gIsOverseas)) ? 'Filipino' : 'Foreign');
+          const gRawBucket   = _classifyResidenceBucket({ country: g.country, nationality: gNationality, isOverseas: gIsOverseas });
+          const gCount       = _asInt(g.male_count) + _asInt(g.female_count);
 
-      // Residency bucket totals (all guests in party)
-      residentsByDay[stayDay] = residentsByDay[stayDay] || {};
-      residentsByDay[stayDay][bucket] = (residentsByDay[stayDay][bucket] || 0) + count;
-      residentsByDay[0][bucket]       = (residentsByDay[0][bucket]       || 0) + count;
+          let gBucket = gRawBucket;
+          if (gRawBucket === 'foreign_resident') {
+            gBucket = listedSet.has(gCountry) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
+          }
 
-      // Sex × residency breakdown — counts all guests in the party via the
-      // record's male_count / female_count, not just the lead guest's sex.
-      // Residence is a party-level attribute, so the bucket is resolved once.
-      let maleCount   = _asInt(r.male_count);
-      let femaleCount = _asInt(r.female_count);
-      if (maleCount + femaleCount === 0) {
-        // Defensive fallback for legacy/anomalous rows: count the lead guest only.
-        if (sex === 'female') femaleCount = 1; else maleCount = 1;
+          const gMale   = _asInt(g.male_count);
+          const gFemale = _asInt(g.female_count);
+
+          if (gRawBucket === 'foreign_resident' && gCountry) {
+            if (!countryByDay[gCountry]) countryByDay[gCountry] = { 0: 0 };
+            countryByDay[gCountry][stayDay] = (countryByDay[gCountry][stayDay] || 0) + gCount;
+            countryByDay[gCountry][0]       = (countryByDay[gCountry][0]       || 0) + gCount;
+          }
+
+          residentsByDay[stayDay] = residentsByDay[stayDay] || {};
+          residentsByDay[stayDay][gBucket] = (residentsByDay[stayDay][gBucket] || 0) + gCount;
+          residentsByDay[0][gBucket]       = (residentsByDay[0][gBucket]       || 0) + gCount;
+
+          sexByDay[stayDay] = sexByDay[stayDay] || { male: {}, female: {} };
+          if (!sexByDay[stayDay].male)   sexByDay[stayDay].male   = {};
+          if (!sexByDay[stayDay].female) sexByDay[stayDay].female = {};
+          if (!sexByDay[0].male)         sexByDay[0].male         = {};
+          if (!sexByDay[0].female)       sexByDay[0].female       = {};
+
+          sexByDay[stayDay].male[gBucket]   = (sexByDay[stayDay].male[gBucket]   || 0) + gMale;
+          sexByDay[stayDay].female[gBucket] = (sexByDay[stayDay].female[gBucket] || 0) + gFemale;
+          sexByDay[0].male[gBucket]         = (sexByDay[0].male[gBucket]         || 0) + gMale;
+          sexByDay[0].female[gBucket]       = (sexByDay[0].female[gBucket]       || 0) + gFemale;
+        });
+      } else {
+        const country     = (r.lead_country || '').toUpperCase();
+        const nationality = (r.lead_nationality || '');
+        const sex         = (r.lead_sex || '').toLowerCase();
+        const rawBucket   = _classifyResidenceBucket({ country, nationality, isOverseas: !!r.lead_is_overseas });
+        const count       = _asInt(r.total_guests);
+
+        let bucket = rawBucket;
+        if (rawBucket === 'foreign_resident') {
+          bucket = listedSet.has(country) ? 'listed_foreign_resident' : 'unlisted_foreign_resident';
+        }
+
+        if (rawBucket === 'foreign_resident' && country) {
+          if (!countryByDay[country]) countryByDay[country] = { 0: 0 };
+          countryByDay[country][stayDay] = (countryByDay[country][stayDay] || 0) + count;
+          countryByDay[country][0]       = (countryByDay[country][0]       || 0) + count;
+        }
+
+        residentsByDay[stayDay] = residentsByDay[stayDay] || {};
+        residentsByDay[stayDay][bucket] = (residentsByDay[stayDay][bucket] || 0) + count;
+        residentsByDay[0][bucket]       = (residentsByDay[0][bucket]       || 0) + count;
+
+        let maleCount   = _asInt(r.male_count);
+        let femaleCount = _asInt(r.female_count);
+        if (maleCount + femaleCount === 0) {
+          if (sex === 'female') femaleCount = 1; else maleCount = 1;
+        }
+        sexByDay[stayDay] = sexByDay[stayDay] || { male: {}, female: {} };
+        if (!sexByDay[stayDay].male)   sexByDay[stayDay].male   = {};
+        if (!sexByDay[stayDay].female) sexByDay[stayDay].female = {};
+        if (!sexByDay[0].male)         sexByDay[0].male         = {};
+        if (!sexByDay[0].female)       sexByDay[0].female       = {};
+        sexByDay[stayDay].male[bucket]   = (sexByDay[stayDay].male[bucket]   || 0) + maleCount;
+        sexByDay[stayDay].female[bucket] = (sexByDay[stayDay].female[bucket] || 0) + femaleCount;
+        sexByDay[0].male[bucket]         = (sexByDay[0].male[bucket]         || 0) + maleCount;
+        sexByDay[0].female[bucket]       = (sexByDay[0].female[bucket]       || 0) + femaleCount;
       }
-      sexByDay[stayDay] = sexByDay[stayDay] || { male: {}, female: {} };
-      if (!sexByDay[stayDay].male)   sexByDay[stayDay].male   = {};
-      if (!sexByDay[stayDay].female) sexByDay[stayDay].female = {};
-      if (!sexByDay[0].male)         sexByDay[0].male         = {};
-      if (!sexByDay[0].female)       sexByDay[0].female       = {};
-      sexByDay[stayDay].male[bucket]   = (sexByDay[stayDay].male[bucket]   || 0) + maleCount;
-      sexByDay[stayDay].female[bucket] = (sexByDay[stayDay].female[bucket] || 0) + femaleCount;
-      sexByDay[0].male[bucket]         = (sexByDay[0].male[bucket]         || 0) + maleCount;
-      sexByDay[0].female[bucket]       = (sexByDay[0].female[bucket]       || 0) + femaleCount;
     }
   });
 
@@ -1116,17 +1736,34 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
   const firstDay = `${year}-${String(month).padStart(2, '0')}-01`;
   const lastDay  = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
 
-  const [records] = await db.pool.execute(
-    `SELECT id, check_in, check_out, actual_check_out, total_guests,
-            lead_country, lead_sex, lead_nationality, lead_is_overseas,
-            lead_city_municipality, lead_province,
-            male_count, female_count
-     FROM guest_records
-     WHERE business_id = ? AND is_deleted = false
-       AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?
-       AND status IN ('active', 'archived')`,
-    [businessId, firstDay, lastDay]
+  const [records] = await queryWithRetry(() =>
+    db.pool.execute(
+      `SELECT id, check_in, check_out, actual_check_out, total_guests,
+              lead_country, lead_sex, lead_nationality, lead_is_overseas,
+              lead_city_municipality, lead_province,
+              male_count, female_count
+       FROM guest_records
+       WHERE business_id = ? AND is_deleted = false
+         AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?
+         AND status IN ('active', 'archived')`,
+      [businessId, firstDay, lastDay]
+    )
   );
+
+  const recordIds = records.map(r => r.id);
+  let breakdownsByRecord = {};
+  if (recordIds.length > 0) {
+    const [gobRows] = await db.pool.execute(
+      `SELECT guest_record_id, country, nationality, is_overseas, province, city_municipality, male_count, female_count
+       FROM guest_origin_breakdowns
+       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
+      recordIds
+    );
+    gobRows.forEach(b => {
+      if (!breakdownsByRecord[b.guest_record_id]) breakdownsByRecord[b.guest_record_id] = [];
+      breakdownsByRecord[b.guest_record_id].push(b);
+    });
+  }
 
   const data = {
     maleThisCity: 0, femaleThisCity: 0,
@@ -1145,54 +1782,295 @@ async function _fetchVarMonthData(businessId, businessCity, businessProvince, mo
     const effectiveCheckOut = r.actual_check_out || r.check_out;
     const checkOut = _parseLocalDate(effectiveCheckOut);
     const nights   = Math.max(0, Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24)));
-    // VAR spread (tourist presence day count): the check-out day counts too
-    // (check-in Aug 6, check-out Aug 8 is 3 days; same-day stays are 1 day).
     const spreadDays = nights + 1;
 
-    // Sex distribution uses the record's male_count / female_count (all guests
-    // in the party), not just the lead guest's sex.  Residence is a party-level
-    // attribute, so the bucket is resolved once from the lead guest's address.
-    let maleCount   = _asInt(r.male_count);
-    let femaleCount = _asInt(r.female_count);
-    if (maleCount + femaleCount === 0) {
-      // Defensive fallback for legacy/anomalous rows: count the lead guest only.
-      const sex = (r.lead_sex || '').toLowerCase();
-      if (sex === 'female') femaleCount = 1; else maleCount = 1;
-    }
-
-    const gCountry = (r.lead_country || '').toUpperCase();
-    const isForeign = !!r.lead_is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
-
-    let maleBucket;
-    let femaleBucket;
-    if (isForeign) {
-      maleBucket   = 'maleForeign';
-      femaleBucket = 'femaleForeign';
-    } else {
-      const gCity = _normalizeCityName(r.lead_city_municipality);
-      const gProv = (r.lead_province || '').toUpperCase();
-      if (gCity && gCity === bCity) {
-        maleBucket   = 'maleThisCity';
-        femaleBucket = 'femaleThisCity';
-      } else if (gProv && gProv === bProv) {
-        maleBucket   = 'maleOtherCity';
-        femaleBucket = 'femaleOtherCity';
-      } else {
-        maleBucket   = 'maleOtherProvince';
-        femaleBucket = 'femaleOtherProvince';
-      }
-    }
+    const groups = breakdownsByRecord[r.id] || [];
+    const hasGroups = groups.length > 0;
 
     for (let n = 0; n < spreadDays; n++) {
       const stayDate = new Date(checkIn);
       stayDate.setDate(checkIn.getDate() + n);
       if (stayDate.getFullYear() !== year || (stayDate.getMonth() + 1) !== month) continue;
-      data[maleBucket]   += maleCount;
-      data[femaleBucket] += femaleCount;
+
+      if (hasGroups) {
+        groups.forEach(g => {
+          const gCountry = (g.country || '').toUpperCase();
+          const isForeign = !!g.is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
+
+          let maleBucket, femaleBucket;
+          if (isForeign) {
+            maleBucket   = 'maleForeign';
+            femaleBucket = 'femaleForeign';
+          } else {
+            const gCity = _normalizeCityName(g.city_municipality);
+            const gProv = (g.province || '').toUpperCase();
+            if (gCity && gCity === bCity) {
+              maleBucket   = 'maleThisCity';
+              femaleBucket = 'femaleThisCity';
+            } else if (gProv && gProv === bProv) {
+              maleBucket   = 'maleOtherCity';
+              femaleBucket = 'femaleOtherCity';
+            } else {
+              maleBucket   = 'maleOtherProvince';
+              femaleBucket = 'femaleOtherProvince';
+            }
+          }
+          data[maleBucket]   += _asInt(g.male_count);
+          data[femaleBucket] += _asInt(g.female_count);
+        });
+      } else {
+        let maleCount   = _asInt(r.male_count);
+        let femaleCount = _asInt(r.female_count);
+        if (maleCount + femaleCount === 0) {
+          const sex = (r.lead_sex || '').toLowerCase();
+          if (sex === 'female') femaleCount = 1; else maleCount = 1;
+        }
+
+        const gCountry = (r.lead_country || '').toUpperCase();
+        const isForeign = !!r.lead_is_overseas || (gCountry !== '' && gCountry !== 'PHILIPPINES');
+
+        let maleBucket, femaleBucket;
+        if (isForeign) {
+          maleBucket   = 'maleForeign';
+          femaleBucket = 'femaleForeign';
+        } else {
+          const gCity = _normalizeCityName(r.lead_city_municipality);
+          const gProv = (r.lead_province || '').toUpperCase();
+          if (gCity && gCity === bCity) {
+            maleBucket   = 'maleThisCity';
+            femaleBucket = 'femaleThisCity';
+          } else if (gProv && gProv === bProv) {
+            maleBucket   = 'maleOtherCity';
+            femaleBucket = 'femaleOtherCity';
+          } else {
+            maleBucket   = 'maleOtherProvince';
+            femaleBucket = 'femaleOtherProvince';
+          }
+        }
+        data[maleBucket]   += maleCount;
+        data[femaleBucket] += femaleCount;
+      }
     }
   });
 
   return data;
+}
+
+// Empty estimation accumulator shared by the aggregation and route-level totals.
+function _emptyEstimation() {
+  return {
+    originEstimated: { count: 0, byCategory: { thisCity: 0, otherCity: 0, otherProvince: 0, foreign: 0 } },
+    genderEstimated: { count: 0, male: 0, female: 0 },
+  };
+}
+
+// ─── VAR 1 (Tourist Attraction) month aggregation ────────────────────────────
+// Daily sex × residence grid from attraction_visit_logs for a single month.
+// The VAR 1 form classifies Philippine visitors against the attraction's
+// location; attractions are San Pablo City-only, so This City/Municipality is
+// SAN PABLO CITY and same-province residents are Other City/Municipality.
+//
+// ─── Estimation methodology ───────────────────────────────────────────────────
+// Origin AND gender are optional at data-entry time. A headcount-only log row
+// stores NULLs, so reports must distribute those visitors. Per day the rows
+// are grouped by what they actually recorded, and each unknown dimension is
+// estimated ONCE per group against the config in src/config/distributionConfig.js
+// (origin distribution study + PSA 47.1%/52.9% gender split). The doc's four
+// groups:
+//    A — origin known, gender known   → used directly (male/female counts)
+//    B — origin known, gender unknown → sex-estimated once per residence category
+//    C — origin unknown, gender known → origin-estimated once per sex pool
+//    D — origin unknown, gender unknown → origin-estimated once, then
+//        sex-estimated once per category amount
+// Per day, the 4 residence-category totals are rounded with the largest-remainder
+// method so category totals sum to the day's exact Grand Total (= Σ guest_count);
+// per category, Male is largest-remainder rounded and Female = Total − Male.
+// Rows that only imply "Philippines" with no province/city are treated as origin
+// unknown (legacy rows silently recorded exactly the case we now store as NULL).
+async function _fetchAttractionMonthData(attractionId, month, year) {
+  const firstDay = `${year}-${String(month).padStart(2, '0')}-01`;
+  const lastDay  = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
+
+  const [records] = await db.pool.execute(
+    `SELECT id, visit_date, guest_count, male_count, female_count,
+            is_foreign, country, province, city_municipality
+     FROM attraction_visit_logs
+     WHERE attraction_id = ? AND visit_date BETWEEN ? AND ? AND deleted_at IS NULL`,
+    [attractionId, firstDay, lastDay]
+  );
+
+  const kCity = _normalizeCityName('San Pablo City');
+  const kProv = 'LAGUNA';
+
+  const emptyBucket = () => ({
+    maleThisCity: 0, femaleThisCity: 0,
+    maleOtherCity: 0, femaleOtherCity: 0,
+    maleOtherProvince: 0, femaleOtherProvince: 0,
+    maleForeign: 0, femaleForeign: 0,
+  });
+
+  // Build a camelCase bucket key from a sex + kOriginCategories key
+  // (e.g. 'male' + 'thisCity' → 'maleThisCity'). Never use `male${cat}` — the
+  // first word of the category is lowercase, which would mismatch the bucket.
+  const bk = (sex, cat) => sex + cat.charAt(0).toUpperCase() + cat.slice(1);
+
+  const emptyEstimation = _emptyEstimation;
+
+  const acc = {};
+  const daily = {};
+  const totals = emptyBucket();
+  const estimation = emptyEstimation();
+
+  // Resolve the residence category for a row. Returns one of the kOriginCategories
+  // keys, or null when the origin is unknown (not enough recorded to classify).
+  const _categoryOf = (r) => {
+    if (r.is_foreign === 1 || r.is_foreign === true) return 'foreign';
+    const gCountry = (r.country || '').trim().toUpperCase();
+    if (gCountry === '') return null;
+    if (gCountry !== 'PHILIPPINES') return 'foreign';
+
+    const gCity = _normalizeCityName(r.city_municipality);
+    const gProv = (r.province || '').trim().toUpperCase();
+    if (gCity === kCity) return 'thisCity';
+    if (gProv === kProv) return 'otherCity';
+    if (gCity !== '' || gProv !== '') return 'otherProvince';
+    return null; // 'Philippines' with no province/city → origin unknown
+  };
+
+  records.forEach(r => {
+    const visitDate = _parseLocalDate(r.visit_date);
+    if (!visitDate) return;
+    const dayKey = String(visitDate.getDate());
+
+    const guest     = _asInt(r.guest_count);
+    const category  = _categoryOf(r);
+    const originKnown = category !== null;
+    const mRaw = r.male_count;
+    const fRaw = r.female_count;
+    const male = _asInt(mRaw);
+    const female = _asInt(fRaw);
+    // A row counts as gender-known only when it actually carries counts; a
+    // legacy 0/0 row with a positive guest count is treated as gender-unknown.
+    const genderKnown = mRaw != null && fRaw != null && (male + female > 0);
+
+    const entry   = (acc[dayKey] ??= { bucket: emptyBucket(), est: emptyEstimation(),
+      bByCategory: emptyBucket(), malePool: 0, femalePool: 0, unknownPool: 0 });
+
+    if (originKnown && genderKnown) {
+      // Group A — direct.
+      entry.bucket[bk('male', category)] += male;
+      entry.bucket[bk('female', category)] += female;
+    } else if (originKnown) {
+      // Group B — known origin, unknown gender; sex-split per category later.
+      entry.bByCategory[bk('male', category)] += guest;
+    } else if (genderKnown) {
+      // Group C — unknown origin, known gender; origin-split per sex pool later.
+      entry.malePool += male;
+      entry.femalePool += female;
+    } else {
+      // Group D — everything unknown; origin-then-sex split later.
+      entry.unknownPool += guest;
+    }
+  });
+
+  const malePct = distributionConfig.gender.malePct;
+  const femalePct = distributionConfig.gender.femalePct;
+
+  Object.entries(acc).forEach(([dayKey, entry]) => {
+    // Group B — for each known-origin category with sex-estimated visitors.
+    kOriginCategories.forEach(cat => {
+      const guestB = entry.bByCategory[bk('male', cat)];
+      if (!guestB) return;
+      const maleB = _largestRemainderScalar(guestB * malePct, 0, guestB);
+      entry.bucket[bk('male', cat)] += maleB;
+      entry.bucket[bk('female', cat)] += guestB - maleB;
+      entry.est.genderEstimated.count += guestB;
+      entry.est.genderEstimated.male += maleB;
+      entry.est.genderEstimated.female += guestB - maleB;
+    });
+
+    // Group C — unknown origin, known gender: origin-split each sex pool once.
+    const malePoolC = entry.malePool;
+    const femalePoolC = entry.femalePool;
+    if (malePoolC || femalePoolC) {
+      const maleAlloc = _largestRemainderVec(kOriginCategories.map(c => malePoolC * kOriginPct[c]), malePoolC);
+      const femaleAlloc = _largestRemainderVec(kOriginCategories.map(c => femalePoolC * kOriginPct[c]), femalePoolC);
+      kOriginCategories.forEach((cat, i) => {
+        const mC = maleAlloc[i];
+        const fC = femaleAlloc[i];
+        entry.bucket[bk('male', cat)] += mC;
+        entry.bucket[bk('female', cat)] += fC;
+        entry.est.originEstimated.count += mC + fC;
+        entry.est.originEstimated.byCategory[cat] += mC + fC;
+      });
+    }
+
+    // Group D — unknown origin AND gender: origin-split once, then sex-split
+    // each category amount once.
+    const unknownD = entry.unknownPool;
+    if (unknownD) {
+      const catTotals = _largestRemainderVec(kOriginCategories.map(c => unknownD * kOriginPct[c]), unknownD);
+      kOriginCategories.forEach((cat, i) => {
+        const totalD = catTotals[i];
+        const maleD = _largestRemainderScalar(totalD * malePct, 0, totalD);
+        entry.bucket[bk('male', cat)] += maleD;
+        entry.bucket[bk('female', cat)] += totalD - maleD;
+        entry.est.originEstimated.count += totalD;
+        entry.est.originEstimated.byCategory[cat] += totalD;
+        entry.est.genderEstimated.count += totalD;
+        entry.est.genderEstimated.male += maleD;
+        entry.est.genderEstimated.female += totalD - maleD;
+      });
+    }
+  });
+
+  // Repackage the per-day accounting back into flat buckets (what the sheet
+  // builders expect) while rolling everything up to month totals + estimation.
+  Object.entries(acc).forEach(([dayKey, entry]) => {
+    daily[dayKey] = entry.bucket;
+    for (const k of Object.keys(totals)) totals[k] += entry.bucket[k] || 0;
+    estimation.originEstimated.count += entry.est.originEstimated.count;
+    for (const cat of kOriginCategories) {
+      estimation.originEstimated.byCategory[cat] += entry.est.originEstimated.byCategory[cat] || 0;
+    }
+    estimation.genderEstimated.count += entry.est.genderEstimated.count;
+    estimation.genderEstimated.male += entry.est.genderEstimated.male;
+    estimation.genderEstimated.female += entry.est.genderEstimated.female;
+  });
+
+  return { month, year, daily, totals, estimation };
+}
+
+// Largest-remainder rounding of a list of unrounded counts to integers whose
+// sum equals `total` exactly.
+function _largestRemainderVec(unrounded, total) {
+  const n = unrounded.length;
+  const floor = unrounded.map(v => Math.floor(v));
+  let remaining = total - floor.reduce((a, b) => a + b, 0);
+  while (remaining > 0) {
+    let bestIdx = -1;
+    let bestRemainder = -1;
+    for (let i = 0; i < n; i++) {
+      const rem = unrounded[i] - floor[i];
+      if (rem > bestRemainder) {
+        bestRemainder = rem;
+        bestIdx = i;
+      }
+    }
+    floor[bestIdx] += 1;
+    unrounded[bestIdx] -= 1;
+    remaining -= 1;
+  }
+  return floor;
+}
+
+// Largest-remainder rounding of a single scalar to an integer within [min, max].
+function _largestRemainderScalar(value, min, max) {
+  const floor = Math.min(Math.floor(value), max);
+  const rest = max - floor;
+  if (rest <= 0) return floor;
+  const remainder = value - Math.floor(value);
+  return remainder >= 0.5 ? floor + 1 : floor;
 }
 
 // ─── Merge helpers ────────────────────────────────────────────────────────────
@@ -1281,6 +2159,72 @@ async function _patchDefaultFont(buffer, fontXml) {
     console.warn('[report] Default font patch skipped:', err.message);
     return buffer;
   }
+}
+
+// ExcelJS writes every image anchor with colOff/rowOff zeroed and editAs
+// "oneCell".  Restore the template's exact EMU offsets (and the default
+// two-cell edit behavior) so the VAR 1 logo + QR and the VAR 2 logo + footer
+// graphic sit precisely where the blank templates place them.
+async function _patchImageOffsets(buffer, anchors, label) {
+  const _matchSpec = (inner) => {
+    const m = inner.match(/<xdr:from><xdr:col>(\d+)<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row><xdr:rowOff>\d+<\/xdr:rowOff><\/xdr:from><xdr:to><xdr:col>(\d+)<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row>/);
+    if (!m) return null;
+    return anchors.find(s =>
+      s.fromCol === +m[1] && s.fromRow === +m[2] &&
+      s.toCol === +m[3] && s.toRow === +m[4]) || null;
+  };
+
+  const _applyOffsets = (inner, spec) => {
+    let out = inner;
+    out = out.replace(/<xdr:from>([\s\S]*?)<\/xdr:from>/, (block, f) =>
+      `<xdr:from>${f
+        .replace(/<xdr:colOff>\d+<\/xdr:colOff>/, `<xdr:colOff>${spec.fromColOff}</xdr:colOff>`)
+        .replace(/<xdr:rowOff>\d+<\/xdr:rowOff>/, `<xdr:rowOff>${spec.fromRowOff}</xdr:rowOff>`)}</xdr:from>`);
+    out = out.replace(/<xdr:to>([\s\S]*?)<\/xdr:to>/, (block, t) =>
+      `<xdr:to>${t
+        .replace(/<xdr:colOff>\d+<\/xdr:colOff>/, `<xdr:colOff>${spec.toColOff}</xdr:colOff>`)
+        .replace(/<xdr:rowOff>\d+<\/xdr:rowOff>/, `<xdr:rowOff>${spec.toRowOff}</xdr:rowOff>`)}</xdr:to>`);
+    return out;
+  };
+
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+    const drawings = Object.keys(zip.files)
+      .filter(name => /^xl\/drawings\/drawing\d+\.xml$/.test(name));
+
+    let anyChanged = false;
+    for (const name of drawings) {
+      let xml = await zip.file(name).async('string');
+      let changed = false;
+      xml = xml.replace(/<xdr:twoCellAnchor([^>]*)>([\s\S]*?)<\/xdr:twoCellAnchor>/g, (block, attrs, inner) => {
+        const spec = _matchSpec(inner);
+        if (!spec) return block;
+        changed = true;
+        return `<xdr:twoCellAnchor>${_applyOffsets(inner, spec)}</xdr:twoCellAnchor>`;
+      });
+      if (changed) {
+        zip.file(name, xml);
+        anyChanged = true;
+      }
+    }
+
+    if (!anyChanged) {
+      console.warn(`[report] ${label} image offset patch: no matching anchors found, export unchanged`);
+      return buffer;
+    }
+    return await zip.generateAsync({ type: 'nodebuffer' });
+  } catch (err) {
+    console.warn(`[report] ${label} image offset patch skipped:`, err.message);
+    return buffer;
+  }
+}
+
+async function _patchVar1ImageOffsets(buffer) {
+  return _patchImageOffsets(buffer, kVar1ImageAnchors, 'VAR 1');
+}
+
+async function _patchVar2ImageOffsets(buffer) {
+  return _patchImageOffsets(buffer, kVar2ImageAnchors, 'VAR 2');
 }
 
 // ─── Template Cloning ────────────────────────────────────────────────────────
@@ -1621,7 +2565,9 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   const r = kRows.sum;
 
   sheet.getCell('B3').value = 'Region: __4-A';
-  sheet.getCell('A4').value = `Jan-Dec, ${year}`;
+  const abbr = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  sheet.getCell('A4').value =
+    `${abbr[allMonths[0].month]}-${abbr[allMonths[allMonths.length - 1].month]}, ${year}`;
   sheet.getCell('A22').value = `City/Municipality: ${city || ''}`;
   sheet.getCell('A23').value = `Province: ${province || ''}`;
   sheet.getCell('A19').value = `AE ID Code (LGU Assigned): ${biz?.ae_id || ''}`;
@@ -1636,6 +2582,27 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
       sheet.getCell(`B${t.row}`).alignment = { horizontal: 'center' };
     }
   });
+
+  // ── Remove unused month columns BEFORE writing data ──────────────────────
+  // Template has 12 month columns (B-M) + 1 total column (N) whose header row
+  // lives at row 25.  Deleting the unused month columns between the last
+  // selected month and TOTAL shifts the native "TOTAL" header column left so
+  // it sits directly after the last selected month (e.g. Jan-May → TOTAL in G).
+  const unusedMonthCols = 12 - allMonths.length;
+  if (unusedMonthCols > 0) {
+    sheet.spliceColumns(allMonths.length + 2, unusedMonthCols);
+  }
+
+  // Header row (25) is hardcoded JANUARY-DECEMBER in the template. Rewrite it
+  // so each month column reflects the actual selected range (e.g. May-Aug →
+  // B=MAY, C=JUNE, D=JULY, E=AUGUST). TOTAL (after the last month) is left as-is.
+  const fullMonthNames = [
+    '', 'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+  for (let i = 0; i < allMonths.length; i++) {
+    sheet.getCell(25, i + 2).value = fullMonthNames[allMonths[i].month].toUpperCase();
+  }
 
   const _sumTotalRows = new Set([30, 45, 53, 62, 72, 80, 88, 99, 108, 116, 122, 130, 137, 140, 142, 144, 146, 147, 148, 149, 150, 159, 160]);
   const setMonthValues = (rowNum, fn) => {
@@ -1753,15 +2720,6 @@ function _buildMonthlySummarySheet(sheet, allMonths, totalRoomsAll, year, adminN
   };
   setMonthlySexValues(r.maleStart, 'male');
   setMonthlySexValues(r.femaleStart, 'female');
-
-  // ── Remove unused month columns for the requested range ──────────────────
-  // Template has 12 month columns (B-M) + 1 total column (N).
-  // After writing, data occupies columns 2..(allMonths.length+1) and total at
-  // allMonths.length+2.  Delete leftover template columns after the total.
-  const unusedMonthCols = 12 - allMonths.length;
-  if (unusedMonthCols > 0) {
-    sheet.spliceColumns(allMonths.length + 3, unusedMonthCols);
-  }
 }
 
 // ==============================================================================================
@@ -1789,10 +2747,10 @@ const kVarCols = {
   grandTotal: 18,     // R
 };
 
-const kVarDataRowStart = 16;
-const kVarTotalRow = 57;
+const kVarDataRowStart = 21;
+const kVarTotalRow = 62;
 
-function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year) {
+function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year, estimation) {
   const kVarMonthNames = [
     '', 'January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December',
@@ -1807,12 +2765,12 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
     : `${kVarMonthAbbr[sortedMonths[0]]}-${kVarMonthAbbr[sortedMonths[sortedMonths.length - 1]]}, ${year}`;
 
   // Update header fields
-  // Row 9: Month/Year — write value in the cells near E9
-  sheet.getCell('G9').value = monthLabel;
+  // Row 14: Month/Year — write value in the cells near E14
+  sheet.getCell('G14').value = monthLabel;
 
-  // Row 10: Municipality — write the first business city or leave template default
+  // Row 15: Municipality — write the first business city or leave template default
   if (businesses.length === 1) {
-    sheet.getCell('G10').value = (businesses[0].city_municipality || '').toUpperCase();
+    sheet.getCell('G15').value = (businesses[0].city_municipality || '').toUpperCase();
   }
 
   const c = kVarCols;
@@ -1857,7 +2815,7 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
     const grandTotal      = totalThisCity + totalOtherCity + totalOtherProv + totalForeign;
 
     sheet.getRow(rowNum).getCell(c.name).value           = biz.business_name;
-    sheet.getRow(rowNum).getCell(c.attrCode).value       = '9-902';
+    sheet.getRow(rowNum).getCell(c.attrCode).value       = biz.attrCode || '9-902';
     sheet.getRow(rowNum).getCell(c.maleThisCity).value    = maleThisCity || null;
     sheet.getRow(rowNum).getCell(c.femaleThisCity).value   = femaleThisCity || null;
     sheet.getRow(rowNum).getCell(c.maleOtherCity).value    = maleOtherCity || null;
@@ -1925,19 +2883,168 @@ function _buildVarExcelSheet(sheet, businesses, varDataList, sortedMonths, year)
   totalRow.getCell(c.grandMale).value        = { formula: `SUM(P${kVarDataRowStart}:P${lastDataRow})` };
   totalRow.getCell(c.grandFemale).value      = { formula: `SUM(Q${kVarDataRowStart}:Q${lastDataRow})` };
   totalRow.getCell(c.grandTotal).value       = { formula: `F${kVarTotalRow}+I${kVarTotalRow}+L${kVarTotalRow}+O${kVarTotalRow}` };
+}
 
+// ─── VAR 1 (Tourist Attraction) sheet builder ────────────────────────────────
+// Column positions in same day blank.xlsx (1-indexed, A=1).
+const kVar1Cols = {
+  day: 2,             // B
+  maleThisCity: 4,    // D
+  femaleThisCity: 5,  // E
+  totalThisCity: 6,   // F
+  maleOtherCity: 7,   // G
+  femaleOtherCity: 8, // H
+  totalOtherCity: 9,  // I
+  maleOtherProv: 10,  // J
+  femaleOtherProv: 11,// K
+  totalOtherProv: 12, // L
+  maleForeign: 13,    // M
+  femaleForeign: 14,  // N
+  totalForeign: 15,   // O
+  grandMale: 16,      // P
+  grandFemale: 17,    // Q
+  grandTotal: 18,     // R
+};
+
+const kVar1DayRowStart = 24; // day 1 lives at row 24 (template rows 24-54 = days 1-31)
+const kVar1TotalRow = 55;
+
+// Attraction type values as stored in tourist_attractions.attraction_type →
+// the display labels used on the VAR 1 form.  Unknown values fall back to a
+// title-cased version of the stored key.
+const kAttractionTypeLabels = {
+  ecotourism: 'Ecotourism',
+  natural_attractions: 'Natural Attractions',
+  cultural: 'Cultural',
+  religious: 'Religious',
+  historical_heritage_sites: 'Historical Heritage Sites',
+  agri_tourism: 'Agri-Tourism',
+  farm_tourism_sites: 'Farm Tourism Sites',
+};
+
+function _attractionTypeLabel(value) {
+  const key = String(value || '').trim();
+  if (!key) return '';
+  if (kAttractionTypeLabels[key]) return kAttractionTypeLabels[key];
+  return key
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+}
+
+function _buildVar1ExcelSheet(sheet, attractionName, attractionType, daily, totals, month, year, estimation) {
+  const c = kVar1Cols;
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const kWeekdayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  // ── Header variable fields (rows 1-15 come from the template clone) ───────
+  sheet.getCell('G14').value = `${kMonthNames[month]} ${year}`;          // Month/Year value (label at E14)
+  sheet.getCell('G16').value = attractionName;                            // Name of attraction/ Spot (label at E16)
+  // Type of Tourism Attraction — display labels go in the merged fill-in box
+  // E18:G18 (label at D18).
+  sheet.getCell('E18').value = (attractionType || []).map(_attractionTypeLabel).filter(Boolean).join(', ');
+
+  // ── Day rows 24-54 ────────────────────────────────────────────────────────
+  // Raw input columns D,E,G,H,J,K,M,N — the only cells filled from data.
+  const rawInputCols = [
+    c.maleThisCity, c.femaleThisCity,
+    c.maleOtherCity, c.femaleOtherCity,
+    c.maleOtherProv, c.femaleOtherProv,
+    c.maleForeign, c.femaleForeign,
+  ];
+
+  // Computed columns F,I,L,O,P,Q,R — the template's per-row formulas, restored
+  // in EVERY day row so Excel totals the counts itself (the clone resolves the
+  // template's formulas to plain cached 0s, so they must be re-injected).
+  const injectDayFormulas = (rowNum) => {
+    sheet.getRow(rowNum).getCell(c.totalThisCity).value   = { formula: `D${rowNum}+E${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalOtherCity).value  = { formula: `G${rowNum}+H${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalOtherProv).value  = { formula: `J${rowNum}+K${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.totalForeign).value    = { formula: `M${rowNum}+N${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandMale).value       = { formula: `D${rowNum}+G${rowNum}+J${rowNum}+M${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandFemale).value     = { formula: `E${rowNum}+H${rowNum}+K${rowNum}+N${rowNum}` };
+    sheet.getRow(rowNum).getCell(c.grandTotal).value      = { formula: `F${rowNum}+I${rowNum}+L${rowNum}+O${rowNum}` };
+  };
+
+  for (let day = 1; day <= 31; day++) {
+    const rowNum = kVar1DayRowStart + day - 1;
+    const d = daily[String(day)];
+
+    // Keep the computed-column formulas in every row, data or not.
+    injectDayFormulas(rowNum);
+
+    if (day > daysInMonth) {
+      // Days past month-end: blank the weekday + raw inputs (formulas kept)
+      sheet.getRow(rowNum).getCell(3).value = null;
+      rawInputCols.forEach(col => { sheet.getRow(rowNum).getCell(col).value = null; });
+      continue;
+    }
+
+    // Week Day (Mon-Sun) — the actual calendar weekday for this date
+    sheet.getRow(rowNum).getCell(3).value = kWeekdayNames[new Date(year, month - 1, day).getDay()];
+
+    if (!d) {
+      // In-month day with no recorded visits: clear the raw inputs but keep
+      // the day number (template), weekday label and computed-column formulas.
+      rawInputCols.forEach(col => { sheet.getRow(rowNum).getCell(col).value = null; });
+      continue;
+    }
+
+    const maleThisCity    = d.maleThisCity || 0;
+    const femaleThisCity  = d.femaleThisCity || 0;
+    const maleOtherCity   = d.maleOtherCity || 0;
+    const femaleOtherCity = d.femaleOtherCity || 0;
+    const maleOtherProv   = d.maleOtherProvince || 0;
+    const femaleOtherProv = d.femaleOtherProvince || 0;
+    const maleForeign     = d.maleForeign || 0;
+    const femaleForeign   = d.femaleForeign || 0;
+
+    // Raw input columns D,E,G,H,J,K,M,N
+    sheet.getRow(rowNum).getCell(c.maleThisCity).value    = maleThisCity || null;
+    sheet.getRow(rowNum).getCell(c.femaleThisCity).value  = femaleThisCity || null;
+    sheet.getRow(rowNum).getCell(c.maleOtherCity).value   = maleOtherCity || null;
+    sheet.getRow(rowNum).getCell(c.femaleOtherCity).value = femaleOtherCity || null;
+    sheet.getRow(rowNum).getCell(c.maleOtherProv).value   = maleOtherProv || null;
+    sheet.getRow(rowNum).getCell(c.femaleOtherProv).value = femaleOtherProv || null;
+    sheet.getRow(rowNum).getCell(c.maleForeign).value     = maleForeign || null;
+    sheet.getRow(rowNum).getCell(c.femaleForeign).value   = femaleForeign || null;
+  }
+
+  // ── Total row (row 55) — mirrors the template's D55:Q55 SUM formulas ──────
+  const lastDataRow = kVar1DayRowStart + 30; // 54
+  const totalRow = sheet.getRow(kVar1TotalRow);
+  totalRow.getCell(c.maleThisCity).value     = { formula: `SUM(D${kVar1DayRowStart}:D${lastDataRow})` };
+  totalRow.getCell(c.femaleThisCity).value   = { formula: `SUM(E${kVar1DayRowStart}:E${lastDataRow})` };
+  totalRow.getCell(c.totalThisCity).value    = { formula: `SUM(F${kVar1DayRowStart}:F${lastDataRow})` };
+  totalRow.getCell(c.maleOtherCity).value    = { formula: `SUM(G${kVar1DayRowStart}:G${lastDataRow})` };
+  totalRow.getCell(c.femaleOtherCity).value  = { formula: `SUM(H${kVar1DayRowStart}:H${lastDataRow})` };
+  totalRow.getCell(c.totalOtherCity).value   = { formula: `SUM(I${kVar1DayRowStart}:I${lastDataRow})` };
+  totalRow.getCell(c.maleOtherProv).value    = { formula: `SUM(J${kVar1DayRowStart}:J${lastDataRow})` };
+  totalRow.getCell(c.femaleOtherProv).value  = { formula: `SUM(K${kVar1DayRowStart}:K${lastDataRow})` };
+  totalRow.getCell(c.totalOtherProv).value   = { formula: `SUM(L${kVar1DayRowStart}:L${lastDataRow})` };
+  totalRow.getCell(c.maleForeign).value      = { formula: `SUM(M${kVar1DayRowStart}:M${lastDataRow})` };
+  totalRow.getCell(c.femaleForeign).value    = { formula: `SUM(N${kVar1DayRowStart}:N${lastDataRow})` };
+  totalRow.getCell(c.totalForeign).value     = { formula: `SUM(O${kVar1DayRowStart}:O${lastDataRow})` };
+  totalRow.getCell(c.grandMale).value        = { formula: `SUM(P${kVar1DayRowStart}:P${lastDataRow})` };
+  totalRow.getCell(c.grandFemale).value      = { formula: `SUM(Q${kVar1DayRowStart}:Q${lastDataRow})` };
+  // Column R grand total — mirrors the template's R51 formula (=F51+I51+L51+O51)
+  totalRow.getCell(c.grandTotal).value       = { formula: `F${kVar1TotalRow}+I${kVar1TotalRow}+L${kVar1TotalRow}+O${kVar1TotalRow}` };
+  // The blank template bakes a two-decimal (#,##0.00) format into this cell;
+  // reset it to General so integer totals render as "84", matching the PDF.
+  totalRow.getCell(c.grandTotal).numFmt = 'General';
 }
 
 // ─── PDF Layout & Page-Break Config ─────────────────────────────────────────
 const SHEET_PDF_CONFIG = {
-  daily:   { layout: 'landscape', size: 'A4', margin: 30, breakRows: [64, 124] },
-  monthly: { layout: 'landscape', size: 'A4', margin: 40, breakRows: [64, 124] },
-  sum:     { layout: 'portrait',  size: 'A4', margin: 30, breakRows: [66, 128] },
-  var:     { layout: 'portrait', size: 'A4', margin: 30, breakRows: [] },
+  daily:   { layout: 'landscape', size: 'A4', margin: 28.35, breakRows: [64, 124] },
+  monthly: { layout: 'landscape', size: 'A4', margin: 28.35, breakRows: [64, 124] },
+  sum:     { layout: 'portrait',  size: 'A4', margin: 28.35, breakRows: [66, 128] },
+  var:     { layout: 'portrait', size: 'A4', margin: 28.35, breakRows: [] },
 };
 
 function _getSheetPdfConfig(sheetName, reportType) {
-  if (reportType === 'var') return SHEET_PDF_CONFIG.var;
+  if (reportType === 'var2' || reportType === 'var1') return SHEET_PDF_CONFIG.var;
   if (sheetName === 'AE DAE-1B by Country (Sum)') return SHEET_PDF_CONFIG.sum;
   if (sheetName.includes('Monthly'))              return SHEET_PDF_CONFIG.monthly;
   return SHEET_PDF_CONFIG.daily;
@@ -1949,7 +3056,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
   const sheets = [];
   workbook.eachSheet(sheet => sheets.push(sheet));
 
-  const pdfConfig = { ...(reportType === 'var' ? SHEET_PDF_CONFIG.var
+  const pdfConfig = { ...(reportType === 'var2' || reportType === 'var1' ? SHEET_PDF_CONFIG.var
     : variant === 'summary' ? SHEET_PDF_CONFIG.sum
     : variant === 'series' ? SHEET_PDF_CONFIG.monthly
     : SHEET_PDF_CONFIG.daily) };
@@ -1962,10 +3069,10 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
   // Font metrics that convert Excel's stored column widths ("characters of the
   // default font") into physical points.  CHAR_WIDTH_PT = max digit width of the
-  // template's default font at 96dpi: Arial 10 → 7px = 5.25pt; MS PGothic 11
+  // template's default font at 96dpi: Arial/Calibri 11 → 7px = 5.25pt; MS PGothic 11
   // (VAR, half-width digits) → 8px = 6.0pt.  CELL_PAD_PT = Excel's 5px padding
   // each column adds, so column edges match Excel's rendered width exactly.
-  const CHAR_WIDTH_PT = reportType === 'var' ? 6.0 : 5.25;
+  const CHAR_WIDTH_PT = reportType === 'var2' ? 6.0 : 5.25;
   const CELL_PAD_PT = 3.75;
   const PAGE_DIMS = { A3: { w: 841.89, h: 1190.55 }, A4: { w: 595.28, h: 841.89 } };
   const BORDER_WIDTH = {
@@ -1983,14 +3090,48 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     return PAGE_DIMS[size] || PAGE_DIMS.A3;
   };
 
-  const effectiveMargin = Math.max(pdfConfig.margin, 30);
+  const effectiveMargin = Math.max(pdfConfig.margin, 28.35);
 
-  // ── Per-sheet layout: sections + natural content width/height ─────────────
+    // ── Per-sheet layout: sections + natural content width/height ─────────────
+  // Last row that actually carries content (a value, border, fill, or template
+  // image) — the VAR sheets keep ~26 phantom empty trailing rows past their
+  // real content, which inflate the fit-height and shrink the whole grid.
+  const _lastUsedRow = (sheet, maxRow) => {
+    let used = 0;
+    sheet.eachRow({ includeEmpty: true }, (row, rn) => {
+      if (rn > maxRow) return;
+      let rowUsed = false;
+      row.eachCell({ includeEmpty: true }, (cell, cn) => {
+        if (cn > 33) return;
+        const hasValue = cell.value !== null && cell.value !== undefined && cell.value !== '';
+        const hasBorder = !!(cell.border && (cell.border.top || cell.border.bottom
+          || cell.border.left || cell.border.right));
+        const hasFill = !!(cell.fill && cell.fill.type && cell.fill.fgColor
+          && cell.fill.fgColor.argb);
+        if (hasValue || hasBorder || hasFill) rowUsed = true;
+      });
+      if (rowUsed) used = rn;
+    });
+    // VAR 1 restores its template artwork (top logo rows 2-6, QR graphic rows
+    // 61-63) and VAR 2 does the same (top logo rows 2-7, footer graphic rows
+    // 67-69), so rows spanned by those anchors count as used too.
+    if (reportType === 'var1') {
+      for (const img of attractionTemplateImages) used = Math.max(used, img.br.row);
+    }
+    if (reportType === 'var2') {
+      for (const img of varTemplateImages) used = Math.max(used, img.br.row);
+    }
+    return used;
+  };
+
   const layouts = sheets.map(sheet => {
-    const maxCol = reportType === 'var' ? 18 : 33;
+    const maxCol = reportType === 'var2' || reportType === 'var1' ? 18 : 33;
     const maxRow = (reportType === 'dae' && variant === 'daily')
       ? 181
       : (sheet.rowCount || 197);
+    const usedRow = (reportType === 'var2' || reportType === 'var1')
+      ? Math.min(maxRow, _lastUsedRow(sheet, maxRow))
+      : maxRow;
 
     const rows = [];
     sheet.eachRow({ includeEmpty: true }, (row, rn) => {
@@ -2018,12 +3159,15 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
     let maxHeightInAnySection = 0;
     for (const sec of sheetSections) {
       let h = 0;
-      for (const { row } of sec) h += (row.height || 15);
+      for (const { row, rn } of sec) {
+        if (rn > usedRow) break;
+        h += (row.height || 15);
+      }
       if (h > maxHeightInAnySection) maxHeightInAnySection = h;
     }
     if (maxHeightInAnySection === 0) maxHeightInAnySection = 300;
 
-    return { sheet, maxCol, sheetSections, contentWidthPt, maxHeightInAnySection };
+    return { sheet, maxCol, sheetSections, contentWidthPt, maxHeightInAnySection, usedRow };
   });
 
   // ── Page geometry per sheet ───────────────────────────────────────────────
@@ -2045,7 +3189,7 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       layout: pdfConfig.layout,
       scale,
       originX: effectiveMargin + (aw2 - L.contentWidthPt * scale) / 2,
-      originY: effectiveMargin + (ah2 - L.maxHeightInAnySection * scale) / 2,
+      originY: effectiveMargin,
     };
   });
 
@@ -2064,8 +3208,35 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
 
   let isFirstSheet = true;
 
+  // Convert a two-cell image anchor into PDF-space box coordinates using the
+  // same column-width/row-height math as the cell grid (EMU → pt × scale).
+  const _pdfImageBox = (sheet, tl, br, scale, originX, originY) => {
+    const px = (emu) => (emu / 914400) * 72;
+    let x = originX;
+    for (let c = 1; c <= tl.col; c++) {
+      x += ((sheet.getColumn(c).width || 10) * CHAR_WIDTH_PT + CELL_PAD_PT) * scale;
+    }
+    x += px(tl.colOff) * scale;
+    let y = originY;
+    for (let r = 1; r <= tl.row; r++) {
+      y += (sheet.getRow(r).height || 15) * scale;
+    }
+    y += px(tl.rowOff) * scale;
+    let boxW = 0;
+    for (let c = tl.col + 1; c <= br.col; c++) {
+      boxW += ((sheet.getColumn(c).width || 10) * CHAR_WIDTH_PT + CELL_PAD_PT) * scale;
+    }
+    boxW += px(br.colOff - tl.colOff) * scale;
+    let boxH = 0;
+    for (let r = tl.row + 1; r <= br.row; r++) {
+      boxH += (sheet.getRow(r).height || 15) * scale;
+    }
+    boxH += px(br.rowOff - tl.rowOff) * scale;
+    return { x, y, boxW, boxH };
+  };
+
   for (let si = 0; si < layouts.length; si++) {
-    const { sheet, maxCol, sheetSections } = layouts[si];
+    const { sheet, maxCol, sheetSections, usedRow } = layouts[si];
     const geo = geometries[si];
     const { originX, originY, scale } = geo;
 
@@ -2083,6 +3254,8 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
       let curY = originY;
 
       for (const { row, rn } of section) {
+        // Skip phantom empty trailing rows beyond the sheet's real content.
+        if (rn > usedRow) continue;
         const rh = (row.height || 15) * scale;
         let curX = originX;
 
@@ -2287,14 +3460,32 @@ async function _generatePdfBuffer(workbook, variant, month, year, reportType = '
         curY += rh;
       }
 
-      // Draw the tourism office logo over the VAR header block (B1, rows 1-4)
-      // on the first page, using the same origin/scale math as the cell grid.
-      if (reportType === 'var' && s === 0 && varLogoBuffer) {
-        const colAW = (sheet.getColumn(1).width || 10) * CHAR_WIDTH_PT * scale + CELL_PAD_PT * scale;
-        const logoX = originX + colAW + (1038225 / 914400) * 72 * scale;
-        const logoY = originY + (57150 / 914400) * 72 * scale;
-        const logoPx = 64 * 0.75 * scale;
-        doc.image(varLogoBuffer, logoX, logoY, { width: logoPx, height: logoPx });
+      // Draw the template's own artwork — the top logo and footer graphic for
+      // VAR 1 (attraction) and VAR 2 — at their original anchor boxes, using
+      // the same origin/scale math as the cell grid.
+      const templateImages = reportType === 'var1'
+        ? attractionTemplateImages
+        : reportType === 'var2' ? varTemplateImages : [];
+      for (const img of templateImages) {
+        try {
+          const { x, y, boxW, boxH } = _pdfImageBox(sheet, img.tl, img.br, scale, geo.originX, geo.originY);
+          if (boxW <= 0 || boxH <= 0) continue;
+          const imgMeta = doc.openImage(img.buffer);
+          // The VAR 2 footer graphic is a tall-thin sliver whose anchor box is
+          // much taller than its natural aspect ratio.  Excel's template uses
+          // "stretch to fill" for it, so reproduce that here (else it renders
+          // thinned/pancaked).  Detect it by its single-column anchor (to.col
+          // === from.col); the top logos keep aspect-preserving fit.
+          const stretchToFill = reportType === 'var2' && img.tl.col === img.br.col;
+          if (stretchToFill) {
+            doc.image(img.buffer, x, y, { width: boxW, height: boxH });
+          } else {
+            const ratio = Math.min(boxW / imgMeta.width, boxH / imgMeta.height);
+            doc.image(img.buffer, x, y, { width: imgMeta.width * ratio, height: imgMeta.height * ratio });
+          }
+        } catch (err) {
+          console.warn(`[report] Could not draw ${reportType} template image:`, err.message);
+        }
       }
     }
   }

@@ -122,7 +122,7 @@ async function sendOtp(toEmail, otp) {
   }
 }
 
-async function sendSystemMessage(toEmail, subject, content, messageType = 'general') {
+async function sendSystemMessage(toEmail, subject, content, messageType) {
   if (!brevoClient) {
     throw new Error('Email service not configured (BREVO_API_KEY missing)');
   }

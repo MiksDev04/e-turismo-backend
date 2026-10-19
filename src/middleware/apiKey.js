@@ -1,5 +1,5 @@
 /**
- * Public paths that do not require an API key.
+ * Public paths that do not require an API key. f
  */
 const PUBLIC_PATHS = ['/api/confirm-email', '/api/auth/admin-setup/confirm', '/api/auth/register/confirm', '/health'];
 

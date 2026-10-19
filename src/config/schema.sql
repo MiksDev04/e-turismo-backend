@@ -10,14 +10,42 @@
 --     sex). Male/female counts are captured (or auto-split via the PSA
 --     47.1%/52.9% distribution when left blank). The remaining guests in
 --     the party are implied by total_guests - male_count - female_count
---     and are not itemized.
+--     and are not itemized. When origin groups are recorded
+--     (`guest_origin_breakdowns`), male/female/total are derived from the
+--     group sums instead; PSA applies only when no origin groups exist.
 --   - `guest_record_rooms` (new): junction table -- a stay can span
 --     more than one room (a party of 5 might get split across two)
+--   - `guest_origin_breakdowns` (new): repeatable Origin Groups
+--     (country / nationality / is_overseas / province / city_municipality /
+--     male / female), keyed by `guest_records` (accommodation).
+--     nationality is 'Filipino' or 'Foreign'.
+--     country may be NULL when is_overseas = 1.
+--     province / city_municipality are Philippines-only.
 --   - `guest_breakdowns` / `guest_breakdowns_synced` are retired.
 --
+-- Includes the tourist-attraction model:
+--   - `tourist_attractions` (new): public attractions (parks, plazas,
+--     LGU-managed sites) tied to a user account, same pending/approved
+--     workflow as businesses. One account = exactly one attraction.
+--   - `attraction_visit_logs` (new): batch visit entries per attraction
+--     per day (guest_count + origin classification) — no PII, like a
+--     gate logbook. Nationality is NOT stored: it is derived from the
+--     country column (country = 'Philippines' => Filipino, otherwise
+--     Foreign). Male/female counts are captured (or auto-split via the
+--     PSA 47.1%/52.9% distribution when left blank).
+--   - `message_recipients` now links to either a business OR an
+--     attraction (exactly one per row).
+--   - `report_batches.report_type` is one of 'dae' | 'var1' | 'var2':
+--     'dae'   = accommodation establishments (daily/summary/series)
+--     'var1'  = tourist attractions, one daily grid per attraction (always 'daily')
+--     'var2'  = combined accommodations + attractions, one row each (always 'total')
+--   - `users.role` widened to 'attraction'; `pending_email_confirmations
+--     .purpose` widened to 'attraction_registration'.
+--
 -- Table creation order respects foreign key dependencies:
---   users -> businesses -> rooms -> guest_records -> guest_record_rooms
---         -> messages -> message_recipients
+--   users -> businesses -> tourist_attractions -> attraction_visit_logs
+--         -> rooms -> guest_records -> guest_record_rooms
+--         -> guest_origin_breakdowns -> messages -> message_recipients
 --         -> report_batches
 -- =====================================================================
 DROP DATABASE tourism_db;
@@ -34,10 +62,13 @@ DROP TABLE IF EXISTS `report_batches`;
 DROP TABLE IF EXISTS `message_recipients`;
 DROP TABLE IF EXISTS `messages`;
 DROP TABLE IF EXISTS `guest_record_rooms`;
+DROP TABLE IF EXISTS `guest_origin_breakdowns`;
 DROP TABLE IF EXISTS `guest_records`;
 DROP TABLE IF EXISTS `guest_breakdowns`;
 DROP TABLE IF EXISTS `rooms`;
 DROP TABLE IF EXISTS `businesses`;
+DROP TABLE IF EXISTS `attraction_visit_logs`;
+DROP TABLE IF EXISTS `tourist_attractions`;
 DROP TABLE IF EXISTS `pending_email_confirmations`;
 DROP TABLE IF EXISTS `users`;
 
@@ -51,7 +82,7 @@ CREATE TABLE `users` (
   `email` varchar(255) DEFAULT NULL,
   `username` varchar(100) NOT NULL,
   `password` text NOT NULL,
-  `role` enum('business','admin') NOT NULL DEFAULT 'business',
+  `role` enum('business','admin','attraction') NOT NULL DEFAULT 'business',
   `reset_otp` varchar(6) DEFAULT NULL,
   `reset_otp_expiry` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -71,7 +102,7 @@ CREATE TABLE `users` (
 -- ---------------------------------------------------------------
 CREATE TABLE `pending_email_confirmations` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
-  `purpose` enum('admin_setup','business_registration') NOT NULL,
+  `purpose` enum('admin_setup','business_registration','attraction_registration') NOT NULL,
   `full_name` varchar(255) NOT NULL,
   `username` varchar(100) NOT NULL,
   `email` varchar(255) NOT NULL,
@@ -101,7 +132,7 @@ CREATE TABLE `businesses` (
 
   `permit_file_url` varchar(1000) DEFAULT NULL,
   `valid_id_url` varchar(1000) DEFAULT NULL,
-  `status` enum('pending','approved','rejected','warning','suspended') NOT NULL DEFAULT 'pending',
+  `status` enum('pending','approved','rejected','warning') NOT NULL DEFAULT 'pending',
   `remarks` text,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -121,6 +152,62 @@ CREATE TABLE `businesses` (
   KEY `idx_businesses_status` (`status`),
   KEY `idx_businesses_deleted_at` (`deleted_at`),
   CONSTRAINT `businesses_user_id_fkey` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ---------------------------------------------------------------
+-- Table: tourist_attractions (new)
+-- ---------------------------------------------------------------
+CREATE TABLE `tourist_attractions` (
+  `id` char(36) NOT NULL DEFAULT (uuid()),
+  `user_id` char(36) NOT NULL,
+  `attraction_name` varchar(255) NOT NULL,
+  `attraction_type` json DEFAULT NULL COMMENT 'Array of one or more: Ecotourism, Natural Attractions, Cultural, Religious, Historical Heritage Sites, Agri-Tourism, Farm Tourism Sites',
+  `valid_id_url` varchar(1000) DEFAULT NULL,
+  `barangay` varchar(255) DEFAULT NULL,
+  `street` text,
+  `status` enum('pending','approved','rejected','warning') NOT NULL DEFAULT 'pending',
+  `remarks` text,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `deleted_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_ta_user_id` (`user_id`),
+  KEY `idx_ta_status` (`status`),
+  KEY `idx_ta_deleted_at` (`deleted_at`),
+  CONSTRAINT `tourist_attractions_user_id_fkey` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ---------------------------------------------------------------
+-- Table: attraction_visit_logs (new)
+-- ---------------------------------------------------------------
+CREATE TABLE `attraction_visit_logs` (
+  `id` char(36) NOT NULL DEFAULT (uuid()),
+  `attraction_id` char(36) NOT NULL,
+  `visit_date` date NOT NULL,
+  `guest_count` int NOT NULL,
+  `male_count` int DEFAULT NULL COMMENT 'Optional; left NULL when gender not captured (estimated at report time via PSA 47.1/52.9 split)',
+  `female_count` int DEFAULT NULL COMMENT 'Optional; female = guest_count - male_count when the other side is entered',
+  `is_foreign` tinyint(1) NOT NULL DEFAULT 0 COMMENT '1 = recorded as Foreign tourist by the app user (country may still be NULL when no country was named); 0 = domestic (Filipino) or origin not captured',
+  `country` varchar(255) DEFAULT NULL COMMENT 'NULL = not named (origin not captured, or Foreign tourist who did not say which country); Philippines = Filipino tourist; otherwise Foreign. Nationality is derived from is_foreign + this value, never stored',
+  `province` varchar(255) DEFAULT NULL COMMENT 'Only set for domestic (Filipino) tourists; NULL whenever is_foreign = 1',
+  `city_municipality` varchar(255) DEFAULT NULL COMMENT 'Only set for domestic (Filipino) tourists; NULL whenever is_foreign = 1',
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `deleted_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_avl_attraction_id` (`attraction_id`),
+  KEY `idx_avl_visit_date` (`visit_date`),
+  KEY `idx_avl_deleted_at` (`deleted_at`),
+  KEY `idx_avl_is_foreign` (`is_foreign`),
+  CONSTRAINT `attraction_visit_logs_attraction_id_fkey` FOREIGN KEY (`attraction_id`) REFERENCES `tourist_attractions` (`id`) ON DELETE RESTRICT,
+  CONSTRAINT `chk_avl_guest_count` CHECK (`guest_count` >= 1),
+  CONSTRAINT `chk_avl_sex_sum` CHECK (`male_count` IS NULL OR `female_count` IS NULL OR `male_count` + `female_count` = `guest_count`),
+  CONSTRAINT `chk_avl_is_foreign_consistency` CHECK (
+    (`is_foreign` = 1 AND `province` IS NULL AND `city_municipality` IS NULL
+      AND (`country` IS NULL OR `country` <> 'Philippines'))
+    OR
+    (`is_foreign` = 0 AND (`country` IS NULL OR `country` = 'Philippines'))
+  )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- ---------------------------------------------------------------
@@ -207,12 +294,49 @@ CREATE TABLE `guest_record_rooms` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- ---------------------------------------------------------------
+-- Table: guest_origin_breakdowns
+-- Origin Groups: repeatable Country / Nationality /
+-- Province / City-Municipality / Male / Female rows. Keyed by
+-- guest_records (accommodation). country may be NULL when
+-- is_overseas = 1. province / city_municipality are
+-- Philippines-only.
+-- ---------------------------------------------------------------
+DROP TABLE IF EXISTS `guest_origin_breakdowns`;
+CREATE TABLE `guest_origin_breakdowns` (
+  `id` char(36) NOT NULL DEFAULT (uuid()),
+  `guest_record_id` char(36) NOT NULL,
+  `country` varchar(255) DEFAULT NULL,
+  `nationality` varchar(255) DEFAULT NULL,
+  `is_overseas` tinyint(1) NOT NULL DEFAULT 0,
+  `province` varchar(255) DEFAULT NULL,
+  `city_municipality` varchar(255) DEFAULT NULL,
+  `male_count` int NOT NULL DEFAULT 0,
+  `female_count` int NOT NULL DEFAULT 0,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `deleted_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_gob_guest_record_id` (`guest_record_id`),
+  KEY `idx_gob_deleted_at` (`deleted_at`),
+  CONSTRAINT `fk_gob_guest_record`
+    FOREIGN KEY (`guest_record_id`) REFERENCES `guest_records` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `chk_gob_sex_sum` CHECK (male_count + female_count >= 1),
+  CONSTRAINT `chk_gob_country_required` CHECK (is_overseas = 1 OR country IS NOT NULL),
+  CONSTRAINT `chk_gob_origin_only_philippines` CHECK (
+    country = 'Philippines' OR (province IS NULL AND city_municipality IS NULL)
+  ),
+  CONSTRAINT `chk_gob_overseas_no_origin` CHECK (
+    is_overseas = 0 OR (province IS NULL AND city_municipality IS NULL)
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ---------------------------------------------------------------
 -- Table: messages
 -- ---------------------------------------------------------------
 CREATE TABLE `messages` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
   `sender_id` char(36) NOT NULL,
-  `message_type` enum('compliance','announcement','general') NOT NULL DEFAULT 'general',
+  `message_type` enum('compliance','announcement') NOT NULL DEFAULT 'announcement',
   `subject` varchar(255) NOT NULL,
   `content` text NOT NULL,
   `is_broadcast` tinyint(1) NOT NULL DEFAULT '0',
@@ -229,7 +353,8 @@ CREATE TABLE `messages` (
 CREATE TABLE `message_recipients` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
   `message_id` char(36) NOT NULL,
-  `business_id` char(36) NOT NULL,
+  `business_id` char(36) DEFAULT NULL,
+  `attraction_id` char(36) DEFAULT NULL,
   `status` enum('unread','read','archived') NOT NULL DEFAULT 'unread',
   `is_read` tinyint(1) NOT NULL DEFAULT '0',
   `read_at` datetime DEFAULT NULL,
@@ -237,10 +362,16 @@ CREATE TABLE `message_recipients` (
   PRIMARY KEY (`id`),
   KEY `idx_mr_message_id` (`message_id`),
   KEY `idx_mr_business_id` (`business_id`),
+  KEY `idx_mr_attraction_id` (`attraction_id`),
   KEY `idx_mr_is_read` (`is_read`),
   KEY `idx_mr_status` (`status`),
   CONSTRAINT `message_recipients_business_id_fkey` FOREIGN KEY (`business_id`) REFERENCES `businesses` (`id`),
-  CONSTRAINT `message_recipients_message_id_fkey` FOREIGN KEY (`message_id`) REFERENCES `messages` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
+  CONSTRAINT `message_recipients_attraction_id_fkey` FOREIGN KEY (`attraction_id`) REFERENCES `tourist_attractions` (`id`),
+  CONSTRAINT `message_recipients_message_id_fkey` FOREIGN KEY (`message_id`) REFERENCES `messages` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `chk_mr_recipient_exclusive` CHECK (
+    (`business_id` IS NOT NULL AND `attraction_id` IS NULL)
+    OR (`business_id` IS NULL AND `attraction_id` IS NOT NULL)
+  )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- ---------------------------------------------------------------
@@ -248,9 +379,9 @@ CREATE TABLE `message_recipients` (
 -- ---------------------------------------------------------------
 CREATE TABLE `report_batches` (
   `id` char(36) NOT NULL DEFAULT (uuid()),
-  `report_type` enum('dae','var') NOT NULL,
+  `report_type` enum('dae','var1','var2') NOT NULL,
   `report_variant` enum('daily','summary','series','total') NOT NULL
-    COMMENT 'DAE: daily/summary/series. VAR always uses total (single sheet).',
+    COMMENT 'DAE: daily/summary/series. VAR 1 (attractions): always daily. VAR 2 (combined): always total.',
   `period_year` smallint NOT NULL,
   `period_months` JSON NOT NULL
     COMMENT 'Sorted array of ints 1-12, e.g. [1,2,3]. App must sort before insert.',
@@ -271,8 +402,9 @@ CREATE TABLE `report_batches` (
   CONSTRAINT `chk_batch_period_year` CHECK (`period_year` >= 2000),
   CONSTRAINT `chk_batch_period_months_array` CHECK (JSON_TYPE(`period_months`) = 'ARRAY'),
   CONSTRAINT `chk_batch_variant_matches_type` CHECK (
-    (`report_type` = 'dae' AND `report_variant` IN ('daily','summary','series')) OR
-    (`report_type` = 'var' AND `report_variant` = 'total')
+    (`report_type` = 'dae'  AND `report_variant` IN ('daily','summary','series')) OR
+    (`report_type` = 'var1' AND `report_variant` = 'daily') OR
+    (`report_type` = 'var2' AND `report_variant` = 'total')
   ),
   CONSTRAINT `chk_batch_single_month_variants` CHECK (
     `report_variant` NOT IN ('daily','summary') OR JSON_LENGTH(`period_months`) = 1
@@ -309,4 +441,38 @@ SET FOREIGN_KEY_CHECKS = 1;
 -- JOIN guest_record_rooms grr ON grr.guest_record_id = gr.id
 -- JOIN rooms r ON r.id = grr.room_id
 -- GROUP BY gr.id;
+--
+-- VAR total now combines both sources (accommodations + attractions).
+-- Source of truth per record: when it has live origin groups
+-- (guest_origin_breakdowns), spread each group's origin + counts;
+-- otherwise fall back to the record lead origin + counts. When groups
+-- exist, nationality is read from the stored column; when absent, the lead
+-- record nationality is used directly.
+--
+-- SELECT nationality, country, province, city_municipality,
+--        SUM(guest_count) AS guest_count
+-- FROM (
+--   SELECT
+--     CASE WHEN gob.id IS NULL THEN gr.lead_nationality
+--          ELSE COALESCE(gob.nationality, CASE WHEN gob.country = 'Philippines' THEN 'Filipino' ELSE 'Foreign' END) END AS nationality,
+--     COALESCE(gob.country, gr.lead_country) AS country,
+--     COALESCE(gob.province, gr.lead_province) AS province,
+--     COALESCE(gob.city_municipality, gr.lead_city_municipality) AS city_municipality,
+--     CASE WHEN gob.id IS NULL THEN gr.total_guests
+--          ELSE gob.male_count + gob.female_count END AS guest_count
+--   FROM guest_records gr
+--   LEFT JOIN guest_origin_breakdowns gob
+--     ON gob.guest_record_id = gr.id AND gob.deleted_at IS NULL
+--   WHERE gr.is_deleted = 0
+--   UNION ALL
+--   SELECT
+--     CASE WHEN avl.country = 'Philippines' THEN 'Filipino' ELSE 'Foreign' END AS nationality,
+--     avl.country,
+--     avl.province,
+--     avl.city_municipality,
+--     avl.guest_count
+--   FROM attraction_visit_logs avl
+--   WHERE avl.deleted_at IS NULL
+-- ) combined
+-- GROUP BY nationality, country, province, city_municipality;
 -- =====================================================================

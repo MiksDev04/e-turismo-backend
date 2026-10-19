@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import db from '../config/db.js';
 import mailer from '../utils/mailer.js';
+import { otpRequestLimiter, otpVerifyLimiter, loginLimiter } from '../middleware/rateLimiter.js';
 
 const router = express.Router();
 
@@ -10,7 +11,7 @@ const router = express.Router();
  * POST /api/auth/login
  * Authenticates user and returns profile + business data + JWT
  */
-router.post('/login', async (req, res, next) => {
+router.post('/login', loginLimiter, async (req, res, next) => {
   try {
     const { username, password } = req.body;
 
@@ -20,7 +21,7 @@ router.post('/login', async (req, res, next) => {
 
     // 1. Fetch user by username
     const [users] = await db.pool.execute(
-      'SELECT * FROM users WHERE (username = ? OR email = ?) AND deleted_at IS NULL',
+      'SELECT * FROM users WHERE (username = ? OR email = ?) AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1',
       [username.trim().toLowerCase(), username.trim().toLowerCase()]
     );
 
@@ -72,9 +73,6 @@ router.post('/login', async (req, res, next) => {
       if (business.status === 'pending') {
         return res.status(403).json({ message: 'Your account is still pending approval.' });
       }
-      if (business.status === 'suspended') {
-        return res.status(403).json({ message: 'Your account is suspended because of violations.' });
-      }
       if (business.status === 'rejected') {
         return res.status(403).json({ message: 'Your account application was not approved.' });
       }
@@ -103,6 +101,46 @@ router.post('/login', async (req, res, next) => {
       };
     }
 
+    // 4b. If attraction role, fetch attraction details
+    if (user.role === 'attraction') {
+      const [attractions] = await db.pool.execute(
+        'SELECT * FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+        [user.id]
+      );
+
+      if (attractions.length === 0) {
+        return res.status(404).json({ message: 'Attraction profile not found. Please contact support.' });
+      }
+
+      const attraction = attractions[0];
+
+      // Check status
+      if (attraction.status === 'pending') {
+        return res.status(403).json({ message: 'Your account is still pending approval.' });
+      }
+      if (attraction.status === 'suspended') {
+        return res.status(403).json({ message: 'Your account is suspended because of violations.' });
+      }
+      if (attraction.status === 'rejected') {
+        return res.status(403).json({ message: 'Your account application was not approved.' });
+      }
+
+      responseData.attraction = {
+        id: attraction.id,
+        attraction_name: attraction.attraction_name,
+        attraction_type: typeof attraction.attraction_type === 'string'
+          ? JSON.parse(attraction.attraction_type)
+          : attraction.attraction_type,
+        valid_id_url: attraction.valid_id_url,
+        street: attraction.street,
+        barangay: attraction.barangay,
+        status: attraction.status,
+        remarks: attraction.remarks,
+        created_at: attraction.created_at,
+        updated_at: attraction.updated_at
+      };
+    }
+
     // 5. Generate JWT
     const token = jwt.sign(
       { id: user.id, role: user.role },
@@ -125,7 +163,7 @@ router.post('/login', async (req, res, next) => {
  * POST /api/auth/forgot-password
  * Sends a 6-digit OTP to the user's email
  */
-router.post('/forgot-password', async (req, res, next) => {
+router.post('/forgot-password', otpRequestLimiter, async (req, res, next) => {
   try {
     const { email } = req.body;
 
@@ -135,7 +173,7 @@ router.post('/forgot-password', async (req, res, next) => {
 
     // 1. Find user by email
 const [users] = await db.pool.execute(
-      'SELECT id, email, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, email, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1',
       [email.trim().toLowerCase()]
     );
 
@@ -176,7 +214,7 @@ const [users] = await db.pool.execute(
  * POST /api/auth/verify-otp
  * Verifies if the provided OTP is correct and not expired
  */
-router.post('/verify-otp', async (req, res, next) => {
+router.post('/verify-otp', otpVerifyLimiter, async (req, res, next) => {
   try {
     const { email, otp } = req.body;
 
@@ -185,7 +223,7 @@ router.post('/verify-otp', async (req, res, next) => {
     }
 
     const [users] = await db.pool.execute(
-      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1',
       [email.trim().toLowerCase()]
     );
 
@@ -214,7 +252,7 @@ router.post('/verify-otp', async (req, res, next) => {
  * POST /api/auth/reset-password
  * Resets the password if the OTP is valid
  */
-router.post('/reset-password', async (req, res, next) => {
+router.post('/reset-password', otpVerifyLimiter, async (req, res, next) => {
   try {
     const { email, otp, new_password } = req.body;
 
@@ -224,7 +262,7 @@ router.post('/reset-password', async (req, res, next) => {
 
     // 1. Verify OTP again for security
     const [users] = await db.pool.execute(
-      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL',
+      'SELECT id, reset_otp, reset_otp_expiry, reset_otp_expiry > NOW() AS otp_valid FROM users WHERE email = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1',
       [email.trim().toLowerCase()]
     );
 

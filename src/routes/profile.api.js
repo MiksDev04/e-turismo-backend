@@ -6,6 +6,7 @@ import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
 import cloudinary from '../config/cloudinary.js';
 import upload from '../middleware/upload.js';
+import { otpRequestLimiter, otpVerifyLimiter, authedActionLimiter } from '../middleware/rateLimiter.js';
 
 const router = express.Router();
 
@@ -41,6 +42,14 @@ router.get('/profile', auth.authenticate, async (req, res, next) => {
         business.total_rooms = roomCountRows[0]?.count || 0;
       }
       responseData.business = business;
+    }
+
+    if (user.role === 'attraction') {
+      const [attractions] = await db.pool.execute(
+        'SELECT * FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+        [user.id]
+      );
+      responseData.attraction = attractions[0] || null;
     }
 
     res.json(responseData);
@@ -119,6 +128,123 @@ router.put('/business', auth.authenticate, auth.requireRole('business'), async (
 });
 
 /**
+ * PUT /api/attraction
+ * Updates attraction details (for attraction users)
+ */
+router.put('/attraction', auth.authenticate, auth.requireRole('attraction'), async (req, res, next) => {
+  try {
+    const { attraction_name, attraction_type, street, barangay } = req.body;
+
+    if (!attraction_name || !String(attraction_name).trim()) {
+      return res.status(400).json({ message: 'Attraction name is required.' });
+    }
+
+    let parsedTypes = attraction_type;
+    if (typeof parsedTypes === 'string') {
+      try {
+        parsedTypes = JSON.parse(parsedTypes);
+      } catch (e) {
+        parsedTypes = parsedTypes.split(',').map((s) => s.trim());
+      }
+    }
+
+    if (!Array.isArray(parsedTypes) || parsedTypes.length === 0) {
+      return res.status(400).json({ message: 'Select at least one attraction type.' });
+    }
+
+    const allowedAttractionTypes = [
+      'ecotourism',
+      'natural_attractions',
+      'cultural',
+      'religious',
+      'historical_heritage_sites',
+      'agri_tourism',
+      'farm_tourism_sites',
+    ];
+
+    const invalidTypes = parsedTypes.filter(
+      (type) => !allowedAttractionTypes.includes(String(type).trim())
+    );
+    if (invalidTypes.length > 0) {
+      return res.status(400).json({ message: 'Invalid attraction type selected.' });
+    }
+
+    const [attractions] = await db.pool.execute(
+      'SELECT id FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+      [req.user.id]
+    );
+    if (attractions.length === 0) {
+      return res.status(404).json({ message: 'No attraction associated with this account.' });
+    }
+
+    await db.pool.execute(
+      `UPDATE tourist_attractions SET
+        attraction_name = ?, attraction_type = ?, street = ?, barangay = ?
+      WHERE user_id = ? AND deleted_at IS NULL`,
+      [
+        String(attraction_name).trim(),
+        JSON.stringify(parsedTypes.map((type) => String(type).trim())),
+        String(street || '').trim(),
+        String(barangay || '').trim(),
+        req.user.id
+      ]
+    );
+
+    res.json({ message: 'Attraction information updated.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/attraction/upload
+ * Updates the representative's valid ID for the authenticated attraction
+ */
+router.post('/attraction/upload',
+  auth.authenticate,
+  auth.requireRole('attraction'),
+  upload.fields([
+    { name: 'valid_id', maxCount: 1 }
+  ]),
+  async (req, res, next) => {
+    try {
+      const [attractions] = await db.pool.execute(
+        'SELECT id FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+        [req.user.id]
+      );
+      if (attractions.length === 0) {
+        return res.status(404).json({ message: 'Attraction not found.' });
+      }
+      const attractionId = attractions[0].id;
+      const files = req.files;
+
+      if (!files?.valid_id?.[0]) {
+        return res.status(400).json({ message: 'No files provided.' });
+      }
+
+      const uploadResult = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { resource_type: 'raw', folder: 'tourism/valid_ids', public_id: attractionId, overwrite: true },
+          (err, result) => { if (err) reject(err); else resolve(result); }
+        );
+        stream.end(files.valid_id[0].buffer);
+      });
+
+      const validIdUrl = uploadResult.secure_url;
+
+      await db.pool.execute(
+        'UPDATE tourist_attractions SET valid_id_url = ? WHERE user_id = ? AND deleted_at IS NULL',
+        [validIdUrl, req.user.id]
+      );
+
+      res.json({ message: 'Valid ID updated successfully.', valid_id_url: validIdUrl });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
  * POST /api/business/upload
  * Updates permit file and/or valid ID for the authenticated business
  */
@@ -187,7 +313,7 @@ router.post('/business/upload',
  * POST /api/profile/change-password
  * Updates password for logged-in user
  */
-router.post('/change-password', auth.authenticate, async (req, res, next) => {
+router.post('/change-password', auth.authenticate, authedActionLimiter, async (req, res, next) => {
   try {
     const { old_password, new_password } = req.body;
 
@@ -221,7 +347,7 @@ router.post('/change-password', auth.authenticate, async (req, res, next) => {
  * POST /api/send-email-otp
  * Sends OTP to CURRENT email to verify identity for email/password change
  */
-router.post('/send-email-otp', auth.authenticate, async (req, res, next) => {
+router.post('/send-email-otp', auth.authenticate, otpRequestLimiter, async (req, res, next) => {
   try {
     const [users] = await db.pool.execute('SELECT email, full_name FROM users WHERE id = ?', [req.user.id]);
     if (users.length === 0) return res.status(404).json({ message: 'User not found.' });
@@ -252,7 +378,7 @@ router.post('/send-email-otp', auth.authenticate, async (req, res, next) => {
  * PUT /api/update-email
  * Sends a confirmation link to the new email instead of directly updating it
  */
-router.put('/update-email', auth.authenticate, async (req, res, next) => {
+router.put('/update-email', auth.authenticate, otpVerifyLimiter, async (req, res, next) => {
   try {
     const { new_email, otp } = req.body;
     if (!new_email || !otp) return res.status(400).json({ message: 'New email and code are required.' });
