@@ -660,11 +660,12 @@ function _revTag(rev) {
 
 // Shared cache key used by the download route, _getOrGenerate and pre-generation
 // so a pre-generated file is actually found by a later view.
-function _cacheKey(batchId, format, w, h) {
-  return `${batchId}:${format}:${w == null ? '' : w}x${h == null ? '' : h}`;
+function _cacheKey(batchId, format, w, h, sheetId) {
+  const base = `${batchId}:${format}:${w == null ? '' : w}x${h == null ? '' : h}`;
+  return sheetId == null ? base : `${base}:${sheetId}`;
 }
 
-const _REPORT_CACHE_MAX_ENTRIES = 20;
+const _REPORT_CACHE_MAX_ENTRIES = 100;
 const _REPORT_CACHE_MAX_BYTES = 128 * 1024 * 1024;
 const _reportFileCache = new Map(); // key -> { buffer, revision, contentType, filename, bytes }
 let _reportCacheBytes = 0;
@@ -704,8 +705,8 @@ function _cacheSet(key, entry) {
 // so a request that arrives after a data change never joins an old-data build.
 // A build is cached only if the revision did not move during it; a failed build
 // is never cached.
-async function _getOrGenerate({ batchId, format, pageWidth, pageHeight, build }) {
-  const key = _cacheKey(batchId, format, pageWidth, pageHeight);
+async function _getOrGenerate({ batchId, format, pageWidth, pageHeight, sheetId, build }) {
+  const key = _cacheKey(batchId, format, pageWidth, pageHeight, sheetId);
   const rev = await _reportDataRevision();
 
   const hit = _cacheGet(key);
@@ -1197,11 +1198,36 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
   }
 });
 
+// ── List selectable sheets (accounts) for DAE / VAR 1 ────────────────────────
+router.get('/reports/sheets', adminGuard, async (req, res, next) => {
+  try {
+    const { reportType } = req.query;
+
+    let sql;
+    if (reportType === 'dae') {
+      sql = `SELECT id, business_name AS name FROM businesses
+             WHERE status IN ('approved','warning') AND deleted_at IS NULL
+             ORDER BY business_name`;
+    } else if (reportType === 'var1') {
+      sql = `SELECT id, attraction_name AS name FROM tourist_attractions
+             WHERE status IN ('approved','warning') AND deleted_at IS NULL
+             ORDER BY attraction_name`;
+    } else {
+      return res.json([]);
+    }
+
+    const [rows] = await db.pool.execute(sql);
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── Download report (generates file in memory, streams bytes) ───────────────
 router.post('/reports/download', adminGuard, async (req, res, next) => {
   // TODO: large annual series across many establishments may be slow on free tier
   try {
-    const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx', pageWidth, pageHeight } = req.body;
+    const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx', pageWidth, pageHeight, sheetId } = req.body;
 
     if (!['dae', 'var1', 'var2'].includes(reportType)) {
       return res.status(400).json({ message: 'reportType must be "dae", "var1", or "var2"' });
@@ -1251,10 +1277,10 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
     });
 
     const entry = await _getOrGenerate({
-      batchId, format, pageWidth, pageHeight,
+      batchId, format, pageWidth, pageHeight, sheetId,
       build: () => _generateReportFile({
         reportType, variant: effectiveVariant, sortedMonths, year,
-        format, pageWidth, pageHeight, batchId, userId: req.user.id,
+        format, pageWidth, pageHeight, batchId, userId: req.user.id, sheetId,
       }),
     });
 
@@ -1290,7 +1316,7 @@ async function _resolveBatch({ reportType, variant, year, months, userId }) {
 // Pure w.r.t. the HTTP layer so it can be driven by both the download route and
 // background pre-generation on batch creation.
 async function _generateReportFile({
-  reportType, variant, sortedMonths, year, format, pageWidth, pageHeight, batchId, userId,
+  reportType, variant, sortedMonths, year, format, pageWidth, pageHeight, batchId, userId, sheetId,
 }) {
     // ── Phase 0 timing (report-viewing-tasks.md T0.1) ─────────────────────────
     const t0 = Date.now();
@@ -1414,7 +1440,7 @@ async function _generateReportFile({
 
       const attractionTmpl = attractionTemplateWb?.getWorksheet('Sheet1');
 
-      for (const att of attractions) {
+      for (const att of attractions.filter(a => !sheetId || a.id === sheetId)) {
         const md = await _fetchAttractionMonthData(att.id, sortedMonths[0], year);
         const sheetName = att.attraction_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
         const sheet = attractionTmpl
@@ -1441,7 +1467,7 @@ async function _generateReportFile({
       }
     } else {
       // ── DAE: Per-establishment worksheets ──────────────────────────────────
-      for (const biz of businesses) {
+      for (const biz of businesses.filter(b => !sheetId || b.id === sheetId)) {
         let bizAllMonths = null;
         if (variant === 'series' && sortedMonths.length > 1) {
           bizAllMonths = await Promise.all(
