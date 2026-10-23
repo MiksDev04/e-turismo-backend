@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
+import { parseDbDate } from '../utils/date.js';
 
 const router = express.Router();
 
@@ -194,6 +195,62 @@ router.get('/rankings', adminGuard, async (req, res, next) => {
     });
 
     res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/admin/attractions/:id/daily-tourists
+ * Per-day visitor counts for one attraction, for a given month/year.
+ * Query params: month (1-12), year (2000-2100)
+ */
+router.get('/:id/daily-tourists', adminGuard, async (req, res, next) => {
+  try {
+    const month = parseInt(req.query.month, 10);
+    const year  = parseInt(req.query.year, 10);
+
+    if (!month || month < 1 || month > 12) {
+      return res.status(400).json({ message: 'month must be between 1 and 12.' });
+    }
+    if (!year || year < 2000 || year > 2100) {
+      return res.status(400).json({ message: 'year must be between 2000 and 2100.' });
+    }
+
+    // Local-midnight bounds; periodEnd is exclusive (Date normalises month 12 -> Jan next year).
+    const periodStart = new Date(year, month - 1, 1);
+    const periodEnd   = new Date(year, month, 1);
+    const daysInMonth = new Date(year, month, 0).getDate(); // last day of the selected month
+
+    const [rows] = await db.pool.execute(
+      `SELECT visit_date, SUM(guest_count) AS tourists
+       FROM attraction_visit_logs
+       WHERE attraction_id = ?
+         AND deleted_at IS NULL
+         AND visit_date >= ? AND visit_date < ?
+       GROUP BY visit_date`,
+      [req.params.id, periodStart, periodEnd]
+    );
+
+    const buckets = new Array(daysInMonth + 1).fill(0);
+    for (const row of rows) {
+      // visit_date arrives as 'YYYY-MM-DD' (dateStrings enabled); parseDbDate
+      // returns local wall-clock so getDate() is the correct day of month.
+      const date = parseDbDate(row.visit_date);
+      if (!date) continue;
+      const day = date.getDate();
+      if (day < 1 || day > daysInMonth) continue;
+      buckets[day] += Number(row.tourists) || 0;
+    }
+
+    const days = [];
+    let total = 0;
+    for (let day = 1; day <= daysInMonth; day++) {
+      days.push({ day, tourists: buckets[day] });
+      total += buckets[day];
+    }
+
+    res.json({ data: { year, month, days, total } });
   } catch (err) {
     next(err);
   }
