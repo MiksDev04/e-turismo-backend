@@ -632,13 +632,15 @@ const _reportRevisionTables = [
 ];
 
 async function _reportDataRevision() {
+  // One round trip: UNION ALL of the per-table MAX/COUNT queries (table names
+  // come from the constant above, never from user input).
+  const sql = _reportRevisionTables
+    .map(table => `SELECT MAX(created_at) AS c, MAX(updated_at) AS u, COUNT(*) AS n FROM \`${table}\``)
+    .join(' UNION ALL ');
+  const [r] = await queryWithRetry(() => db.pool.query(sql));
   let ts = 0;
   let rows = 0;
-  for (const table of _reportRevisionTables) {
-    const [r] = await db.pool.query(
-      `SELECT MAX(created_at) AS c, MAX(updated_at) AS u, COUNT(*) AS n FROM \`${table}\``
-    );
-    const row = r[0] || {};
+  for (const row of r) {
     for (const v of [row.c, row.u]) {
       if (v) {
         const ms = new Date(v).getTime();
@@ -660,11 +662,12 @@ function _revTag(rev) {
 
 // Shared cache key used by the download route, _getOrGenerate and pre-generation
 // so a pre-generated file is actually found by a later view.
-function _cacheKey(batchId, format, w, h) {
-  return `${batchId}:${format}:${w == null ? '' : w}x${h == null ? '' : h}`;
+function _cacheKey(batchId, format, w, h, sheetId) {
+  const base = `${batchId}:${format}:${w == null ? '' : w}x${h == null ? '' : h}`;
+  return sheetId == null ? base : `${base}:${sheetId}`;
 }
 
-const _REPORT_CACHE_MAX_ENTRIES = 20;
+const _REPORT_CACHE_MAX_ENTRIES = 100;
 const _REPORT_CACHE_MAX_BYTES = 128 * 1024 * 1024;
 const _reportFileCache = new Map(); // key -> { buffer, revision, contentType, filename, bytes }
 let _reportCacheBytes = 0;
@@ -704,9 +707,9 @@ function _cacheSet(key, entry) {
 // so a request that arrives after a data change never joins an old-data build.
 // A build is cached only if the revision did not move during it; a failed build
 // is never cached.
-async function _getOrGenerate({ batchId, format, pageWidth, pageHeight, build }) {
-  const key = _cacheKey(batchId, format, pageWidth, pageHeight);
-  const rev = await _reportDataRevision();
+async function _getOrGenerate({ batchId, format, pageWidth, pageHeight, sheetId, build, revision }) {
+  const key = _cacheKey(batchId, format, pageWidth, pageHeight, sheetId);
+  const rev = revision || await _reportDataRevision();
 
   const hit = _cacheGet(key);
   if (hit && _sameRevision(hit.revision, rev)) return hit;
@@ -908,16 +911,20 @@ router.post('/reports', adminGuard, async (req, res, next) => {
     // Warm the file cache in the background so the first view is a cache hit.
     // Serialized (length-1 queue) to avoid stacking CPU-bound builds; failures
     // are logged only and never cached.
-    _enqueuePreGen(() => _getOrGenerate({
-      batchId,
-      format: 'pdf',
-      pageWidth: undefined,
-      pageHeight: undefined,
-      build: () => _generateReportFile({
-        reportType, variant: effectiveVariant, sortedMonths: months, year: parseInt(periodYear, 10),
-        format: 'pdf', pageWidth: undefined, pageHeight: undefined, batchId, userId: req.user.id,
-      }),
-    }));
+    // DAE / VAR 1 are viewed one sheet at a time (cache key includes sheetId), so
+    // a full all-sheets pre-generation would never be a cache hit and only burns CPU.
+    if (reportType === 'var2') {
+      _enqueuePreGen(() => _getOrGenerate({
+        batchId,
+        format: 'pdf',
+        pageWidth: undefined,
+        pageHeight: undefined,
+        build: () => _generateReportFile({
+          reportType, variant: effectiveVariant, sortedMonths: months, year: parseInt(periodYear, 10),
+          format: 'pdf', pageWidth: undefined, pageHeight: undefined, batchId, userId: req.user.id,
+        }),
+      }));
+    }
   } catch (err) {
     next(err);
   }
@@ -1197,11 +1204,36 @@ router.get('/reports/view', adminGuard, async (req, res, next) => {
   }
 });
 
+// ── List selectable sheets (accounts) for DAE / VAR 1 ────────────────────────
+router.get('/reports/sheets', adminGuard, async (req, res, next) => {
+  try {
+    const { reportType } = req.query;
+
+    let sql;
+    if (reportType === 'dae') {
+      sql = `SELECT id, business_name AS name FROM businesses
+             WHERE status IN ('approved','warning') AND deleted_at IS NULL
+             ORDER BY business_name`;
+    } else if (reportType === 'var1') {
+      sql = `SELECT id, attraction_name AS name FROM tourist_attractions
+             WHERE status IN ('approved','warning') AND deleted_at IS NULL
+             ORDER BY attraction_name`;
+    } else {
+      return res.json([]);
+    }
+
+    const [rows] = await db.pool.execute(sql);
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── Download report (generates file in memory, streams bytes) ───────────────
 router.post('/reports/download', adminGuard, async (req, res, next) => {
   // TODO: large annual series across many establishments may be slow on free tier
   try {
-    const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx', pageWidth, pageHeight } = req.body;
+    const { reportType = 'dae', reportVariant, periodYear, periodMonths, format = 'xlsx', pageWidth, pageHeight, sheetId } = req.body;
 
     if (!['dae', 'var1', 'var2'].includes(reportType)) {
       return res.status(400).json({ message: 'reportType must be "dae", "var1", or "var2"' });
@@ -1246,18 +1278,24 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
 
     const year = parseInt(periodYear, 10);
 
-    const batchId = await _resolveBatch({
-      reportType, variant: effectiveVariant, year, months: sortedMonths, userId: req.user.id,
-    });
+    const _handlerT0 = Date.now();
+    const [batchId, revision] = await Promise.all([
+      _resolveBatch({
+        reportType, variant: effectiveVariant, year, months: sortedMonths, userId: req.user.id,
+      }),
+      _reportDataRevision(),
+    ]);
+    console.log(`[report-timing] resolveBatch+revision total=${Date.now() - _handlerT0}ms`);
 
     const entry = await _getOrGenerate({
-      batchId, format, pageWidth, pageHeight,
+      batchId, format, pageWidth, pageHeight, sheetId, revision,
       build: () => _generateReportFile({
         reportType, variant: effectiveVariant, sortedMonths, year,
-        format, pageWidth, pageHeight, batchId, userId: req.user.id,
+        format, pageWidth, pageHeight, batchId, userId: req.user.id, sheetId,
       }),
     });
 
+    console.log(`[report-timing] handler total=${Date.now() - _handlerT0}ms format=${format} sheetId=${sheetId ?? '-'}`);
     res.set('Content-Type', entry.contentType);
     res.set('Content-Disposition', `attachment; filename="${entry.filename}"`);
     res.send(entry.buffer);
@@ -1270,19 +1308,31 @@ router.post('/reports/download', adminGuard, async (req, res, next) => {
   }
 });
 
+// Bookkeeping only: do not make the viewer wait for it.
+function _touchGenerated(batchId) {
+  db.pool
+    .execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId])
+    .catch(err => console.error('[report] last_generated_at update failed:', err.message));
+}
+
 // Resolve (find-or-create) the report_batches row for a download request.
 async function _resolveBatch({ reportType, variant, year, months, userId }) {
+  const selectSql =
+    `SELECT id FROM report_batches
+     WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`;
+  const selectParams = [reportType, variant, year, JSON.stringify(months)];
+
+  // Common path: the batch already exists -> a single round trip.
+  const [existing] = await db.pool.execute(selectSql, selectParams);
+  if (existing.length > 0) return existing[0].id;
+
   const newBatchId = uuidv4();
   await db.pool.execute(
     `INSERT IGNORE INTO report_batches (id, report_type, report_variant, period_year, period_months, requested_by)
      VALUES (?, ?, ?, ?, ?, ?)`,
     [newBatchId, reportType, variant, year, JSON.stringify(months), userId]
   );
-  const [rows] = await db.pool.execute(
-    `SELECT id FROM report_batches
-     WHERE report_type = ? AND report_variant = ? AND period_year = ? AND period_months = CAST(? AS JSON)`,
-    [reportType, variant, year, JSON.stringify(months)]
-  );
+  const [rows] = await db.pool.execute(selectSql, selectParams);
   return rows[0].id;
 }
 
@@ -1290,18 +1340,34 @@ async function _resolveBatch({ reportType, variant, year, months, userId }) {
 // Pure w.r.t. the HTTP layer so it can be driven by both the download route and
 // background pre-generation on batch creation.
 async function _generateReportFile({
-  reportType, variant, sortedMonths, year, format, pageWidth, pageHeight, batchId, userId,
+  reportType, variant, sortedMonths, year, format, pageWidth, pageHeight, batchId, userId, sheetId,
 }) {
-    // ── Aggregate (reuse same logic as /view) ─────────────────────────────────
-    const [businesses] = await db.pool.execute(
-      `SELECT id, business_name, business_line, ae_id, region, city_municipality, province,
-              owner_first_name, owner_last_name, owner_middle_name,
-              (SELECT COUNT(*) FROM rooms WHERE business_id = businesses.id) AS total_rooms
-       FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL ORDER BY business_name`
-    );
+    // ── Phase 0 timing (report-viewing-tasks.md T0.1) ─────────────────────────
+    const t0 = Date.now();
+    let _prev = t0;
+    const lap = (label) => {
+      const now = Date.now();
+      console.log(`[report-timing] ${label} total=${now - t0}ms delta=${now - _prev}ms businesses=${businesses.length} format=${format}`);
+      _prev = now;
+    };
 
-    const [userRows] = await db.pool.execute('SELECT full_name FROM users WHERE id = ?', [userId]);
+    // ── Aggregate (reuse same logic as /view) ─────────────────────────────────
+    // DAE sheet view only needs the one selected business; everything else
+    // (VAR 2, full exports) keeps the unfiltered list.
+    const onlyThisBusiness = reportType === 'dae' && sheetId;
+    const [[businesses], [userRows]] = await Promise.all([
+      db.pool.execute(
+        `SELECT id, business_name, business_line, ae_id, region, city_municipality, province,
+                owner_first_name, owner_last_name, owner_middle_name,
+                (SELECT COUNT(*) FROM rooms WHERE business_id = businesses.id) AS total_rooms
+         FROM businesses WHERE status IN ('approved', 'warning') AND deleted_at IS NULL
+         ${onlyThisBusiness ? 'AND id = ?' : ''} ORDER BY business_name`,
+        onlyThisBusiness ? [sheetId] : []
+      ),
+      db.pool.execute('SELECT full_name FROM users WHERE id = ?', [userId]),
+    ]);
     const adminName = userRows[0]?.full_name || 'System Admin';
+    lap('db: biz+user');
 
     const daysInMonth = sortedMonths.length === 1 ? new Date(year, sortedMonths[0], 0).getDate() : 0;
 
@@ -1405,7 +1471,7 @@ async function _generateReportFile({
 
       const attractionTmpl = attractionTemplateWb?.getWorksheet('Sheet1');
 
-      for (const att of attractions) {
+      for (const att of attractions.filter(a => !sheetId || a.id === sheetId)) {
         const md = await _fetchAttractionMonthData(att.id, sortedMonths[0], year);
         const sheetName = att.attraction_name.substring(0, 31).replace(/[\\\?\*\/\[\]]/g, '');
         const sheet = attractionTmpl
@@ -1432,7 +1498,7 @@ async function _generateReportFile({
       }
     } else {
       // ── DAE: Per-establishment worksheets ──────────────────────────────────
-      for (const biz of businesses) {
+      for (const biz of businesses.filter(b => !sheetId || b.id === sheetId)) {
         let bizAllMonths = null;
         if (variant === 'series' && sortedMonths.length > 1) {
           bizAllMonths = await Promise.all(
@@ -1468,6 +1534,8 @@ async function _generateReportFile({
       }
     }
 
+    lap('sheets built');
+
     _purgeOrphanedDefinedNames(wb);
     wb.eachSheet(ws => {
       if (ws.pageSetup) {
@@ -1490,6 +1558,7 @@ async function _generateReportFile({
       // Evaluate all formulas so the exported file carries cached results
       // (viewers that don't recalculate show 0 in totals/subtotals otherwise).
       wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
+      lap('formulas');
       wb.calcProperties.fullCalcOnLoad = true;
       const buffer = await wb.xlsx.writeBuffer();
       const fontXml = reportType === 'var2' ? defaultFontXml.var
@@ -1501,7 +1570,8 @@ async function _generateReportFile({
       } else if (reportType === 'var2') {
         outBuffer = await _patchVar2ImageOffsets(outBuffer);
       }
-      await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
+      _touchGenerated(batchId);
+      lap('file written');
       return {
         buffer: Buffer.from(outBuffer),
         contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -1511,8 +1581,10 @@ async function _generateReportFile({
 
     // Evaluate all formulas so the PDF renderer can read cached results
     wb.eachSheet(sheet => _evaluateFormulasInSheet(sheet));
+    lap('formulas');
     const pdfBuffer = await _generatePdfBuffer(wb, variant, sortedMonths[0], year, reportType, { pageWidth, pageHeight });
-    await db.pool.execute('UPDATE report_batches SET last_generated_at = NOW() WHERE id = ?', [batchId]);
+    _touchGenerated(batchId);
+    lap('file written');
     return { buffer: pdfBuffer, contentType: 'application/pdf', filename: `${baseFilename}.pdf` };
 }
 
@@ -1543,29 +1615,30 @@ async function _fetchMonthData(businessId, month, year) {
   // room removed mid-stay is only counted for the days it was actually occupied.
   const recordIds = records.map(r => r.id);
   let roomWindows = {};
+  let breakdownsByRecord = {};
   if (recordIds.length > 0) {
-    const [grrRows] = await db.pool.execute(
-      `SELECT guest_record_id, room_id,
-              DATE(created_at) AS start_date,
-              DATE(deleted_at)  AS end_date
-       FROM guest_record_rooms
-       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')})`,
-      recordIds
-    );
+    const placeholders = recordIds.map(() => '?').join(',');
+    // The two lookups are independent (both only need recordIds) -> run together.
+    const [[grrRows], [gobRows]] = await Promise.all([
+      db.pool.execute(
+        `SELECT guest_record_id, room_id,
+                DATE(created_at) AS start_date,
+                DATE(deleted_at)  AS end_date
+         FROM guest_record_rooms
+         WHERE guest_record_id IN (${placeholders})`,
+        recordIds
+      ),
+      db.pool.execute(
+        `SELECT guest_record_id, country, nationality, is_overseas, province, city_municipality, male_count, female_count
+         FROM guest_origin_breakdowns
+         WHERE guest_record_id IN (${placeholders}) AND deleted_at IS NULL`,
+        recordIds
+      ),
+    ]);
     grrRows.forEach(r => {
       if (!roomWindows[r.guest_record_id]) roomWindows[r.guest_record_id] = [];
       roomWindows[r.guest_record_id].push({ startDate: r.start_date, endDate: r.end_date });
     });
-  }
-
-  let breakdownsByRecord = {};
-  if (recordIds.length > 0) {
-    const [gobRows] = await db.pool.execute(
-      `SELECT guest_record_id, country, nationality, is_overseas, province, city_municipality, male_count, female_count
-       FROM guest_origin_breakdowns
-       WHERE guest_record_id IN (${recordIds.map(() => '?').join(',')}) AND deleted_at IS NULL`,
-      recordIds
-    );
     gobRows.forEach(b => {
       if (!breakdownsByRecord[b.guest_record_id]) breakdownsByRecord[b.guest_record_id] = [];
       breakdownsByRecord[b.guest_record_id].push(b);

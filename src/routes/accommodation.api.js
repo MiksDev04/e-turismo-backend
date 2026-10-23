@@ -258,6 +258,77 @@ router.get('/:id/rooms', adminGuard, async (req, res, next) => {
 });
 
 /**
+ * GET /api/admin/accommodations/:id/daily-tourists
+ * Per-day tourist counts for one business, for a given month/year.
+ * Query params: month (1-12), year (2000-2100)
+ */
+router.get('/:id/daily-tourists', adminGuard, async (req, res, next) => {
+  try {
+    const month = parseInt(req.query.month, 10);
+    const year  = parseInt(req.query.year, 10);
+
+    if (!month || month < 1 || month > 12) {
+      return res.status(400).json({ message: 'month must be between 1 and 12.' });
+    }
+    if (!year || year < 2000 || year > 2100) {
+      return res.status(400).json({ message: 'year must be between 2000 and 2100.' });
+    }
+
+    // Local-midnight bounds; periodEnd is exclusive (Date normalises month 12 -> Jan next year).
+    const periodStart  = new Date(year, month - 1, 1);
+    const periodEnd    = new Date(year, month, 1);
+    const monthLastDay = new Date(year, month, 0); // last day of the selected month
+    const daysInMonth  = monthLastDay.getDate();
+
+    const [rows] = await db.pool.execute(
+      `SELECT check_in, check_out, actual_check_out, total_guests
+       FROM guest_records
+       WHERE business_id = ?
+         AND is_deleted = false
+         AND check_in < ?
+         AND COALESCE(actual_check_out, check_out) >= ?`,
+      [req.params.id, periodEnd, periodStart]
+    );
+
+    const buckets = new Array(daysInMonth + 1).fill(0);
+
+    for (const row of rows) {
+      const checkIn = parseDbDate(row.check_in);
+      if (!checkIn) continue;
+
+      // Actual check-out takes priority; check_out is only the fallback. A stay
+      // with neither is treated as a same-day stay on the check-in date.
+      const lastDay = parseDbDate(row.actual_check_out || row.check_out) || new Date(checkIn);
+      if (lastDay < checkIn) lastDay.setTime(checkIn.getTime());
+
+      // Clamp the stay to the selected month (the check-out day is inclusive).
+      const start = checkIn > periodStart ? checkIn : new Date(periodStart);
+      const end   = lastDay < monthLastDay ? lastDay : new Date(monthLastDay);
+      if (end < start) continue;
+
+      const guests = Number(row.total_guests) || 0;
+      const cursor = new Date(start);
+      cursor.setHours(0, 0, 0, 0);
+      while (cursor <= end) {
+        buckets[cursor.getDate()] += guests;
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    }
+
+    const days = [];
+    let total = 0;
+    for (let day = 1; day <= daysInMonth; day++) {
+      days.push({ day, tourists: buckets[day] });
+      total += buckets[day];
+    }
+
+    res.json({ data: { year, month, days, total } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * PUT /api/admin/accommodations/:id/approve
  * Approve a business
  */
