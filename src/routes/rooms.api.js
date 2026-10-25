@@ -244,6 +244,8 @@ router.put('/rooms/:id/status', auth.authenticate, auth.requireRole('business'),
       )
     );
 
+    // TODO(activity-log): guest_record_checked_out (auto path)
+
     res.json({ message: 'Room status updated', roomStatus });
   } catch (err) {
     next(err);

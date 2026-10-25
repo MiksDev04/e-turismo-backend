@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import { parseOriginGroups } from '../utils/originGroups.js';
+import { logActivity } from '../utils/activityLogger.js';
 
 const router = express.Router();
 
@@ -211,6 +212,7 @@ router.post('/guest-entries', auth.authenticate, auth.requireRole('business'), a
     }
 
     await connection.commit();
+    await logActivity(req.user.id, 'guest_record_created', { guestRecordId });
     res.status(201).json({ message: 'Guest entry saved successfully', guestRecordId });
   } catch (err) {
     await connection.rollback();

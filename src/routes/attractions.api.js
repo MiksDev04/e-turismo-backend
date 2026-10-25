@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
+import { logActivity } from '../utils/activityLogger.js';
 import { parseDbDate } from '../utils/date.js';
 
 const router = express.Router();
@@ -267,6 +268,7 @@ router.put('/:id/approve', adminGuard, async (req, res, next) => {
       'UPDATE tourist_attractions SET status = ?, remarks = ? WHERE id = ?',
       ['approved', remarks || null, req.params.id]
     );
+    await logActivity(req.user.id, 'attraction_status_changed', { attractionId: req.params.id }, remarks ? `approved: ${remarks}` : 'approved');
     res.json({ message: 'Attraction approved.' });
   } catch (err) {
     next(err);
@@ -284,6 +286,7 @@ router.put('/:id/reject', adminGuard, async (req, res, next) => {
       'UPDATE tourist_attractions SET status = ?, remarks = ? WHERE id = ?',
       ['rejected', remarks || null, req.params.id]
     );
+    await logActivity(req.user.id, 'attraction_status_changed', { attractionId: req.params.id }, remarks ? `rejected: ${remarks}` : 'rejected');
     res.json({ message: 'Attraction rejected.' });
   } catch (err) {
     next(err);
@@ -301,6 +304,7 @@ router.put('/:id/flag', adminGuard, async (req, res, next) => {
       'UPDATE tourist_attractions SET status = ?, remarks = ? WHERE id = ?',
       ['warning', remarks || null, req.params.id]
     );
+    await logActivity(req.user.id, 'attraction_status_changed', { attractionId: req.params.id }, remarks ? `warning: ${remarks}` : 'warning');
     res.json({ message: 'Attraction flagged.' });
   } catch (err) {
     next(err);
@@ -361,6 +365,8 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     );
 
     await connection.commit();
+
+    await logActivity(req.user.id, 'attraction_status_changed', { attractionId: id }, `${status}: ${reason}`);
 
     res.json({ message: 'Attraction status updated.' });
 

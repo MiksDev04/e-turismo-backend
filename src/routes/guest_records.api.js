@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import { parseOriginGroups, breakdownToJson } from '../utils/originGroups.js';
+import { logActivity } from '../utils/activityLogger.js';
 
 const router = express.Router();
 
@@ -256,6 +257,8 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
 
     const now = new Date();
 
+    let created = false;
+
     if (existing.length === 0) {
       // Create new (Upsert logic for syncPendingCreates)
       if (!businessId) {
@@ -291,6 +294,7 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
           now
         ]
       );
+      created = true;
 
       // Create junction rows when roomIds are provided (mirrors POST handler logic).
       // This handles the case where a record was created offline (syncPendingCreate)
@@ -479,6 +483,13 @@ router.put('/guest-records/:id', auth.authenticate, auth.requireRole('business')
     }
 
     await connection.commit();
+    if (created) {
+      await logActivity(req.user.id, 'guest_record_created', { guestRecordId: recordId });
+    } else if (isCheckout) {
+      await logActivity(req.user.id, 'guest_record_checked_out', { guestRecordId: recordId }, 'manual checkout');
+    } else {
+      await logActivity(req.user.id, 'guest_record_updated', { guestRecordId: recordId }, null);
+    }
     res.json({ message: 'Record updated successfully', updated_at: now.toISOString() });
   } catch (err) {
     await connection.rollback();

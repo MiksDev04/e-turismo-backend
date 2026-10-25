@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import distributionConfig, { kOriginPct, kOriginCategories } from '../config/distributionConfig.js';
+import { logActivity } from '../utils/activityLogger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -906,6 +907,22 @@ router.post('/reports', adminGuard, async (req, res, next) => {
     );
     const batchId = rows[0].id;
     const isExisting = batchId !== newBatchId;
+
+    // Log report creation only when a new report record is actually inserted;
+    // viewing/downloading (which may reuse this same batch) must not count.
+    if (!isExisting) {
+      const reportName = reportType === 'dae' ? 'DAE (accommodations)' : reportType === 'var1' ? 'VAR 1 (attractions)' : 'VAR 2 (combined)';
+      const _abbr = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      let periodText;
+      if (months.length === 12) periodText = `Jan-Dec ${periodYear}`;
+      else if (months.length === 1) periodText = `${_abbr[months[0]]} ${periodYear}`;
+      else periodText = `${_abbr[months[0]]}-${_abbr[months[months.length - 1]]} ${periodYear}`;
+      let details = reportName;
+      if (reportType === 'dae') details += ` ${effectiveVariant}`;
+      details += `, ${periodText}`;
+      await logActivity(req.user.id, 'report_generated', {}, details);
+    }
+
     res.status(200).json({ batchId, existing: isExisting });
 
     // Warm the file cache in the background so the first view is a cache hit.
@@ -1551,6 +1568,15 @@ async function _generateReportFile({
       if (ms.length === 12) return 'Jan-Dec';
       if (ms.length === 1) return _abbr[ms[0]];
       return `${_abbr[ms[0]]}-${_abbr[ms[ms.length - 1]]}`;
+    };
+    const _fmtPeriodDisplay = (ms) => {
+      if (ms.length === 0) return '';
+      if (ms.length === 12) return `Jan-Dec ${year}`;
+      const sorted = [...ms].sort((a, b) => a - b);
+      if (sorted.length === 1) return `${_abbr[sorted[0]]} ${year}`;
+      const contiguous = sorted.every((m, i) => i === 0 || m === sorted[i - 1] + 1);
+      if (contiguous) return `${_abbr[sorted[0]]}-${_abbr[sorted[sorted.length - 1]]} ${year}`;
+      return sorted.map(m => _abbr[m]).join(', ') + ` ${year}`;
     };
     const baseFilename = `${reportType.toUpperCase()}_${variant}_${_fmtPeriod(sortedMonths)}_${year}`;
 
