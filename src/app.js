@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import errorHandler from './middleware/errorHandler.js';
@@ -43,6 +44,7 @@ app.use(cors({
 }));
 
 app.use(express.json());
+app.use(compression());
 app.use(express.urlencoded({ extended: true }));
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', async (req, res) => await res.json({ status: 'ok' }));
