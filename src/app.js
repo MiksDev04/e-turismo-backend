@@ -1,4 +1,5 @@
 import express from 'express';
+import compression from 'compression';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -43,6 +44,7 @@ app.use(cors({
 }));
 
 app.use(express.json());
+app.use(compression());
 app.use(express.urlencoded({ extended: true }));
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', async (req, res) => await res.json({ status: 'ok' }));

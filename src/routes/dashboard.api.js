@@ -104,10 +104,12 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('admin', 'busin
 
     let query = `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
                         male_count, female_count, lead_sex, purpose_of_visit
-                 FROM guest_records 
-                 WHERE is_deleted = FALSE 
-                   AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`;
-    let params = [startDate, endDate];
+                 FROM guest_records
+                 WHERE is_deleted = FALSE
+                   AND ((actual_check_out IS NOT NULL AND actual_check_out >= ?)
+                        OR (actual_check_out IS NULL AND check_out >= ?))
+                   AND check_in <= ?`;
+    let params = [startDate, startDate, endDate];
 
     if (req.user.role === 'business') {
       // Business must specify their ID and it must match their session or they must be authorized
@@ -354,8 +356,8 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     const [periodRecords] = await connection.execute(
       `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
               male_count, female_count, lead_sex, purpose_of_visit
-       FROM guest_records WHERE is_deleted = FALSE AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`,
-      [startDate, endDate]
+       FROM guest_records WHERE is_deleted = FALSE AND ((actual_check_out IS NOT NULL AND actual_check_out >= ?) OR (actual_check_out IS NULL AND check_out >= ?)) AND check_in <= ?`,
+      [startDate, startDate, endDate]
     );
 
     let yearRecords;
@@ -365,8 +367,8 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
       const [rows] = await connection.execute(
         `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
                 male_count, female_count, lead_sex, purpose_of_visit
-         FROM guest_records WHERE is_deleted = FALSE AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`,
-        [yearStart, yearEnd]
+         FROM guest_records WHERE is_deleted = FALSE AND ((actual_check_out IS NOT NULL AND actual_check_out >= ?) OR (actual_check_out IS NULL AND check_out >= ?)) AND check_in <= ?`,
+        [yearStart, yearStart, yearEnd]
       );
       yearRecords = rows;
     }
