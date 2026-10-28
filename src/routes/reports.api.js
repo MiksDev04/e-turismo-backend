@@ -758,6 +758,10 @@ router.get('/reports', adminGuard, async (req, res, next) => {
       variant,
       year,
       month,
+      fromYear,
+      fromMonth,
+      toYear,
+      toMonth,
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
@@ -797,16 +801,6 @@ router.get('/reports', adminGuard, async (req, res, next) => {
       ? 'WHERE ' + conditions.join(' AND ')
       : '';
 
-    const [countRows] = await db.pool.query(
-      `SELECT COUNT(*) as total FROM report_batches rb ${whereClause}`,
-      params
-    );
-    const totalCount = countRows[0].total;
-
-    if (totalCount === 0) {
-      return res.json({ data: [], totalCount: 0, pageCount: 0 });
-    }
-
     const [rows] = await db.pool.query(
       `SELECT rb.id, rb.report_type, rb.report_variant, rb.period_year,
               rb.period_months, rb.created_at, rb.last_viewed_at,
@@ -815,12 +809,61 @@ router.get('/reports', adminGuard, async (req, res, next) => {
        FROM report_batches rb
        LEFT JOIN users u ON rb.requested_by = u.id
        ${whereClause}
-       ORDER BY rb.created_at DESC
-       LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
+       ORDER BY rb.created_at DESC`,
+      params
     );
 
-    const data = rows.map(row => {
+    const monthNames = [
+      '', 'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December',
+    ];
+
+    const toChrono = (y, m) => {
+      const yy = parseInt(y, 10);
+      const mm = monthNames.indexOf(m);
+      if (!Number.isFinite(yy) || mm <= 0) return null;
+      return yy * 12 + (mm - 1);
+    };
+
+    const fromBound = (fromYear && fromMonth)
+      ? toChrono(fromYear, fromMonth)
+      : (fromYear ? toChrono(fromYear, 'January') : null);
+    const toBound = (toYear && toMonth)
+      ? toChrono(toYear, toMonth)
+      : (toYear ? toChrono(toYear, 'December') : null);
+
+    // Backward compat: single year/month
+    const legacyFrom = year ? toChrono(year, month || 'January') : null;
+    const legacyTo = year ? toChrono(year, month || 'December') : null;
+    const effectiveFrom = fromBound ?? (year ? legacyFrom : null);
+    const effectiveTo = toBound ?? (year ? legacyTo : null);
+
+    const filteredRows = rows.filter(row => {
+      const months = Array.isArray(row.period_months)
+        ? row.period_months
+        : JSON.parse(row.period_months);
+      const reportMonths = (months || []).map(m => row.period_year * 12 + (m - 1));
+      const reportMin = reportMonths.length ? Math.min(...reportMonths) : null;
+      const reportMax = reportMonths.length ? Math.max(...reportMonths) : null;
+      if (effectiveFrom != null && (reportMax == null || reportMax < effectiveFrom)) return false;
+      if (effectiveTo != null && (reportMin == null || reportMin > effectiveTo)) return false;
+      // monthly series (and all) only show if selected range covers report range
+      if (effectiveFrom != null && effectiveTo != null) {
+        if (reportMin < effectiveFrom || reportMax > effectiveTo) return false;
+      }
+      return true;
+    });
+
+    const totalCount = filteredRows.length;
+    const pageCount = Math.ceil(totalCount / limit) || 0;
+
+    if (totalCount === 0) {
+      return res.json({ data: [], totalCount: 0, pageCount: 0 });
+    }
+
+    const pageRows = filteredRows.slice(offset, offset + limit);
+
+    const data = pageRows.map(row => {
       const months = Array.isArray(row.period_months)
         ? row.period_months
         : JSON.parse(row.period_months);
