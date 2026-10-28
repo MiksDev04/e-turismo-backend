@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
+import { logActivity } from '../utils/activityLogger.js';
 import cloudinary from '../config/cloudinary.js';
 import upload from '../middleware/upload.js';
 import { otpRequestLimiter, otpVerifyLimiter, authedActionLimiter } from '../middleware/rateLimiter.js';
@@ -85,6 +86,8 @@ router.put('/profile', auth.authenticate, async (req, res, next) => {
       [full_name.trim(), phone.trim(), username.trim().toLowerCase(), req.user.id]
     );
 
+    await logActivity(req.user.id, 'profile_updated', {}, null);
+
     res.json({ message: 'Profile updated successfully.' });
   } catch (err) {
     next(err);
@@ -120,6 +123,14 @@ router.put('/business', auth.authenticate, auth.requireRole('business'), async (
         req.user.id
       ]
     );
+
+    const [bizRows] = await db.pool.execute(
+      'SELECT id FROM businesses WHERE user_id = ? AND deleted_at IS NULL',
+      [req.user.id]
+    );
+    if (bizRows.length > 0) {
+      await logActivity(req.user.id, 'profile_updated', { businessId: bizRows[0].id }, null);
+    }
 
     res.json({ message: 'Business information updated.' });
   } catch (err) {
@@ -189,6 +200,8 @@ router.put('/attraction', auth.authenticate, auth.requireRole('attraction'), asy
         req.user.id
       ]
     );
+
+    await logActivity(req.user.id, 'profile_updated', { attractionId: attractions[0].id }, null);
 
     res.json({ message: 'Attraction information updated.' });
   } catch (err) {
@@ -337,6 +350,8 @@ router.post('/change-password', auth.authenticate, authedActionLimiter, async (r
 
     await db.pool.execute('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, req.user.id]);
 
+    await logActivity(req.user.id, 'password_changed');
+
     res.json({ message: 'Password updated successfully.' });
   } catch (err) {
     next(err);
@@ -452,7 +467,7 @@ router.get('/confirm-email', async (req, res, next) => {
     }
 
     const [users] = await db.pool.execute(
-      'SELECT id, new_email FROM users WHERE email_confirm_token = ? AND email_confirm_expiry > NOW()',
+      'SELECT id, email, new_email FROM users WHERE email_confirm_token = ? AND email_confirm_expiry > NOW()',
       [token]
     );
 
@@ -464,6 +479,8 @@ router.get('/confirm-email', async (req, res, next) => {
     }
 
     const user = users[0];
+    const oldEmail = user.email;
+    const newEmail = user.new_email;
 
     // Update email and clear confirmation fields
     await db.pool.execute(
@@ -475,6 +492,8 @@ router.get('/confirm-email', async (req, res, next) => {
       WHERE id = ?`,
       [user.id]
     );
+
+    await logActivity(user.id, 'email_changed', {}, `old: ${oldEmail}, new: ${newEmail}`);
 
     res.send(simpleHtmlPage(
       'Email Confirmed Successfully',

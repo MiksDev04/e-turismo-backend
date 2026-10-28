@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import errorHandler from './middleware/errorHandler.js';
@@ -18,6 +19,7 @@ import visitEntryRoutes from './routes/visit_entry.api.js';
 import visitRecordRoutes from './routes/visit_record.api.js';
 import messageRoutes from './routes/messages.api.js';
 import reportRoutes from './routes/reports.api.js';
+import activityLogsRoutes, { businessRouter as businessActivityLogsRoutes, attractionRouter as attractionActivityLogsRoutes } from './routes/activity_logs.api.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,6 +44,7 @@ app.use(cors({
 }));
 
 app.use(express.json());
+app.use(compression());
 app.use(express.urlencoded({ extended: true }));
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', async (req, res) => await res.json({ status: 'ok' }));
@@ -65,6 +68,9 @@ app.use('/api', profileRoutes);
 app.use('/api/admin/accommodations', accommodationRoutes);
 app.use('/api/admin/attractions', attractionRoutes);
 app.use('/api/admin', reportRoutes);
+app.use('/api/admin', activityLogsRoutes);
+app.use('/api/business', businessActivityLogsRoutes);
+app.use('/api/attraction', attractionActivityLogsRoutes);
 app.use('/api/business', guestEntryRoutes);
 app.use('/api/business', guestRecordsRoutes);
 app.use('/api/business', roomRoutes);

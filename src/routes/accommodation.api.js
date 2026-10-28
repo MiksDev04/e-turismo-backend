@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
+import { logActivity } from '../utils/activityLogger.js';
 import { parseDbDate } from '../utils/date.js';
 
 const router = express.Router();
@@ -339,6 +340,7 @@ router.put('/:id/approve', adminGuard, async (req, res, next) => {
       'UPDATE businesses SET status = ?, remarks = ? WHERE id = ?',
       ['approved', remarks || null, req.params.id]
     );
+    await logActivity(req.user.id, 'business_status_changed', { businessId: req.params.id }, remarks ? `approved: ${remarks}` : 'approved');
     res.json({ message: 'Business approved.' });
   } catch (err) {
     next(err);
@@ -356,6 +358,7 @@ router.put('/:id/reject', adminGuard, async (req, res, next) => {
       'UPDATE businesses SET status = ?, remarks = ? WHERE id = ?',
       ['rejected', remarks || null, req.params.id]
     );
+    await logActivity(req.user.id, 'business_status_changed', { businessId: req.params.id }, remarks ? `rejected: ${remarks}` : 'rejected');
     res.json({ message: 'Business rejected.' });
   } catch (err) {
     next(err);
@@ -373,6 +376,7 @@ router.put('/:id/flag', adminGuard, async (req, res, next) => {
       'UPDATE businesses SET status = ?, remarks = ? WHERE id = ?',
       ['warning', remarks || null, req.params.id]
     );
+    await logActivity(req.user.id, 'business_status_changed', { businessId: req.params.id }, remarks ? `warning: ${remarks}` : 'warning');
     res.json({ message: 'Business flagged.' });
   } catch (err) {
     next(err);
@@ -433,6 +437,8 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     );
 
     await connection.commit();
+
+    await logActivity(req.user.id, 'business_status_changed', { businessId: id }, `${status}: ${reason}`);
 
     res.json({ message: 'Business status updated.' });
 

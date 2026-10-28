@@ -4,35 +4,29 @@ import auth from '../middleware/auth.js';
 
 const router = express.Router();
 
+async function getRegistrationCounts() {
+  const [rows] = await db.pool.execute(
+    `SELECT 'b' AS kind, status, COUNT(*) AS count FROM businesses
+       WHERE deleted_at IS NULL AND status IN ('approved','pending') GROUP BY status
+     UNION ALL
+     SELECT 't', status, COUNT(*) FROM tourist_attractions
+       WHERE deleted_at IS NULL AND status IN ('approved','pending') GROUP BY status`);
+  const n = (k, s) => Number(rows.find(r => r.kind === k && r.status === s)?.count ?? 0);
+  return {
+    activeAccommodations: n('b','approved'), pendingAccommodations: n('b','pending'),
+    activeAttractions: n('t','approved'),   pendingAttractions: n('t','pending'),
+  };
+}
+
 /**
  * GET /api/dashboard/stats
  * Admin only: returns counts of active and pending businesses/attractions
  */
 router.get('/stats', auth.authenticate, auth.requireRole('admin'), async (req, res, next) => {
-  const connection = await db.pool.getConnection();
   try {
-    const [active] = await connection.execute(
-      `SELECT COUNT(*) as count FROM businesses WHERE status = 'approved' AND deleted_at IS NULL`
-    );
-    const [pending] = await connection.execute(
-      `SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL`
-    );
-    const [activeAttractions] = await connection.execute(
-      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'approved' AND deleted_at IS NULL`
-    );
-    const [pendingAttractions] = await connection.execute(
-      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'pending' AND deleted_at IS NULL`
-    );
-    res.json({
-      activeAccommodations: active[0].count,
-      pendingAccommodations: pending[0].count,
-      activeAttractions: activeAttractions[0].count,
-      pendingAttractions: pendingAttractions[0].count
-    });
+    res.json(await getRegistrationCounts());
   } catch (err) {
     next(err);
-  } finally {
-    connection.release();
   }
 });
 
@@ -42,22 +36,14 @@ router.get('/stats', auth.authenticate, auth.requireRole('admin'), async (req, r
  * navigation badges in the admin sidebar / bottom nav.
  */
 router.get('/pending-counts', auth.authenticate, auth.requireRole('admin'), async (req, res, next) => {
-  const connection = await db.pool.getConnection();
   try {
-    const [pending] = await connection.execute(
-      `SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL`
-    );
-    const [pendingAttractions] = await connection.execute(
-      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'pending' AND deleted_at IS NULL`
-    );
+    const counts = await getRegistrationCounts();
     res.json({
-      pendingAccommodations: pending[0].count,
-      pendingAttractions: pendingAttractions[0].count
+      pendingAccommodations: counts.pendingAccommodations,
+      pendingAttractions: counts.pendingAttractions,
     });
   } catch (err) {
     next(err);
-  } finally {
-    connection.release();
   }
 });
 
@@ -105,9 +91,9 @@ router.get('/guest-records', auth.authenticate, auth.requireRole('admin', 'busin
     let query = `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
                         male_count, female_count, lead_sex, purpose_of_visit
                  FROM guest_records 
-                 WHERE is_deleted = FALSE 
-                   AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`;
-    let params = [startDate, endDate];
+                 WHERE is_deleted = FALSE
+                   AND ((actual_check_out IS NOT NULL AND actual_check_out >= ?) OR (actual_check_out IS NULL AND check_out >= ?)) AND check_in <= ?`;
+    let params = [startDate, startDate, endDate];
 
     if (req.user.role === 'business') {
       // Business must specify their ID and it must match their session or they must be authorized
@@ -326,6 +312,108 @@ router.get('/attraction/visit-logs', auth.authenticate, auth.requireRole('attrac
 });
 
 /**
+ * GET /api/dashboard/trend
+ * Admin only: monthly accommodation + attraction trend for the requested years
+ */
+router.get('/trend', auth.authenticate, auth.requireRole('admin'), async (req, res, next) => {
+  try {
+    const yearsParam = req.query.years;
+    if (typeof yearsParam !== 'string' || yearsParam.trim() === '') {
+      return res.status(400).json({ message: 'Missing years parameter' });
+    }
+
+    const parts = yearsParam.split(',');
+    if (parts.length > 5) {
+      return res.status(400).json({ message: 'At most 5 years are allowed' });
+    }
+
+    const years = [];
+    for (const part of parts) {
+      const num = Number(part.trim());
+      if (!Number.isInteger(num) || num < 2000 || num > 2100) {
+        return res.status(400).json({ message: 'Invalid year' });
+      }
+      years.push(num);
+    }
+
+    const attractionSql = `SELECT MONTH(avl.visit_date) AS m, SUM(avl.guest_count) AS c
+       FROM attraction_visit_logs avl
+       JOIN tourist_attractions ta ON ta.id = avl.attraction_id
+       WHERE avl.deleted_at IS NULL
+         AND ta.deleted_at IS NULL
+         AND ta.status = 'approved'
+         AND avl.visit_date >= ? AND avl.visit_date <= ?
+         AND avl.guest_count > 0
+       GROUP BY MONTH(avl.visit_date)`;
+    const accommodationSql = `SELECT check_in, check_out, actual_check_out, total_guests
+       FROM guest_records
+       WHERE is_deleted = FALSE
+         AND ((actual_check_out IS NOT NULL AND actual_check_out >= ?)
+              OR (actual_check_out IS NULL AND check_out >= ?))
+         AND check_in <= ?`;
+
+    const tasks = years.map(async (year) => {
+      const jan1 = `${year}-01-01`;
+      const dec31 = `${year}-12-31`;
+
+      const [attractionRows] = await db.pool.execute(attractionSql, [jan1, dec31]);
+      const attractionMonthly = new Array(12).fill(0);
+      for (const row of attractionRows) {
+        const monthIndex = Number(row.m) - 1;
+        if (monthIndex >= 0 && monthIndex < 12) {
+          attractionMonthly[monthIndex] += Number(row.c);
+        }
+      }
+
+      const [accommodationRows] = await db.pool.execute(accommodationSql, [jan1, jan1, dec31]);
+      const accommodationMonthly = new Array(12).fill(0);
+      for (const row of accommodationRows) {
+        const totalGuests = Number(row.total_guests);
+        if (!Number.isFinite(totalGuests) || totalGuests <= 0) continue;
+
+        const checkInText = String(row.check_in).substring(0, 10);
+        const rawCheckout = row.actual_check_out ?? row.check_out;
+        const checkoutText = String(rawCheckout).substring(0, 10);
+        const checkIn = new Date(`${checkInText}T00:00:00Z`);
+        const checkOut = new Date(`${checkoutText}T00:00:00Z`);
+        if (checkOut.getTime() < checkIn.getTime()) continue;
+
+        const nights = Math.round((checkOut.getTime() - checkIn.getTime()) / 86400000);
+        const spreadDays = nights + 1;
+        const stayEnd = new Date(checkIn.getTime() + spreadDays * 86400000);
+        const rangeStart = new Date(Date.UTC(year, 0, 1));
+        const rangeEnd = new Date(Date.UTC(year + 1, 0, 1));
+
+        let segmentStart = Math.max(checkIn.getTime(), rangeStart.getTime());
+        const segmentEnd = Math.min(stayEnd.getTime(), rangeEnd.getTime());
+        if (segmentEnd <= segmentStart) continue;
+
+        while (segmentStart < segmentEnd) {
+          const cursorDate = new Date(segmentStart);
+          const monthEnd = Date.UTC(cursorDate.getUTCFullYear(), cursorDate.getUTCMonth() + 1, 1);
+          const chunkEnd = Math.min(monthEnd, segmentEnd);
+          const days = Math.round((chunkEnd - segmentStart) / 86400000);
+          accommodationMonthly[cursorDate.getUTCMonth()] += totalGuests * days;
+          segmentStart = chunkEnd;
+        }
+      }
+
+      const combined = accommodationMonthly.map((value, index) => Number(value) + Number(attractionMonthly[index]));
+      return { year, monthly: combined };
+    });
+
+    const results = await Promise.all(tasks);
+    const response = {};
+    for (const result of results) {
+      response[String(result.year)] = result.monthly;
+    }
+    res.json(response);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * GET /api/dashboard/summary
  * Admin only: consolidated endpoint returning all dashboard data in one call
  * Replaces 4–6 individual API calls with a single request.
@@ -336,83 +424,26 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     return res.status(400).json({ message: 'Missing date parameters' });
   }
 
-  const connection = await db.pool.getConnection();
   try {
-    const [active] = await connection.execute(
-      `SELECT COUNT(*) as count FROM businesses WHERE status = 'approved' AND deleted_at IS NULL`
-    );
-    const [pending] = await connection.execute(
-      `SELECT COUNT(*) as count FROM businesses WHERE status = 'pending' AND deleted_at IS NULL`
-    );
-    const [activeAttractions] = await connection.execute(
-      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'approved' AND deleted_at IS NULL`
-    );
-    const [pendingAttractions] = await connection.execute(
-      `SELECT COUNT(*) as count FROM tourist_attractions WHERE status = 'pending' AND deleted_at IS NULL`
-    );
+    const sameRange = startDate === yearStart && endDate === yearEnd;
 
-    const [periodRecords] = await connection.execute(
-      `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
-              male_count, female_count, lead_sex, purpose_of_visit
-       FROM guest_records WHERE is_deleted = FALSE AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`,
-      [startDate, endDate]
-    );
-
-    let yearRecords;
-    if (startDate === yearStart && endDate === yearEnd) {
-      yearRecords = periodRecords;
-    } else {
-      const [rows] = await connection.execute(
+    const [registrationCounts, periodResult, yearResult, visitResult, yearVisitResult] = await Promise.all([
+      getRegistrationCounts(),
+      db.pool.execute(
         `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
                 male_count, female_count, lead_sex, purpose_of_visit
-         FROM guest_records WHERE is_deleted = FALSE AND COALESCE(actual_check_out, check_out) >= ? AND check_in <= ?`,
-        [yearStart, yearEnd]
-      );
-      yearRecords = rows;
-    }
-
-    const recordIds = periodRecords.map((r) => r.id);
-    let breakdowns = [];
-    if (recordIds.length > 0) {
-      const placeholders = recordIds.map(() => '?').join(',');
-      const [rows] = await connection.execute(
-        `SELECT id AS guest_record_id, lead_country AS country,
-                lead_province AS province,
-                lead_city_municipality AS city_municipality,
-                lead_sex AS sex,
-                lead_is_overseas AS is_overseas,
-                CASE
-                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
-                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 17 THEN '10-17'
-                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 25 THEN '18-25'
-                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 35 THEN '26-35'
-                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 45 THEN '36-45'
-                  WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 55 THEN '46-55'
-                  ELSE '56+'
-                END AS age_group,
-                1 AS count
-         FROM guest_records
-         WHERE id IN (${placeholders}) AND is_deleted = FALSE`,
-        recordIds
-      );
-      breakdowns = rows;
-    }
-
-    const businessIds = [...new Set(periodRecords.map((r) => r.business_id))];
-    let businessLines = [];
-    if (businessIds.length > 0) {
-      const placeholders = businessIds.map(() => '?').join(',');
-      const [rows] = await connection.execute(
-        `SELECT id, business_line FROM businesses
-         WHERE id IN (${placeholders}) AND status = 'approved' AND deleted_at IS NULL`,
-        businessIds
-      );
-      businessLines = rows;
-    }
-
-    let attractionVisitLogs = [];
-    {
-      const [rows] = await connection.execute(
+         FROM guest_records WHERE is_deleted = FALSE AND ((actual_check_out IS NOT NULL AND actual_check_out >= ?) OR (actual_check_out IS NULL AND check_out >= ?)) AND check_in <= ?`,
+        [startDate, startDate, endDate]
+      ),
+      sameRange
+        ? null
+        : db.pool.execute(
+            `SELECT id, business_id, check_in, check_out, actual_check_out, total_guests,
+                    male_count, female_count, lead_sex, purpose_of_visit
+             FROM guest_records WHERE is_deleted = FALSE AND ((actual_check_out IS NOT NULL AND actual_check_out >= ?) OR (actual_check_out IS NULL AND check_out >= ?)) AND check_in <= ?`,
+            [yearStart, yearStart, yearEnd]
+          ),
+      db.pool.execute(
         `SELECT avl.id, avl.attraction_id, ta.attraction_type, avl.visit_date,
                 avl.guest_count, avl.male_count, avl.female_count,
                 avl.country, avl.province, avl.city_municipality
@@ -423,42 +454,80 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
            AND ta.status = 'approved'
            AND avl.visit_date >= ? AND avl.visit_date <= ?`,
         [startDate, endDate]
-      );
-      attractionVisitLogs = rows.map((r) => ({
-        ...r,
-        attraction_type: typeof r.attraction_type === 'string' ? JSON.parse(r.attraction_type) : r.attraction_type,
-      }));
-    }
+      ),
+      sameRange
+        ? null
+        : db.pool.execute(
+            `SELECT avl.id, avl.attraction_id, ta.attraction_type, avl.visit_date,
+                    avl.guest_count, avl.male_count, avl.female_count,
+                    avl.country, avl.province, avl.city_municipality
+             FROM attraction_visit_logs avl
+             JOIN tourist_attractions ta ON ta.id = avl.attraction_id
+             WHERE avl.deleted_at IS NULL
+               AND ta.deleted_at IS NULL
+               AND ta.status = 'approved'
+               AND avl.visit_date >= ? AND avl.visit_date <= ?`,
+            [yearStart, yearEnd]
+          ),
+    ]);
 
-    let yearAttractionVisitLogs;
-    if (startDate === yearStart && endDate === yearEnd) {
-      yearAttractionVisitLogs = attractionVisitLogs;
-    } else {
-      const [rows] = await connection.execute(
-        `SELECT avl.id, avl.attraction_id, ta.attraction_type, avl.visit_date,
-                avl.guest_count, avl.male_count, avl.female_count,
-                avl.country, avl.province, avl.city_municipality
-         FROM attraction_visit_logs avl
-         JOIN tourist_attractions ta ON ta.id = avl.attraction_id
-         WHERE avl.deleted_at IS NULL
-           AND ta.deleted_at IS NULL
-           AND ta.status = 'approved'
-           AND avl.visit_date >= ? AND avl.visit_date <= ?`,
-        [yearStart, yearEnd]
-      );
-      yearAttractionVisitLogs = rows.map((r) => ({
-        ...r,
-        attraction_type: typeof r.attraction_type === 'string' ? JSON.parse(r.attraction_type) : r.attraction_type,
-      }));
-    }
+    const periodRecords = periodResult[0];
+    const yearRecords = sameRange ? periodRecords : yearResult[0];
+
+    const attractionVisitLogs = visitResult[0].map((r) => ({
+      ...r,
+      attraction_type: typeof r.attraction_type === 'string' ? JSON.parse(r.attraction_type) : r.attraction_type,
+    }));
+    const yearAttractionVisitLogs = sameRange
+      ? attractionVisitLogs
+      : yearVisitResult[0].map((r) => ({
+          ...r,
+          attraction_type: typeof r.attraction_type === 'string' ? JSON.parse(r.attraction_type) : r.attraction_type,
+        }));
+
+    const recordIds = periodRecords.map((r) => r.id);
+    const businessIds = [...new Set(periodRecords.map((r) => r.business_id))];
+
+    const breakdownPlaceholders = recordIds.map(() => '?').join(',');
+    const businessPlaceholders = businessIds.map(() => '?').join(',');
+
+    const [breakdownsResult, businessLinesResult] = await Promise.all([
+      recordIds.length > 0
+        ? db.pool.execute(
+            `SELECT id AS guest_record_id, lead_country AS country,
+                    lead_province AS province,
+                    lead_city_municipality AS city_municipality,
+                    lead_sex AS sex,
+                    lead_is_overseas AS is_overseas,
+                    CASE
+                      WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 9  THEN '0-9'
+                      WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 17 THEN '10-17'
+                      WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 25 THEN '18-25'
+                      WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 35 THEN '26-35'
+                      WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 45 THEN '36-45'
+                      WHEN TIMESTAMPDIFF(YEAR, lead_birthdate, check_in) <= 55 THEN '46-55'
+                      ELSE '56+'
+                    END AS age_group,
+                    1 AS count
+             FROM guest_records
+             WHERE id IN (` + breakdownPlaceholders + `) AND is_deleted = FALSE`,
+            recordIds
+          )
+        : Promise.resolve([[]]),
+      businessIds.length > 0
+        ? db.pool.execute(
+            `SELECT id, business_line FROM businesses
+             WHERE id IN (` + businessPlaceholders + `) AND status = 'approved' AND deleted_at IS NULL`,
+            businessIds
+          )
+        : Promise.resolve([[]]),
+    ]);
+
+    const breakdowns = recordIds.length > 0 ? breakdownsResult[0] : [];
+    const businessLines = businessIds.length > 0 ? businessLinesResult[0] : [];
 
     res.json({
-      stats: {
-        activeAccommodations: active[0].count,
-        pendingAccommodations: pending[0].count,
-        activeAttractions: activeAttractions[0].count,
-        pendingAttractions: pendingAttractions[0].count,
-      },
+      stats: registrationCounts,
       periodRecords,
       yearRecords,
       breakdowns,
@@ -468,8 +537,6 @@ router.get('/summary', auth.authenticate, auth.requireRole('admin'), async (req,
     });
   } catch (err) {
     next(err);
-  } finally {
-    connection.release();
   }
 });
 

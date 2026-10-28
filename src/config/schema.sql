@@ -45,8 +45,7 @@
 -- Table creation order respects foreign key dependencies:
 --   users -> businesses -> tourist_attractions -> attraction_visit_logs
 --         -> rooms -> guest_records -> guest_record_rooms
---         -> guest_origin_breakdowns -> messages -> message_recipients
---         -> report_batches
+--         -> guest_origin_breakdowns -> activity_logs -> messages -> message_recipients\r\n--         -> report_batches
 -- =====================================================================
 DROP DATABASE tourism_db;
 CREATE DATABASE IF NOT EXISTS `tourism_db`
@@ -330,6 +329,30 @@ CREATE TABLE `guest_origin_breakdowns` (
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+ 
+-- ---------------------------------------------------------------
+-- Table: activity_logs
+-- ---------------------------------------------------------------
+CREATE TABLE ctivity_logs (
+  id char(36) NOT NULL DEFAULT (uuid()),
+  ctor_id char(36) DEFAULT NULL,
+  ction_type varchar(100) NOT NULL,
+  usiness_id char(36) DEFAULT NULL,
+  	ourist_attraction_id char(36) DEFAULT NULL,
+  guest_record_id char(36) DEFAULT NULL,
+  isit_log_id char(36) DEFAULT NULL,
+  details text,
+  created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_al_actor_id (ctor_id),
+  KEY idx_al_action_type (ction_type),
+  KEY idx_al_created_at (created_at),
+  CONSTRAINT ctivity_logs_actor_id_fkey FOREIGN KEY (ctor_id) REFERENCES users (id),
+  CONSTRAINT ctivity_logs_business_id_fkey FOREIGN KEY (usiness_id) REFERENCES usinesses (id),
+  CONSTRAINT ctivity_logs_attraction_id_fkey FOREIGN KEY (	ourist_attraction_id) REFERENCES 	ourist_attractions (id),
+  CONSTRAINT ctivity_logs_guest_record_id_fkey FOREIGN KEY (guest_record_id) REFERENCES guest_records (id),
+  CONSTRAINT ctivity_logs_visit_log_id_fkey FOREIGN KEY (isit_log_id) REFERENCES ttraction_visit_logs (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 -- ---------------------------------------------------------------
 -- Table: messages
 -- ---------------------------------------------------------------

@@ -2,6 +2,7 @@ import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../config/db.js';
 import auth from '../middleware/auth.js';
+import { logActivity } from '../utils/activityLogger.js';
 
 const router = express.Router();
 
@@ -157,6 +158,7 @@ router.post('/visit-entries', auth.authenticate, auth.requireRole('attraction'),
     );
 
     await connection.commit();
+    await logActivity(req.user.id, 'visit_log_created', { visitLogId: visitEntryId });
     res.status(201).json({ message: 'Visit entry saved successfully', visitEntryId });
   } catch (err) {
     await connection.rollback();

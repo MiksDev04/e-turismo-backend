@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import db from '../config/db.js';
 import mailer from '../utils/mailer.js';
+import { logActivity } from '../utils/activityLogger.js';
 import { otpRequestLimiter, otpVerifyLimiter, loginLimiter } from '../middleware/rateLimiter.js';
 
 const router = express.Router();
@@ -26,6 +27,7 @@ router.post('/login', loginLimiter, async (req, res, next) => {
     );
 
     if (users.length === 0) {
+      logActivity(null, 'login_failed');
       return res.status(401).json({ message: 'Incorrect username or password.' });
     }
 
@@ -34,8 +36,11 @@ router.post('/login', loginLimiter, async (req, res, next) => {
     // 2. Verify password
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
+      logActivity(user.id, 'login_failed');
       return res.status(401).json({ message: 'Incorrect username or password.' });
     }
+
+    logActivity(user.id, 'login_success');
 
     // 3. Prepare response data
     let responseData = {
@@ -196,6 +201,8 @@ const [users] = await db.pool.execute(
       [otp, expiry, user.id]
     );
 
+    await logActivity(user.id, 'password_reset_requested');
+
     // 4. Send email
     try {
       await mailer.sendOtp(user.email, otp);
@@ -289,6 +296,8 @@ router.post('/reset-password', otpVerifyLimiter, async (req, res, next) => {
       'UPDATE users SET password = ?, reset_otp = NULL, reset_otp_expiry = NULL WHERE id = ?',
       [hashedPassword, user.id]
     );
+
+    await logActivity(user.id, 'password_reset_completed');
 
     res.json({ message: 'Password reset successful. You can now sign in with your new password.' });
 

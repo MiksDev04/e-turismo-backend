@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import distributionConfig, { kOriginPct, kOriginCategories } from '../config/distributionConfig.js';
+import { logActivity } from '../utils/activityLogger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -757,6 +758,10 @@ router.get('/reports', adminGuard, async (req, res, next) => {
       variant,
       year,
       month,
+      fromYear,
+      fromMonth,
+      toYear,
+      toMonth,
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
@@ -796,16 +801,6 @@ router.get('/reports', adminGuard, async (req, res, next) => {
       ? 'WHERE ' + conditions.join(' AND ')
       : '';
 
-    const [countRows] = await db.pool.query(
-      `SELECT COUNT(*) as total FROM report_batches rb ${whereClause}`,
-      params
-    );
-    const totalCount = countRows[0].total;
-
-    if (totalCount === 0) {
-      return res.json({ data: [], totalCount: 0, pageCount: 0 });
-    }
-
     const [rows] = await db.pool.query(
       `SELECT rb.id, rb.report_type, rb.report_variant, rb.period_year,
               rb.period_months, rb.created_at, rb.last_viewed_at,
@@ -814,12 +809,61 @@ router.get('/reports', adminGuard, async (req, res, next) => {
        FROM report_batches rb
        LEFT JOIN users u ON rb.requested_by = u.id
        ${whereClause}
-       ORDER BY rb.created_at DESC
-       LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
+       ORDER BY rb.created_at DESC`,
+      params
     );
 
-    const data = rows.map(row => {
+    const monthNames = [
+      '', 'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December',
+    ];
+
+    const toChrono = (y, m) => {
+      const yy = parseInt(y, 10);
+      const mm = monthNames.indexOf(m);
+      if (!Number.isFinite(yy) || mm <= 0) return null;
+      return yy * 12 + (mm - 1);
+    };
+
+    const fromBound = (fromYear && fromMonth)
+      ? toChrono(fromYear, fromMonth)
+      : (fromYear ? toChrono(fromYear, 'January') : null);
+    const toBound = (toYear && toMonth)
+      ? toChrono(toYear, toMonth)
+      : (toYear ? toChrono(toYear, 'December') : null);
+
+    // Backward compat: single year/month
+    const legacyFrom = year ? toChrono(year, month || 'January') : null;
+    const legacyTo = year ? toChrono(year, month || 'December') : null;
+    const effectiveFrom = fromBound ?? (year ? legacyFrom : null);
+    const effectiveTo = toBound ?? (year ? legacyTo : null);
+
+    const filteredRows = rows.filter(row => {
+      const months = Array.isArray(row.period_months)
+        ? row.period_months
+        : JSON.parse(row.period_months);
+      const reportMonths = (months || []).map(m => row.period_year * 12 + (m - 1));
+      const reportMin = reportMonths.length ? Math.min(...reportMonths) : null;
+      const reportMax = reportMonths.length ? Math.max(...reportMonths) : null;
+      if (effectiveFrom != null && (reportMax == null || reportMax < effectiveFrom)) return false;
+      if (effectiveTo != null && (reportMin == null || reportMin > effectiveTo)) return false;
+      // monthly series (and all) only show if selected range covers report range
+      if (effectiveFrom != null && effectiveTo != null) {
+        if (reportMin < effectiveFrom || reportMax > effectiveTo) return false;
+      }
+      return true;
+    });
+
+    const totalCount = filteredRows.length;
+    const pageCount = Math.ceil(totalCount / limit) || 0;
+
+    if (totalCount === 0) {
+      return res.json({ data: [], totalCount: 0, pageCount: 0 });
+    }
+
+    const pageRows = filteredRows.slice(offset, offset + limit);
+
+    const data = pageRows.map(row => {
       const months = Array.isArray(row.period_months)
         ? row.period_months
         : JSON.parse(row.period_months);
@@ -906,6 +950,22 @@ router.post('/reports', adminGuard, async (req, res, next) => {
     );
     const batchId = rows[0].id;
     const isExisting = batchId !== newBatchId;
+
+    // Log report creation only when a new report record is actually inserted;
+    // viewing/downloading (which may reuse this same batch) must not count.
+    if (!isExisting) {
+      const reportName = reportType === 'dae' ? 'DAE (accommodations)' : reportType === 'var1' ? 'VAR 1 (attractions)' : 'VAR 2 (combined)';
+      const _abbr = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      let periodText;
+      if (months.length === 12) periodText = `Jan-Dec ${periodYear}`;
+      else if (months.length === 1) periodText = `${_abbr[months[0]]} ${periodYear}`;
+      else periodText = `${_abbr[months[0]]}-${_abbr[months[months.length - 1]]} ${periodYear}`;
+      let details = reportName;
+      if (reportType === 'dae') details += ` ${effectiveVariant}`;
+      details += `, ${periodText}`;
+      await logActivity(req.user.id, 'report_generated', {}, details);
+    }
+
     res.status(200).json({ batchId, existing: isExisting });
 
     // Warm the file cache in the background so the first view is a cache hit.
@@ -1551,6 +1611,15 @@ async function _generateReportFile({
       if (ms.length === 12) return 'Jan-Dec';
       if (ms.length === 1) return _abbr[ms[0]];
       return `${_abbr[ms[0]]}-${_abbr[ms[ms.length - 1]]}`;
+    };
+    const _fmtPeriodDisplay = (ms) => {
+      if (ms.length === 0) return '';
+      if (ms.length === 12) return `Jan-Dec ${year}`;
+      const sorted = [...ms].sort((a, b) => a - b);
+      if (sorted.length === 1) return `${_abbr[sorted[0]]} ${year}`;
+      const contiguous = sorted.every((m, i) => i === 0 || m === sorted[i - 1] + 1);
+      if (contiguous) return `${_abbr[sorted[0]]}-${_abbr[sorted[sorted.length - 1]]} ${year}`;
+      return sorted.map(m => _abbr[m]).join(', ') + ` ${year}`;
     };
     const baseFilename = `${reportType.toUpperCase()}_${variant}_${_fmtPeriod(sortedMonths)}_${year}`;
 
