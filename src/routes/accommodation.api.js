@@ -65,7 +65,10 @@ router.get('/', adminGuard, async (req, res, next) => {
       `SELECT b.*,
               (SELECT COUNT(*) FROM rooms WHERE business_id = b.id) AS total_rooms,
               u.full_name, u.email, u.phone,
-              DATE(MAX(COALESCE(gr.actual_check_out, CURDATE()))) AS last_activity,
+              CASE
+                WHEN COUNT(gr.id) = 0 THEN NULL
+                ELSE DATE(MAX(COALESCE(gr.actual_check_out, CURDATE())))
+              END AS last_activity,
               CASE
                 WHEN COUNT(gr.id) = 0 THEN 'no_activity'
                 WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 90 DAY) THEN 'inactive'

@@ -63,7 +63,10 @@ router.get('/', adminGuard, async (req, res, next) => {
     // ── Fetch paginated rows ──────────────────────────────────────────────
     const [rows] = await db.pool.query(
       `SELECT ta.*, u.full_name, u.email, u.phone,
-              MAX(avl.visit_date) AS last_activity,
+              CASE
+                WHEN COUNT(avl.id) = 0 THEN NULL
+                ELSE MAX(avl.visit_date)
+              END AS last_activity,
               CASE
                 WHEN COUNT(avl.id) = 0 THEN 'no_activity'
                 WHEN MAX(avl.visit_date) < DATE_SUB(CURDATE(), INTERVAL 90 DAY) THEN 'inactive'
