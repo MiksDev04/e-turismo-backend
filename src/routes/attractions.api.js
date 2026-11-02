@@ -329,9 +329,9 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     if (!['approved', 'warning'].includes(status)) {
       return res.status(400).json({ message: 'Invalid status.' });
     }
-    if (!reason || !reason.trim()) {
-      return res.status(400).json({ message: 'Reason is required.' });
-    }
+    const subject = status === 'warning'
+      ? 'Account Status Update: Warning'
+      : 'Account Status Update: Restored to Approved';
     if (!messageContent || !messageContent.trim()) {
       return res.status(400).json({ message: 'Message content is required.' });
     }
@@ -358,8 +358,8 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     const messageId = crypto.randomUUID();
     await connection.execute(
       `INSERT INTO messages (id, sender_id, message_type, subject, content, is_broadcast)
-       VALUES (?, ?, 'compliance', 'Business Status Update', ?, FALSE)`,
-      [messageId, req.user.id, messageContent.trim()]
+       VALUES (?, ?, 'compliance', ?, ?, FALSE)`,
+      [messageId, req.user.id, subject, messageContent.trim()]
     );
 
     await connection.execute(
@@ -369,12 +369,12 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
 
     await connection.commit();
 
-    await logActivity(req.user.id, 'attraction_status_changed', { attractionId: id }, `${status}: ${reason}`);
+    await logActivity(req.user.id, 'attraction_status_changed', { attractionId: id }, `${status}: ${(reason || '').trim() || 'no remarks'}`);
 
     res.json({ message: 'Attraction status updated.' });
 
     if (att.email) {
-      mailer.sendSystemMessage(att.email, 'Business Status Update', messageContent.trim(), 'compliance')
+      mailer.sendSystemMessage(att.email, subject, messageContent.trim(), 'compliance')
         .catch((err) => console.error('Failed to send status-change email:', err.message));
     }
   } catch (err) {

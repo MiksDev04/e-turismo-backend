@@ -15,6 +15,15 @@ const defaultSender = {
   name:  process.env.BREVO_FROM_NAME || 'San Pablo City Tourism Office',
 };
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 async function sendOtp(toEmail, otp) {
   if (!brevoClient) {
     throw new Error('Email service not configured (BREVO_API_KEY missing)');
@@ -127,6 +136,8 @@ async function sendSystemMessage(toEmail, subject, content, messageType) {
     throw new Error('Email service not configured (BREVO_API_KEY missing)');
   }
   const typeLabel = messageType.charAt(0).toUpperCase() + messageType.slice(1);
+  const safeSubject = escapeHtml(subject);
+  const safeContent = escapeHtml(content);
 
   try {
     await brevoClient.transactionalEmails.sendTransacEmail({
@@ -156,10 +167,10 @@ async function sendSystemMessage(toEmail, subject, content, messageType) {
                 <tr>
                   <td style="padding:36px 20px 28px;">
                     <h2 style="margin:0 0 12px;font-size:18px;color:#1a1a2e;">
-                      ${subject}
+                      ${safeSubject}
                     </h2>
                     <div style="margin:0 0 20px;font-size:14px;color:#555;line-height:1.6;white-space: pre-wrap;">
-                      ${content}
+                      ${safeContent}
                     </div>
 
                   </td>
