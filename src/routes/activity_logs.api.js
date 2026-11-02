@@ -10,6 +10,9 @@ const adminGuard = [auth.authenticate, auth.requireRole('admin')];
 const businessGuard = [auth.authenticate, auth.requireRole('business')];
 const attractionGuard = [auth.authenticate, auth.requireRole('attraction')];
 
+// Action types that are admin-only and must not leak into accommodation/attraction logs.
+const ADMIN_ONLY_ACTION_TYPES = ['notice_sent'];
+
 async function handleFetch(req, res, next, scopeType = 'admin') {
   try {
     const { action_type, date_from, date_to } = req.query;
@@ -28,14 +31,20 @@ async function handleFetch(req, res, next, scopeType = 'admin') {
 
     let scopeWhere = '';
     let scopeParams = [];
+    const adminOnlyExclusion =
+      ADMIN_ONLY_ACTION_TYPES.length > 0
+        ? `AND al.action_type NOT IN (${ADMIN_ONLY_ACTION_TYPES.map(() => '?').join(',')})`
+        : '';
     if (scopeType === 'business') {
       scopeWhere =
-        'AND (al.actor_id = ? OR al.business_id IN (SELECT id FROM businesses WHERE user_id = ?))';
-      scopeParams = [req.user.id, req.user.id];
+        'AND (al.actor_id = ? OR al.business_id IN (SELECT id FROM businesses WHERE user_id = ?)) ' +
+        adminOnlyExclusion;
+      scopeParams = [req.user.id, req.user.id, ...ADMIN_ONLY_ACTION_TYPES];
     } else if (scopeType === 'attraction') {
       scopeWhere =
-        'AND (al.actor_id = ? OR al.tourist_attraction_id IN (SELECT id FROM tourist_attractions WHERE user_id = ?))';
-      scopeParams = [req.user.id, req.user.id];
+        'AND (al.actor_id = ? OR al.tourist_attraction_id IN (SELECT id FROM tourist_attractions WHERE user_id = ?)) ' +
+        adminOnlyExclusion;
+      scopeParams = [req.user.id, req.user.id, ...ADMIN_ONLY_ACTION_TYPES];
     }
 
     const listSql = `SELECT al.id, al.created_at, al.action_type, al.details,
