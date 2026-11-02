@@ -5,6 +5,7 @@ import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
 import { logActivity } from '../utils/activityLogger.js';
+import { buildChangeDetails } from '../utils/changeDiff.js';
 import cloudinary from '../config/cloudinary.js';
 import upload from '../middleware/upload.js';
 import { otpRequestLimiter, otpVerifyLimiter, authedActionLimiter } from '../middleware/rateLimiter.js';
@@ -81,12 +82,40 @@ router.put('/profile', auth.authenticate, async (req, res, next) => {
       return res.status(409).json({ message: 'Username is already taken.' });
     }
 
+    let profileBefore = null;
+    let profileBeforeFailed = false;
+    try {
+      const [profileRows] = await db.pool.execute(
+        'SELECT full_name, phone, username FROM users WHERE id = ?',
+        [req.user.id]
+      );
+      profileBefore = profileRows[0] || null;
+    } catch (err) {
+      console.error(err);
+      profileBeforeFailed = true;
+    }
+
     await db.pool.execute(
       'UPDATE users SET full_name = ?, phone = ?, username = ? WHERE id = ?',
       [full_name.trim(), phone.trim(), username.trim().toLowerCase(), req.user.id]
     );
 
-    await logActivity(req.user.id, 'profile_updated', {}, null);
+    try {
+      if (profileBeforeFailed) {
+        await logActivity(req.user.id, 'profile_updated', {}, null);
+      } else if (profileBefore) {
+        const profileDetails = buildChangeDetails(
+          profileBefore,
+          { full_name: full_name.trim(), phone: phone.trim(), username: username.trim().toLowerCase() },
+          { full_name: 'name', phone: 'phone number', username: 'username' }
+        );
+        if (profileDetails) {
+          await logActivity(req.user.id, 'profile_updated', {}, profileDetails);
+        }
+      }
+    } catch (err) {
+      console.error(err);
+    }
 
     res.json({ message: 'Profile updated successfully.' });
   } catch (err) {
@@ -110,8 +139,21 @@ router.put('/business', auth.authenticate, auth.requireRole('business'), async (
       return res.status(400).json({ message: 'Required fields missing.' });
     }
 
+    let businessBefore = null;
+    let businessBeforeFailed = false;
+    try {
+      const [businessRows] = await db.pool.execute(
+        'SELECT * FROM businesses WHERE user_id = ? AND deleted_at IS NULL',
+        [req.user.id]
+      );
+      businessBefore = businessRows[0] || null;
+    } catch (err) {
+      console.error(err);
+      businessBeforeFailed = true;
+    }
+
     await db.pool.execute(
-      `UPDATE businesses SET 
+      `UPDATE businesses SET
         business_name = ?, tradename = ?, owner_first_name = ?, owner_middle_name = ?, owner_last_name = ?,
         business_type = ?, business_line = ?, street = ?, barangay = ?,
         city_municipality = ?, province = ?, region = ?, permit_number = ?, registration_number = ?
@@ -129,7 +171,55 @@ router.put('/business', auth.authenticate, auth.requireRole('business'), async (
       [req.user.id]
     );
     if (bizRows.length > 0) {
-      await logActivity(req.user.id, 'profile_updated', { businessId: bizRows[0].id }, null);
+      try {
+        const businessId = bizRows[0].id;
+        if (businessBeforeFailed) {
+          await logActivity(req.user.id, 'profile_updated', { businessId }, null);
+        } else if (businessBefore) {
+          const businessDetails = buildChangeDetails(
+            businessBefore,
+            {
+              business_name: business_name.trim(),
+              tradename: tradename?.trim(),
+              owner_first_name: owner_first_name?.trim(),
+              owner_middle_name: owner_middle_name?.trim(),
+              owner_last_name: owner_last_name?.trim(),
+              business_type,
+              business_line: JSON.stringify(business_line),
+              street: street?.trim(),
+              barangay: barangay?.trim(),
+              city_municipality: city_municipality?.trim(),
+              province: province?.trim(),
+              region: region?.trim(),
+              permit_number: permit_number?.trim(),
+              registration_number: registration_number?.trim(),
+            },
+            {
+              business_name: 'business name',
+              tradename: 'trade name',
+              owner_first_name: 'owner first name',
+              owner_middle_name: 'owner middle name',
+              owner_last_name: 'owner last name',
+              business_type: 'business type',
+              business_line: 'business line',
+              street: 'street',
+              barangay: 'barangay',
+              city_municipality: 'city/municipality',
+              province: 'province',
+              region: 'region',
+              permit_number: 'permit number',
+              registration_number: 'registration number',
+            }
+          );
+          if (businessDetails) {
+            await logActivity(req.user.id, 'profile_updated', { businessId }, businessDetails);
+          }
+        } else {
+          await logActivity(req.user.id, 'profile_updated', { businessId }, null);
+        }
+      } catch (err) {
+        console.error(err);
+      }
     }
 
     res.json({ message: 'Business information updated.' });
@@ -181,7 +271,7 @@ router.put('/attraction', auth.authenticate, auth.requireRole('attraction'), asy
     }
 
     const [attractions] = await db.pool.execute(
-      'SELECT id FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
+      'SELECT id, attraction_name, attraction_type, street, barangay FROM tourist_attractions WHERE user_id = ? AND deleted_at IS NULL',
       [req.user.id]
     );
     if (attractions.length === 0) {
@@ -201,7 +291,28 @@ router.put('/attraction', auth.authenticate, auth.requireRole('attraction'), asy
       ]
     );
 
-    await logActivity(req.user.id, 'profile_updated', { attractionId: attractions[0].id }, null);
+    try {
+      const attractionDetails = buildChangeDetails(
+        attractions[0],
+        {
+          attraction_name: String(attraction_name).trim(),
+          attraction_type: JSON.stringify(parsedTypes.map((type) => String(type).trim())),
+          street: String(street || '').trim(),
+          barangay: String(barangay || '').trim(),
+        },
+        {
+          attraction_name: 'attraction name',
+          attraction_type: 'attraction type',
+          street: 'street',
+          barangay: 'barangay',
+        }
+      );
+      if (attractionDetails) {
+        await logActivity(req.user.id, 'profile_updated', { attractionId: attractions[0].id }, attractionDetails);
+      }
+    } catch (err) {
+      console.error(err);
+    }
 
     res.json({ message: 'Attraction information updated.' });
   } catch (err) {
@@ -249,6 +360,12 @@ router.post('/attraction/upload',
         'UPDATE tourist_attractions SET valid_id_url = ? WHERE user_id = ? AND deleted_at IS NULL',
         [validIdUrl, req.user.id]
       );
+
+      try {
+        await logActivity(req.user.id, 'profile_updated', { attractionId }, 'Replaced valid ID');
+      } catch (err) {
+        console.error(err);
+      }
 
       res.json({ message: 'Valid ID updated successfully.', valid_id_url: validIdUrl });
     } catch (err) {
@@ -314,6 +431,17 @@ router.post('/business/upload',
         `UPDATE businesses SET ${setClauses} WHERE user_id = ?`,
         values
       );
+
+      try {
+        const replacedParts = [];
+        if (files?.permit_file?.[0]) replacedParts.push('Replaced business permit file');
+        if (files?.valid_id?.[0]) replacedParts.push('Replaced valid ID');
+        if (replacedParts.length > 0) {
+          await logActivity(req.user.id, 'profile_updated', { businessId }, replacedParts.join('; '));
+        }
+      } catch (err) {
+        console.error(err);
+      }
 
       res.json({ message: 'Documents updated successfully.', ...updates });
     } catch (err) {
