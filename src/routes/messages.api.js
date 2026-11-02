@@ -3,6 +3,7 @@ import db from '../config/db.js';
 import auth from '../middleware/auth.js';
 import mailer from '../utils/mailer.js';
 import crypto from 'crypto';
+import { logActivity, logActivityBatch } from '../utils/activityLogger.js';
 
 const router = express.Router();
 
@@ -82,6 +83,7 @@ router.post('/send-selected', auth.authenticate, auth.requireRole('admin'), asyn
       return res.status(400).json({ message: 'Missing required fields' });
     }
 
+    const trimmedSubject = subject.trim().slice(0, 100);
     const messageId = crypto.randomUUID();
     await connection.execute(
       'INSERT INTO messages (id, sender_id, message_type, subject, content, is_broadcast) VALUES (?, ?, ?, ?, ?, ?)',
@@ -117,6 +119,27 @@ router.post('/send-selected', auth.authenticate, auth.requireRole('admin'), asyn
 
     await connection.commit();
 
+    // Log activity (never affects flow) after commit, before mailer loop
+    try {
+      const entries = [
+        ...businesses.map((id) => ({
+          actorId: req.user.id,
+          actionType: 'notice_sent',
+          refs: { businessId: id },
+          details: `Sent ${messageType} notice "${trimmedSubject}"`,
+        })),
+        ...attractions.map((id) => ({
+          actorId: req.user.id,
+          actionType: 'notice_sent',
+          refs: { attractionId: id },
+          details: `Sent ${messageType} notice "${trimmedSubject}"`,
+        })),
+      ];
+      await logActivityBatch(entries);
+    } catch (e) {
+      console.error('activity log batch failed:', e?.message || e);
+    }
+
     // Send emails asynchronously after commit
     recipients.forEach(r => {
       mailer.sendSystemMessage(r.email, subject.trim(), content.trim(), messageType).catch(console.error);
@@ -145,6 +168,8 @@ router.post('/send-all', auth.authenticate, auth.requireRole('admin'), async (re
     }
 
     const kind = recipientKind === 'attraction' ? 'attraction' : 'business';
+
+    const trimmedSubject = subject.trim().slice(0, 100);
 
     if (kind === 'attraction') {
       const [attractions] = await connection.execute(
@@ -177,6 +202,18 @@ router.post('/send-all', auth.authenticate, auth.requireRole('admin'), async (re
       );
 
       await connection.commit();
+
+      // Log activity (never affects flow) after commit, before mailer loop
+      try {
+        await logActivity(
+          req.user.id,
+          'notice_sent',
+          {},
+          `Sent ${messageType} notice "${trimmedSubject}" to all ${kind === 'attraction' ? 'attractions' : 'businesses'} (${attractions.length} recipients)`
+        );
+      } catch (e) {
+        console.error('activity log failed:', e?.message || e);
+      }
 
       // Send emails asynchronously after commit
       recipients.forEach(r => {
@@ -216,6 +253,18 @@ router.post('/send-all', auth.authenticate, auth.requireRole('admin'), async (re
     );
 
     await connection.commit();
+
+    // Log activity (never affects flow) after commit, before mailer loop
+    try {
+      await logActivity(
+        req.user.id,
+        'notice_sent',
+        {},
+        `Sent ${messageType} notice "${trimmedSubject}" to all ${kind === 'attraction' ? 'attractions' : 'businesses'} (${businesses.length} recipients)`
+      );
+    } catch (e) {
+      console.error('activity log failed:', e?.message || e);
+    }
 
     // Send emails asynchronously after commit
     recipients.forEach(r => {
