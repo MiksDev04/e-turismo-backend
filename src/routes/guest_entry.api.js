@@ -22,7 +22,7 @@ router.get('/vacant-rooms', auth.authenticate, auth.requireRole('business'), asy
       `SELECT id, room_number, capacity, room_status
        FROM rooms
        WHERE business_id = ? AND room_status IN ('vacant', 'reserved')
-       ORDER BY room_number`,
+       ORDER BY (CAST(room_number AS UNSIGNED) = 0), CAST(room_number AS UNSIGNED), room_number`,
       [businessId]
     );
 

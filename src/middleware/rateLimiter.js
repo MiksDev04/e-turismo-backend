@@ -51,14 +51,28 @@ export const authedActionLimiter = rateLimit({
 /**
  * Key for login: one bucket per IP + posted username.
  * Keyed on the username (not a user id) since no session exists yet.
+ * Trimmed the same way the login handler trims it, so "juan" and "juan "
+ * cannot be used to get separate buckets for the same account.
  */
 const ipAndUsernameKey = (req) =>
-  `${ipKeyGenerator(req.ip)}:${(req.body?.username || '').toLowerCase()}`;
+  `${ipKeyGenerator(req.ip)}:${String(
+    req.body?.username || req.body?.email || ''
+  ).trim().toLowerCase()}`;
 
-/** Limits password guessing / brute force on POST /login. */
+/**
+ * Limits password guessing / brute force on POST /login.
+ *
+ * Only *wrong credentials* (401) are counted. Successful logins, pending /
+ * rejected accounts (403), missing profiles (404) and server errors (5xx) do
+ * not consume the budget, and neither do the app's background re-auth calls
+ * once they have succeeded. This is what stops a user who typed the correct
+ * password from being told "Too many attempts".
+ */
 export const loginLimiter = rateLimit({
   windowMs: WINDOW_MS,
   limit: 5,
   keyGenerator: ipAndUsernameKey,
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (req, res) => res.statusCode !== 401,
   handler: tooManyAttempts,
 });

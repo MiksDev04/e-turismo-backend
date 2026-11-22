@@ -249,7 +249,7 @@ router.get('/:id/rooms', adminGuard, async (req, res, next) => {
       `SELECT room_number, capacity, room_status
        FROM rooms
        WHERE business_id = ?
-       ORDER BY room_number`,
+       ORDER BY (CAST(room_number AS UNSIGNED) = 0), CAST(room_number AS UNSIGNED), room_number`,
       [req.params.id]
     );
     res.json({ data: rows });
