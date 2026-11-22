@@ -65,10 +65,7 @@ router.get('/', adminGuard, async (req, res, next) => {
       `SELECT b.*,
               (SELECT COUNT(*) FROM rooms WHERE business_id = b.id) AS total_rooms,
               u.full_name, u.email, u.phone,
-              CASE
-                WHEN COUNT(gr.id) = 0 THEN NULL
-                ELSE DATE(MAX(COALESCE(gr.actual_check_out, CURDATE())))
-              END AS last_activity,
+              DATE(MAX(COALESCE(gr.actual_check_out, CURDATE()))) AS last_activity,
               CASE
                 WHEN COUNT(gr.id) = 0 THEN 'no_activity'
                 WHEN MAX(COALESCE(gr.actual_check_out, CURDATE())) < DATE_SUB(CURDATE(), INTERVAL 90 DAY) THEN 'inactive'
@@ -252,7 +249,7 @@ router.get('/:id/rooms', adminGuard, async (req, res, next) => {
       `SELECT room_number, capacity, room_status
        FROM rooms
        WHERE business_id = ?
-       ORDER BY room_number`,
+       ORDER BY (CAST(room_number AS UNSIGNED) = 0), CAST(room_number AS UNSIGNED), room_number`,
       [req.params.id]
     );
     res.json({ data: rows });
@@ -401,9 +398,9 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     if (!['approved', 'warning'].includes(status)) {
       return res.status(400).json({ message: 'Invalid status.' });
     }
-    const subject = status === 'warning'
-      ? 'Account Status Update: Warning'
-      : 'Account Status Update: Restored to Approved';
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ message: 'Reason is required.' });
+    }
     if (!messageContent || !messageContent.trim()) {
       return res.status(400).json({ message: 'Message content is required.' });
     }
@@ -430,8 +427,8 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     const messageId = crypto.randomUUID();
     await connection.execute(
       `INSERT INTO messages (id, sender_id, message_type, subject, content, is_broadcast)
-       VALUES (?, ?, 'compliance', ?, ?, FALSE)`,
-      [messageId, req.user.id, subject, messageContent.trim()]
+       VALUES (?, ?, 'compliance', 'Business Status Update', ?, FALSE)`,
+      [messageId, req.user.id, messageContent.trim()]
     );
 
     await connection.execute(
@@ -441,12 +438,12 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
 
     await connection.commit();
 
-    await logActivity(req.user.id, 'business_status_changed', { businessId: id }, `${status}: ${(reason || '').trim() || 'no remarks'}`);
+    await logActivity(req.user.id, 'business_status_changed', { businessId: id }, `${status}: ${reason}`);
 
     res.json({ message: 'Business status updated.' });
 
     if (biz.email) {
-      mailer.sendSystemMessage(biz.email, subject, messageContent.trim(), 'compliance')
+      mailer.sendSystemMessage(biz.email, 'Business Status Update', messageContent.trim(), 'compliance')
         .catch((err) => console.error('Failed to send status-change email:', err.message));
     }
   } catch (err) {

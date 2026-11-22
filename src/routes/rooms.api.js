@@ -74,7 +74,9 @@ router.get('/rooms', auth.authenticate, auth.requireRole('business'), async (req
     let query = `SELECT id, room_number, capacity, room_status, created_at, updated_at
                  FROM rooms
                  WHERE ${whereClause}
-                 ORDER BY ${isDeltaSync ? 'updated_at ASC' : 'room_number'}`;
+                 ORDER BY ${isDeltaSync
+                   ? 'updated_at ASC'
+                   : '(CAST(room_number AS UNSIGNED) = 0), CAST(room_number AS UNSIGNED), room_number'}`;
     const queryParams = [...params];
     if (fetchAll !== 'true' && !isDeltaSync) {
       query += ' LIMIT ? OFFSET ?';

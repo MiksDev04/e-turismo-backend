@@ -63,10 +63,7 @@ router.get('/', adminGuard, async (req, res, next) => {
     // ── Fetch paginated rows ──────────────────────────────────────────────
     const [rows] = await db.pool.query(
       `SELECT ta.*, u.full_name, u.email, u.phone,
-              CASE
-                WHEN COUNT(avl.id) = 0 THEN NULL
-                ELSE MAX(avl.visit_date)
-              END AS last_activity,
+              MAX(avl.visit_date) AS last_activity,
               CASE
                 WHEN COUNT(avl.id) = 0 THEN 'no_activity'
                 WHEN MAX(avl.visit_date) < DATE_SUB(CURDATE(), INTERVAL 90 DAY) THEN 'inactive'
@@ -329,9 +326,9 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     if (!['approved', 'warning'].includes(status)) {
       return res.status(400).json({ message: 'Invalid status.' });
     }
-    const subject = status === 'warning'
-      ? 'Account Status Update: Warning'
-      : 'Account Status Update: Restored to Approved';
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ message: 'Reason is required.' });
+    }
     if (!messageContent || !messageContent.trim()) {
       return res.status(400).json({ message: 'Message content is required.' });
     }
@@ -358,8 +355,8 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
     const messageId = crypto.randomUUID();
     await connection.execute(
       `INSERT INTO messages (id, sender_id, message_type, subject, content, is_broadcast)
-       VALUES (?, ?, 'compliance', ?, ?, FALSE)`,
-      [messageId, req.user.id, subject, messageContent.trim()]
+       VALUES (?, ?, 'compliance', 'Business Status Update', ?, FALSE)`,
+      [messageId, req.user.id, messageContent.trim()]
     );
 
     await connection.execute(
@@ -369,12 +366,12 @@ router.put('/:id/status', adminGuard, async (req, res, next) => {
 
     await connection.commit();
 
-    await logActivity(req.user.id, 'attraction_status_changed', { attractionId: id }, `${status}: ${(reason || '').trim() || 'no remarks'}`);
+    await logActivity(req.user.id, 'attraction_status_changed', { attractionId: id }, `${status}: ${reason}`);
 
     res.json({ message: 'Attraction status updated.' });
 
     if (att.email) {
-      mailer.sendSystemMessage(att.email, subject, messageContent.trim(), 'compliance')
+      mailer.sendSystemMessage(att.email, 'Business Status Update', messageContent.trim(), 'compliance')
         .catch((err) => console.error('Failed to send status-change email:', err.message));
     }
   } catch (err) {

@@ -26,6 +26,11 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
+// The API runs behind a reverse proxy (Render), so req.ip is the proxy's
+// address unless we trust exactly one hop. Without this every client shares
+// the same IP, which breaks IP-based rate limiting and audit logging.
+app.set('trust proxy', 1);
+
 // ── Middleware ────────────────────────────────────────────────
 app.use(cors({
   origin: function (origin, callback) {
